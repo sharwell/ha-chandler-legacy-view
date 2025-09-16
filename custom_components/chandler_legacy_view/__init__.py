@@ -6,9 +6,19 @@ import logging
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.device_registry import DeviceEntryType
 from homeassistant.helpers.typing import ConfigType
 
-from .const import DATA_DISCOVERY_MANAGER, DOMAIN, PLATFORMS
+from .const import (
+    DATA_DISCOVERY_MANAGER,
+    DEFAULT_MANUFACTURER,
+    DISCOVERY_DEVICE_MODEL,
+    DISCOVERY_DEVICE_NAME,
+    DISCOVERY_VIA_DEVICE_ID,
+    DOMAIN,
+    PLATFORMS,
+)
 from .discovery import ValveDiscoveryManager
 
 _LOGGER = logging.getLogger(__name__)
@@ -25,6 +35,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Chandler Legacy View from a config entry."""
 
     hass.data.setdefault(DOMAIN, {})
+
+    device_registry = dr.async_get(hass)
+    device_registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={(DOMAIN, DISCOVERY_VIA_DEVICE_ID)},
+        manufacturer=DEFAULT_MANUFACTURER,
+        model=DISCOVERY_DEVICE_MODEL,
+        name=DISCOVERY_DEVICE_NAME,
+        entry_type=DeviceEntryType.SERVICE,
+    )
 
     manager = ValveDiscoveryManager(hass)
     await manager.async_setup()

@@ -17,6 +17,11 @@ DATA_DISCOVERY_MANAGER: Final = "discovery_manager"
 DEFAULT_FRIENDLY_NAME: Final = "Treatment Valve"
 DEFAULT_MANUFACTURER: Final = "Chandler"
 
+# Device registry definitions for the integration's Bluetooth discovery service.
+DISCOVERY_VIA_DEVICE_ID: Final = "bluetooth"
+DISCOVERY_DEVICE_NAME: Final = "Chandler Valve Discovery"
+DISCOVERY_DEVICE_MODEL: Final = "Bluetooth Service"
+
 # Manufacturer data identifier advertised by Chandler Legacy valves.
 CSI_MANUFACTURER_ID: Final = 1850
 

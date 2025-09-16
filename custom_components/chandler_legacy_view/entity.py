@@ -7,6 +7,7 @@ from homeassistant.helpers.entity import DeviceInfo, Entity
 from .const import (
     DEFAULT_FRIENDLY_NAME,
     DEFAULT_MANUFACTURER,
+    DISCOVERY_VIA_DEVICE_ID,
     DOMAIN,
     FRIENDLY_NAME_OVERRIDES,
 )
@@ -48,7 +49,7 @@ class ChandlerValveEntity(Entity):
             name=self._compute_name(self._advertisement),
             manufacturer=DEFAULT_MANUFACTURER,
             model=self._advertisement.model,
-            via_device=(DOMAIN, "bluetooth"),
+            via_device=(DOMAIN, DISCOVERY_VIA_DEVICE_ID),
             sw_version=self._format_firmware_version(self._advertisement),
         )
 
