@@ -48,6 +48,7 @@ class ChandlerValveEntity(Entity):
             name=self._compute_name(self._advertisement),
             manufacturer=DEFAULT_MANUFACTURER,
             via_device=(DOMAIN, "bluetooth"),
+            sw_version=self._format_firmware_version(self._advertisement),
         )
 
     def async_update_from_advertisement(self, advertisement: ValveAdvertisement) -> None:
@@ -60,3 +61,13 @@ class ChandlerValveEntity(Entity):
         """Generate a user-friendly name for the valve entity."""
 
         return friendly_name_from_advertised_name(advertisement.name)
+
+    def _format_firmware_version(self, advertisement: ValveAdvertisement) -> str | None:
+        """Format the firmware version reported by the advertisement."""
+
+        if (
+            advertisement.firmware_major is None
+            or advertisement.firmware_minor is None
+        ):
+            return None
+        return f"{advertisement.firmware_major}.{advertisement.firmware_minor:02d}"

@@ -15,4 +15,7 @@ class ValveAdvertisement:
     rssi: int | None
     manufacturer_data: Mapping[int, bytes]
     service_data: Mapping[str, bytes]
+    firmware_major: int | None = None
+    firmware_minor: int | None = None
+    firmware_version: int | None = None
 

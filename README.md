@@ -10,9 +10,12 @@ Home Assistant as entities that can participate in automations or dashboards.
 
 * Establishes a Home Assistant config entry via the UI (no YAML required).
 * Watches for Bluetooth advertisements that match the expected Chandler valve
-  signatures.
+  signatures, including both the Bluetooth name prefixes and the Chandler
+  manufacturer data identifier.
 * Creates binary sensor entities that indicate whether each recognised valve is
   currently available.
+* Extracts the firmware version reported in the advertisement metadata and
+  surfaces it as an entity attribute for troubleshooting and diagnostics.
 
 This repository currently focuses on the scaffolding required for discovery and
 entity creation. Additional device metadata, richer entities, diagnostics, and

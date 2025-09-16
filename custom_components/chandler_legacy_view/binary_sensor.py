@@ -53,6 +53,12 @@ class ValvePresenceBinarySensor(ChandlerValveEntity, BinarySensorEntity):
             attributes["rssi"] = self._advertisement.rssi
         if self._advertisement.name:
             attributes["advertised_name"] = self._advertisement.name
+        if self._advertisement.firmware_version is not None:
+            attributes["firmware_version"] = self._advertisement.firmware_version
+        if self._advertisement.firmware_major is not None:
+            attributes["firmware_major"] = self._advertisement.firmware_major
+        if self._advertisement.firmware_minor is not None:
+            attributes["firmware_minor"] = self._advertisement.firmware_minor
         return attributes
 
 

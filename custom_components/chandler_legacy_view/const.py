@@ -16,6 +16,9 @@ DATA_DISCOVERY_MANAGER: Final = "discovery_manager"
 DEFAULT_FRIENDLY_NAME: Final = "Treatment Valve"
 DEFAULT_MANUFACTURER: Final = "Chandler"
 
+# Manufacturer data identifier advertised by Chandler Legacy valves.
+CSI_MANUFACTURER_ID: Final = 1850
+
 # Mapping of known Bluetooth local names to user-friendly descriptions.
 FRIENDLY_NAME_OVERRIDES: Final[dict[str, str]] = {
     "c2_1a": "Backwashing Filter",

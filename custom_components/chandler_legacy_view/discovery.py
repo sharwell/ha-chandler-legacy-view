@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Dict
+from typing import Dict, Mapping
 
 from homeassistant.components.bluetooth import (
     BluetoothChange,
@@ -14,7 +14,7 @@ from homeassistant.components.bluetooth import (
 )
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant
 
-from .const import VALVE_MATCHERS, VALVE_NAME_PREFIXES
+from .const import CSI_MANUFACTURER_ID, VALVE_MATCHERS, VALVE_NAME_PREFIXES
 from .models import ValveAdvertisement
 
 _LOGGER = logging.getLogger(__name__)
@@ -36,6 +36,30 @@ def _matches_valve_prefix(name: str | None) -> bool:
         comparison_value.startswith(prefix)
         for prefix in _VALVE_NAME_PREFIXES_CASEFOLD
     )
+
+
+def _classify_manufacturer_data(
+    manufacturer_data: Mapping[int, bytes]
+) -> tuple[bool, int | None, int | None, int | None]:
+    """Identify Chandler valves and extract firmware details from manufacturer data."""
+
+    payload = manufacturer_data.get(CSI_MANUFACTURER_ID)
+    if payload is None:
+        return False, None, None, None
+
+    if len(payload) < 2:
+        _LOGGER.debug(
+            "Manufacturer data for Chandler valve (id %s) was too short to parse firmware: %s",
+            CSI_MANUFACTURER_ID,
+            payload,
+        )
+        return True, None, None, None
+
+    firmware_major = payload[-2]
+    firmware_minor_raw = payload[-1]
+    firmware_minor = 99 if firmware_minor_raw >= 250 else firmware_minor_raw
+    firmware_version = firmware_major * 100 + firmware_minor
+    return True, firmware_major, firmware_minor, firmware_version
 
 
 class ValveDiscoveryManager:
@@ -111,19 +135,45 @@ class ValveDiscoveryManager:
                 )
                 return
 
+            (
+                is_csi_device,
+                firmware_major,
+                firmware_minor,
+                firmware_version,
+            ) = _classify_manufacturer_data(service_info.manufacturer_data)
+
+            if not is_csi_device:
+                _LOGGER.debug(
+                    "Ignoring Bluetooth advertisement from %s; manufacturer data %s does not match Chandler signature",
+                    service_info.address,
+                    service_info.manufacturer_data,
+                )
+                return
+
             advertisement = ValveAdvertisement(
                 address=service_info.address,
                 name=service_info.name,
                 rssi=service_info.rssi,
                 manufacturer_data=service_info.manufacturer_data,
                 service_data=service_info.service_data,
+                firmware_major=firmware_major,
+                firmware_minor=firmware_minor,
+                firmware_version=firmware_version,
             )
             self._devices[service_info.address] = advertisement
-            _LOGGER.debug(
-                "Valve %s seen (RSSI=%s)",
-                service_info.address,
-                service_info.rssi,
-            )
+            if firmware_version is not None:
+                _LOGGER.debug(
+                    "Valve %s seen (RSSI=%s, firmware=%s)",
+                    service_info.address,
+                    service_info.rssi,
+                    firmware_version,
+                )
+            else:
+                _LOGGER.debug(
+                    "Valve %s seen (RSSI=%s)",
+                    service_info.address,
+                    service_info.rssi,
+                )
 
         for listener in list(self._listeners):
             listener(advertisement, change)
