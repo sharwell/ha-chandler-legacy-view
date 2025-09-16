@@ -14,7 +14,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DATA_DISCOVERY_MANAGER, DOMAIN
-from .discovery import ValveDiscoveryManager
+from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
 from .entity import ChandlerValveEntity
 from .models import ValveAdvertisement
 
@@ -35,7 +35,7 @@ class ValvePresenceBinarySensor(ChandlerValveEntity, BinarySensorEntity):
     ) -> None:
         """Handle updates from the Bluetooth discovery manager."""
 
-        if change is BluetoothChange.LOST:
+        if change in BLUETOOTH_LOST_CHANGES:
             self._attr_is_on = False
             self._attr_available = False
         else:
@@ -94,7 +94,7 @@ async def async_setup_entry(
             entity.async_handle_bluetooth_update(advertisement, change)
             return
 
-        if change is BluetoothChange.LOST:
+        if change in BLUETOOTH_LOST_CHANGES:
             return
 
         new_entity = ValvePresenceBinarySensor(advertisement)

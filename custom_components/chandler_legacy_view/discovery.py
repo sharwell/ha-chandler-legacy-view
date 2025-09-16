@@ -25,7 +25,7 @@ _VALVE_NAME_PREFIXES_CASEFOLD = tuple(
     prefix.casefold() for prefix in VALVE_NAME_PREFIXES
 )
 
-_BLUETOOTH_LOST_CHANGES: tuple[BluetoothChange, ...] = tuple(
+BLUETOOTH_LOST_CHANGES: tuple[BluetoothChange, ...] = tuple(
     getattr(BluetoothChange, change_name)
     for change_name in ("LOST", "UNAVAILABLE", "DISCONNECTED")
     if hasattr(BluetoothChange, change_name)
@@ -133,7 +133,7 @@ class ValveDiscoveryManager:
     ) -> None:
         """Handle an incoming Bluetooth advertisement from Home Assistant."""
 
-        if change in _BLUETOOTH_LOST_CHANGES:
+        if change in BLUETOOTH_LOST_CHANGES:
             advertisement = self._devices.pop(service_info.address, None)
             if advertisement is None:
                 _LOGGER.debug(
