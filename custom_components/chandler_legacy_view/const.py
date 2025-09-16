@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from itertools import product
 from typing import Final
 
 from homeassistant.const import Platform
@@ -33,14 +34,30 @@ FRIENDLY_NAME_OVERRIDES: Final[dict[str, str]] = {
 # Known Bluetooth local-name prefixes advertised by Chandler Legacy valves.
 VALVE_NAME_PREFIXES: Final[tuple[str, ...]] = ("CS_", "C2_", "CL_")
 
+def _case_variants(prefix: str) -> tuple[str, ...]:
+    """Return all case permutations for the provided prefix."""
+
+    variants = {
+        "".join(chars)
+        for chars in product(
+            *(
+                (char.lower(), char.upper()) if char.isalpha() else (char,)
+                for char in prefix
+            )
+        )
+    }
+    return tuple(sorted(variants))
+
+
 # Bluetooth callback matchers describing the devices we are interested in.
 #
 # Chandler's firmware appears to emit identifiers starting with ``CS_``,
-# ``C2_``, or ``CL_`` (case-insensitive). ``BluetoothCallbackMatcher``
-# local-name matching uses ``fnmatch`` semantics, so we express the
-# case-insensitive prefixes via character classes.
-VALVE_MATCHERS: Final[tuple[dict[str, str], ...]] = (
-    {"local_name": "[Cc][Ss]_*"},
-    {"local_name": "[Cc]2_*"},
-    {"local_name": "[Cc][Ll]_*"},
+# ``C2_``, or ``CL_`` (case-insensitive). ``BluetoothCallbackMatcher`` objects
+# only allow wildcard matching after the first three characters, so we expand
+# the prefixes into their literal case permutations and append ``*`` to match
+# the rest of the local name.
+VALVE_MATCHERS: Final[tuple[dict[str, str], ...]] = tuple(
+    {"local_name": f"{variant}*"}
+    for prefix in VALVE_NAME_PREFIXES
+    for variant in _case_variants(prefix)
 )
