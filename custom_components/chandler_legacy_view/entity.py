@@ -4,8 +4,26 @@ from __future__ import annotations
 
 from homeassistant.helpers.entity import DeviceInfo, Entity
 
-from .const import DEFAULT_DEVICE_NAME, DEFAULT_MANUFACTURER, DOMAIN
+from .const import (
+    DEFAULT_FRIENDLY_NAME,
+    DEFAULT_MANUFACTURER,
+    DOMAIN,
+    FRIENDLY_NAME_OVERRIDES,
+)
 from .models import ValveAdvertisement
+
+
+def friendly_name_from_advertised_name(advertised_name: str | None) -> str:
+    """Return a friendly valve name for a Bluetooth advertised local name."""
+
+    if not advertised_name:
+        return DEFAULT_FRIENDLY_NAME
+
+    normalized_name = advertised_name.strip().casefold()
+    if not normalized_name:
+        return DEFAULT_FRIENDLY_NAME
+
+    return FRIENDLY_NAME_OVERRIDES.get(normalized_name, DEFAULT_FRIENDLY_NAME)
 
 
 class ChandlerValveEntity(Entity):
@@ -41,8 +59,4 @@ class ChandlerValveEntity(Entity):
     def _compute_name(self, advertisement: ValveAdvertisement) -> str:
         """Generate a user-friendly name for the valve entity."""
 
-        if advertisement.name:
-            return advertisement.name
-
-        address_fragment = advertisement.address.replace(":", "")[-4:]
-        return f"{DEFAULT_DEVICE_NAME} {address_fragment.upper()}"
+        return friendly_name_from_advertised_name(advertisement.name)
