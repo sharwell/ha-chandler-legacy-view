@@ -82,14 +82,15 @@ class ValveDiscoveryManager:
         """Start listening for Bluetooth advertisements."""
 
         _LOGGER.debug("Setting up Bluetooth discovery for Chandler valves")
-        self._callbacks.append(
-            async_register_callback(
-                self._hass,
-                self._async_handle_bluetooth_event,
-                VALVE_MATCHERS,
-                BluetoothScanningMode.PASSIVE,
+        for matcher in VALVE_MATCHERS:
+            self._callbacks.append(
+                async_register_callback(
+                    self._hass,
+                    self._async_handle_bluetooth_event,
+                    matcher,
+                    BluetoothScanningMode.PASSIVE,
+                )
             )
-        )
 
     async def async_unload(self) -> None:
         """Cancel Bluetooth callbacks and clear tracked devices."""
