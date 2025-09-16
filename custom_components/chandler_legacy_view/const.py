@@ -16,10 +16,17 @@ DATA_DISCOVERY_MANAGER: Final = "discovery_manager"
 DEFAULT_DEVICE_NAME: Final = "Water System Valve"
 DEFAULT_MANUFACTURER: Final = "Chandler"
 
+# Known Bluetooth local-name prefixes advertised by Chandler Legacy valves.
+VALVE_NAME_PREFIXES: Final[tuple[str, ...]] = ("CS_", "C2_", "CL_")
+
 # Bluetooth callback matchers describing the devices we are interested in.
-# These are placeholders that document the expected shape of the data and can be
-# updated once precise manufacturer or service identifiers are known.
-VALVE_MATCHERS: Final = (
-    {"local_name": "Chandler Softener"},
-    {"local_name": "Chandler Filter"},
+#
+# Chandler's firmware appears to emit identifiers starting with ``CS_``,
+# ``C2_``, or ``CL_`` (case-insensitive). ``BluetoothCallbackMatcher``
+# local-name matching uses ``fnmatch`` semantics, so we express the
+# case-insensitive prefixes via character classes.
+VALVE_MATCHERS: Final[tuple[dict[str, str], ...]] = (
+    {"local_name": "[Cc][Ss]_*"},
+    {"local_name": "[Cc]2_*"},
+    {"local_name": "[Cc][Ll]_*"},
 )

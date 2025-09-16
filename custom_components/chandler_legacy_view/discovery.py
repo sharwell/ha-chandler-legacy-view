@@ -14,12 +14,28 @@ from homeassistant.components.bluetooth import (
 )
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant
 
-from .const import VALVE_MATCHERS
+from .const import VALVE_MATCHERS, VALVE_NAME_PREFIXES
 from .models import ValveAdvertisement
 
 _LOGGER = logging.getLogger(__name__)
 
 ValveListener = Callable[[ValveAdvertisement, BluetoothChange], None]
+
+_VALVE_NAME_PREFIXES_CASEFOLD = tuple(
+    prefix.casefold() for prefix in VALVE_NAME_PREFIXES
+)
+
+
+def _matches_valve_prefix(name: str | None) -> bool:
+    """Return ``True`` if the Bluetooth local name matches known prefixes."""
+
+    if not name:
+        return False
+    comparison_value = name.casefold()
+    return any(
+        comparison_value.startswith(prefix)
+        for prefix in _VALVE_NAME_PREFIXES_CASEFOLD
+    )
 
 
 class ValveDiscoveryManager:
@@ -77,18 +93,31 @@ class ValveDiscoveryManager:
     ) -> None:
         """Handle an incoming Bluetooth advertisement from Home Assistant."""
 
-        advertisement = ValveAdvertisement(
-            address=service_info.address,
-            name=service_info.name,
-            rssi=service_info.rssi,
-            manufacturer_data=service_info.manufacturer_data,
-            service_data=service_info.service_data,
-        )
-
         if change is BluetoothChange.LOST:
-            self._devices.pop(service_info.address, None)
+            advertisement = self._devices.pop(service_info.address, None)
+            if advertisement is None:
+                _LOGGER.debug(
+                    "Ignoring lost event for %s; device was not tracked as a valve",
+                    service_info.address,
+                )
+                return
             _LOGGER.debug("Valve %s lost", service_info.address)
         else:
+            if not _matches_valve_prefix(service_info.name):
+                _LOGGER.debug(
+                    "Ignoring Bluetooth advertisement from %s with name %r",
+                    service_info.address,
+                    service_info.name,
+                )
+                return
+
+            advertisement = ValveAdvertisement(
+                address=service_info.address,
+                name=service_info.name,
+                rssi=service_info.rssi,
+                manufacturer_data=service_info.manufacturer_data,
+                service_data=service_info.service_data,
+            )
             self._devices[service_info.address] = advertisement
             _LOGGER.debug(
                 "Valve %s seen (RSSI=%s)",
