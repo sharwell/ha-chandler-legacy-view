@@ -12,10 +12,15 @@ Home Assistant as entities that can participate in automations or dashboards.
 * Watches for Bluetooth advertisements that match the expected Chandler valve
   signatures, including both the Bluetooth name prefixes and the Chandler
   manufacturer data identifier.
+* Tracks multiple valves simultaneously by their Bluetooth address so each
+  device is registered individually in Home Assistant.
 * Creates binary sensor entities that indicate whether each recognised valve is
   currently available.
 * Extracts the firmware version reported in the advertisement metadata and
   surfaces it as an entity attribute for troubleshooting and diagnostics.
+* Classifies the advertisement payload to determine whether the valve reports
+  as an Evb019 (firmware < 600) or Evb034 (firmware ≥ 600) and exposes the model
+  via device information and entity state attributes.
 
 This repository currently focuses on the scaffolding required for discovery and
 entity creation. Additional device metadata, richer entities, diagnostics, and

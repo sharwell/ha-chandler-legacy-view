@@ -18,4 +18,5 @@ class ValveAdvertisement:
     firmware_major: int | None = None
     firmware_minor: int | None = None
     firmware_version: int | None = None
+    model: str | None = None
 

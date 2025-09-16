@@ -40,12 +40,12 @@ def _matches_valve_prefix(name: str | None) -> bool:
 
 def _classify_manufacturer_data(
     manufacturer_data: Mapping[int, bytes]
-) -> tuple[bool, int | None, int | None, int | None]:
+) -> tuple[bool, int | None, int | None, int | None, str | None]:
     """Identify Chandler valves and extract firmware details from manufacturer data."""
 
     payload = manufacturer_data.get(CSI_MANUFACTURER_ID)
     if payload is None:
-        return False, None, None, None
+        return False, None, None, None, None
 
     if len(payload) < 2:
         _LOGGER.debug(
@@ -53,13 +53,18 @@ def _classify_manufacturer_data(
             CSI_MANUFACTURER_ID,
             payload,
         )
-        return True, None, None, None
+        return True, None, None, None, None
 
     firmware_major = payload[-2]
     firmware_minor_raw = payload[-1]
     firmware_minor = 99 if firmware_minor_raw >= 250 else firmware_minor_raw
     firmware_version = firmware_major * 100 + firmware_minor
-    return True, firmware_major, firmware_minor, firmware_version
+    model: str | None
+    if firmware_version >= 600:
+        model = "Evb034"
+    else:
+        model = "Evb019"
+    return True, firmware_major, firmware_minor, firmware_version, model
 
 
 class ValveDiscoveryManager:
@@ -140,6 +145,7 @@ class ValveDiscoveryManager:
                 firmware_major,
                 firmware_minor,
                 firmware_version,
+                model,
             ) = _classify_manufacturer_data(service_info.manufacturer_data)
 
             if not is_csi_device:
@@ -159,6 +165,7 @@ class ValveDiscoveryManager:
                 firmware_major=firmware_major,
                 firmware_minor=firmware_minor,
                 firmware_version=firmware_version,
+                model=model,
             )
             self._devices[service_info.address] = advertisement
             if firmware_version is not None:

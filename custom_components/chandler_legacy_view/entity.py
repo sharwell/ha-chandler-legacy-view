@@ -47,6 +47,7 @@ class ChandlerValveEntity(Entity):
             identifiers={(DOMAIN, self._advertisement.address)},
             name=self._compute_name(self._advertisement),
             manufacturer=DEFAULT_MANUFACTURER,
+            model=self._advertisement.model,
             via_device=(DOMAIN, "bluetooth"),
             sw_version=self._format_firmware_version(self._advertisement),
         )
