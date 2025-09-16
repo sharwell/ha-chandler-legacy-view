@@ -25,6 +25,16 @@ _VALVE_NAME_PREFIXES_CASEFOLD = tuple(
     prefix.casefold() for prefix in VALVE_NAME_PREFIXES
 )
 
+_BLUETOOTH_LOST_CHANGES: tuple[BluetoothChange, ...] = tuple(
+    getattr(BluetoothChange, change_name)
+    for change_name in ("LOST", "UNAVAILABLE", "DISCONNECTED")
+    if hasattr(BluetoothChange, change_name)
+)
+
+_BLUETOOTH_ADVERTISEMENT_CHANGE: BluetoothChange | None = getattr(
+    BluetoothChange, "ADVERTISEMENT", None
+)
+
 
 def _matches_valve_prefix(name: str | None) -> bool:
     """Return ``True`` if the Bluetooth local name matches known prefixes."""
@@ -123,7 +133,7 @@ class ValveDiscoveryManager:
     ) -> None:
         """Handle an incoming Bluetooth advertisement from Home Assistant."""
 
-        if change is BluetoothChange.LOST:
+        if change in _BLUETOOTH_LOST_CHANGES:
             advertisement = self._devices.pop(service_info.address, None)
             if advertisement is None:
                 _LOGGER.debug(
@@ -132,7 +142,7 @@ class ValveDiscoveryManager:
                 )
                 return
             _LOGGER.debug("Valve %s lost", service_info.address)
-        else:
+        elif change is _BLUETOOTH_ADVERTISEMENT_CHANGE:
             if not _matches_valve_prefix(service_info.name):
                 _LOGGER.debug(
                     "Ignoring Bluetooth advertisement from %s with name %r",
@@ -182,6 +192,11 @@ class ValveDiscoveryManager:
                     service_info.address,
                     service_info.rssi,
                 )
+        else:
+            _LOGGER.debug(
+                "Ignoring Bluetooth change %s for %s", change, service_info.address
+            )
+            return
 
         for listener in list(self._listeners):
             listener(advertisement, change)
