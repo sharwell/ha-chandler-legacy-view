@@ -1,0 +1,14 @@
+{
+  "domain": "chandler_legacy_view",
+  "name": "Chandler Legacy View",
+  "version": "0.1.0",
+  "config_flow": true,
+  "documentation": "https://github.com/chandler-engineering/ha-chandler-legacy-view",
+  "issue_tracker": "https://github.com/chandler-engineering/ha-chandler-legacy-view/issues",
+  "requirements": [],
+  "dependencies": ["bluetooth"],
+  "codeowners": ["@chandler-engineering"],
+  "iot_class": "local_push",
+  "integration_type": "hub",
+  "loggers": ["custom_components.chandler_legacy_view"]
+}
