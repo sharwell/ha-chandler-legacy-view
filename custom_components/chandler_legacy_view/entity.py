@@ -17,6 +17,19 @@ from .models import ValveAdvertisement
 
 
 _CLACK_NAME_PREFIX = "cl_"
+_LOW_SALT_CAPABLE_NAMES = {
+    "CS_Meter_Soft",
+    "CS_C_Meter_Soft",
+    "C2_01",
+    "C2_03",
+    "C2_17",
+    "C2_19",
+    "C2_21",
+    "CL_01",
+    "CL_04",
+    "CL_06",
+    "CL_08",
+}
 _VALVE_ERROR_TIMEOUT_CODE = 7
 
 _VALVE_ERROR_DISPLAY: dict[int, str] = {
@@ -94,6 +107,19 @@ def _is_clack_valve(advertised_name: str | None) -> bool:
     if not advertised_name:
         return False
     return advertised_name.strip().casefold().startswith(_CLACK_NAME_PREFIX)
+
+
+def _can_report_low_salt(advertised_name: str | None) -> bool:
+    """Return ``True`` if the valve can report a low salt condition."""
+
+    if not advertised_name:
+        return False
+
+    normalized_name = advertised_name.strip()
+    if not normalized_name:
+        return False
+
+    return normalized_name in _LOW_SALT_CAPABLE_NAMES
 
 
 def _valve_error_display(error_code: int | None, is_clack_valve: bool) -> str | None:
