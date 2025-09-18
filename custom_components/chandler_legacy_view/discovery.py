@@ -283,9 +283,9 @@ def _apply_valve_status(
         classification.water_status = 1 if valve_status & 0x04 else 0
         classification.bypass_status = 1 if valve_status & 0x08 else 0
     else:
-        classification.salt_sensor_status = 1 if valve_status & 0x80 else 0
-        classification.water_status = 1 if valve_status & 0x40 else 0
-        classification.bypass_status = 1 if valve_status & 0x20 else 0
+        classification.salt_sensor_status = 1 if valve_status & 0x01 else 0
+        classification.water_status = 1 if valve_status & 0x02 else 0
+        classification.bypass_status = 1 if valve_status & 0x04 else 0
 
 
 def _parse_evb034_payload(
