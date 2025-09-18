@@ -127,7 +127,7 @@ def _has_manufacturer_data_values(value: Any) -> bool:
 
 def _extract_raw_manufacturer_segments(
     raw_advertisement: bytes | bytearray | memoryview | None,
-) -> list[tuple[bytes, bool]]:
+) -> list[bytes]:
     """Return raw Chandler manufacturer segments from a Bluetooth advertisement."""
 
     if not raw_advertisement:
@@ -140,8 +140,7 @@ def _extract_raw_manufacturer_segments(
     index = 0
     total_length = len(data)
     prefix_le = CSI_MANUFACTURER_ID.to_bytes(2, "little")
-    prefix_be = CSI_MANUFACTURER_ID.to_bytes(2, "big")
-    segments: list[tuple[bytes, bool]] = []
+    segments: list[bytes] = []
 
     while index < total_length:
         segment_length = data[index]
@@ -162,30 +161,26 @@ def _extract_raw_manufacturer_segments(
             continue
 
         if segment_payload.startswith(prefix_le):
-            segments.append((bytes(segment_payload), True))
-        elif segment_payload.startswith(prefix_be):
-            segments.append((bytes(segment_payload), False))
+            segments.append(bytes(segment_payload))
 
     return segments
 
 
-def _combine_manufacturer_segments(segments: list[tuple[bytes, bool]]) -> bytes | None:
+def _combine_manufacturer_segments(segments: list[bytes]) -> bytes | None:
     """Collapse segmented manufacturer data into a single payload."""
 
     if not segments:
         return None
 
-    combined = bytearray()
-    prefix_be = CSI_MANUFACTURER_ID.to_bytes(2, "big")
+    first_segment = segments[0]
+    if len(first_segment) < 2:
+        return None
 
-    first_segment, is_little_endian = segments[0]
-    if is_little_endian:
-        combined.extend(prefix_be)
-        combined.extend(first_segment[2:])
-    else:
-        combined.extend(first_segment)
+    combined = bytearray(first_segment)
 
-    for segment, _ in segments[1:]:
+    for segment in segments[1:]:
+        if len(segment) < 2:
+            continue
         combined.extend(segment[2:])
 
     return bytes(combined)
@@ -199,6 +194,9 @@ def _get_full_manufacturer_payload(
     segments = _extract_raw_manufacturer_segments(raw_advertisement)
     payload = _combine_manufacturer_segments(segments)
     if payload is not None:
+        prefix_le = CSI_MANUFACTURER_ID.to_bytes(2, "little")
+        if payload.startswith(prefix_le):
+            return payload[2:]
         return payload
 
     return _flatten_manufacturer_data(raw_payload)
