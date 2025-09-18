@@ -21,6 +21,7 @@ class ValveAdvertisement:
     model: str | None = None
     is_twin_valve: bool = False
     is_400_series: bool = False
+    has_connection_counter: bool = False
     valve_data_parsed: bool = False
     valve_status: int | None = None
     salt_sensor_status: int | None = None
@@ -31,4 +32,7 @@ class ValveAdvertisement:
     valve_time_minutes: int | None = None
     valve_type: int | None = None
     valve_series_version: int | None = None
+    connection_counter: int | None = None
+    bootloader_version: int | None = None
+    radio_protocol_version: int | None = None
 

@@ -92,6 +92,7 @@ class _ManufacturerClassification:
     model: str | None = None
     is_twin_valve: bool = False
     is_400_series: bool = False
+    has_connection_counter: bool = False
     valve_data_parsed: bool = False
     valve_status: int | None = None
     salt_sensor_status: int | None = None
@@ -102,6 +103,9 @@ class _ManufacturerClassification:
     valve_time_minutes: int | None = None
     valve_type: int | None = None
     valve_series_version: int | None = None
+    connection_counter: int | None = None
+    bootloader_version: int | None = None
+    radio_protocol_version: int | None = None
 
 
 def _has_manufacturer_data_values(value: Any) -> bool:
@@ -218,12 +222,15 @@ def _classify_manufacturer_data(
         return _ManufacturerClassification(True)
 
     prefix_le = CSI_MANUFACTURER_ID.to_bytes(2, "little")
-    if payload.startswith(prefix_le):
-        data = payload[2:]
-    else:
-        data = payload
+    if not payload.startswith(prefix_le):
+        _LOGGER.debug(
+            "Manufacturer data for Chandler valve (id %s) did not start with expected prefix: %s",
+            CSI_MANUFACTURER_ID,
+            payload,
+        )
+        return _ManufacturerClassification(True)
 
-    if len(data) < 2:
+    if len(payload) < 4:
         _LOGGER.debug(
             "Manufacturer data for Chandler valve (id %s) was too short to parse firmware: %s",
             CSI_MANUFACTURER_ID,
@@ -231,8 +238,8 @@ def _classify_manufacturer_data(
         )
         return _ManufacturerClassification(True)
 
-    firmware_major = data[-2]
-    firmware_minor_raw = data[-1]
+    firmware_major = payload[-2]
+    firmware_minor_raw = payload[-1]
     firmware_minor = 99 if firmware_minor_raw >= 250 else firmware_minor_raw
     firmware_version = firmware_major * 100 + firmware_minor
     model: str | None
@@ -252,25 +259,106 @@ def _classify_manufacturer_data(
     classification.is_twin_valve = 100 <= firmware_version <= 199
     classification.is_400_series = 400 <= firmware_version <= 499
 
-    if classification.model == "Evb034":
-        classification.valve_data_parsed = len(data) >= 10
-    else:
-        classification.valve_data_parsed = len(data) >= 2
+    classification.has_connection_counter = classification.is_twin_valve or (
+        classification.firmware_version is not None
+        and classification.firmware_version >= 412
+    )
 
-    if len(data) >= 10 and data[0:2] == b"\x07\x3a":
-        valve_status = data[2]
-        classification.valve_status = valve_status
-        classification.salt_sensor_status = 1 if valve_status & 0x80 else 0
-        classification.water_status = 1 if valve_status & 0x40 else 0
-        classification.bypass_status = 1 if valve_status & 0x20 else 0
-        classification.valve_error = data[3]
-        classification.valve_time_hours = data[4]
-        classification.valve_time_minutes = data[5]
-        classification.valve_type = data[6]
-        classification.valve_series_version = data[7]
+    if classification.model == "Evb034":
+        _parse_evb034_payload(payload, classification)
+    else:
+        _parse_evb019_payload(payload, classification)
 
     return classification
 
+
+def _apply_valve_status(
+    classification: _ManufacturerClassification, valve_status: int
+) -> None:
+    """Populate salt, water and bypass status flags from the valve status bits."""
+
+    classification.valve_status = valve_status
+    classification.salt_sensor_status = 1 if valve_status & 0x80 else 0
+    classification.water_status = 1 if valve_status & 0x40 else 0
+    classification.bypass_status = 1 if valve_status & 0x20 else 0
+
+
+def _parse_evb034_payload(
+    payload: bytes, classification: _ManufacturerClassification
+) -> None:
+    """Parse an Evb034 advertisement payload."""
+
+    if len(payload) < 10:
+        return
+
+    prefix_le = CSI_MANUFACTURER_ID.to_bytes(2, "little")
+    if payload[0:2] != prefix_le:
+        return
+
+    classification.valve_data_parsed = True
+    valve_status = payload[2]
+    _apply_valve_status(classification, valve_status)
+    classification.valve_error = payload[3]
+    classification.valve_time_hours = payload[4]
+    classification.valve_time_minutes = payload[5]
+    classification.valve_type = payload[6]
+    classification.valve_series_version = payload[7]
+
+
+def _parse_evb019_payload(
+    payload: bytes, classification: _ManufacturerClassification
+) -> None:
+    """Parse an Evb019 advertisement payload."""
+
+    if len(payload) < 6:
+        return
+
+    prefix_le = CSI_MANUFACTURER_ID.to_bytes(2, "little")
+    if payload[0:2] != prefix_le:
+        return
+
+    has_connection_counter = classification.has_connection_counter
+    has_minimum_payload = len(payload) >= 8
+    has_required_length = (not has_connection_counter) or len(payload) >= 14
+    twin_valve_valid = (not classification.is_twin_valve) or (
+        len(payload) >= 8 and payload[7] == 100
+    )
+
+    parsed = has_minimum_payload and has_required_length and twin_valve_valid
+    if not parsed:
+        classification.valve_data_parsed = False
+        return
+
+    classification.valve_data_parsed = True
+    valve_status = payload[2]
+    _apply_valve_status(classification, valve_status)
+    classification.valve_error = payload[3]
+    classification.valve_time_hours = payload[4]
+    classification.valve_time_minutes = payload[5]
+
+    if has_connection_counter:
+        if len(payload) > 6:
+            classification.connection_counter = payload[6]
+        if len(payload) > 8:
+            classification.bootloader_version = payload[8]
+        if len(payload) > 9:
+            classification.valve_series_version = payload[9]
+        if len(payload) > 10:
+            classification.radio_protocol_version = payload[10]
+        if len(payload) > 11:
+            classification.valve_type = payload[11]
+    else:
+        if len(payload) > 6:
+            classification.bootloader_version = payload[6]
+        if len(payload) > 7:
+            classification.valve_series_version = payload[7]
+        if len(payload) == 12:
+            if len(payload) > 8:
+                classification.radio_protocol_version = payload[8]
+            if len(payload) > 9:
+                classification.valve_type = payload[9]
+        elif len(payload) > 8:
+            classification.valve_type = payload[8]
 
 class ValveDiscoveryManager:
     """Track Bluetooth advertisements originating from known valves."""
@@ -387,6 +475,7 @@ class ValveDiscoveryManager:
                 model=classification.model,
                 is_twin_valve=classification.is_twin_valve,
                 is_400_series=classification.is_400_series,
+                has_connection_counter=classification.has_connection_counter,
                 valve_data_parsed=classification.valve_data_parsed,
                 valve_status=classification.valve_status,
                 salt_sensor_status=classification.salt_sensor_status,
@@ -397,6 +486,9 @@ class ValveDiscoveryManager:
                 valve_time_minutes=classification.valve_time_minutes,
                 valve_type=classification.valve_type,
                 valve_series_version=classification.valve_series_version,
+                connection_counter=classification.connection_counter,
+                bootloader_version=classification.bootloader_version,
+                radio_protocol_version=classification.radio_protocol_version,
             )
             self._devices[service_info.address] = advertisement
             if classification.firmware_version is not None:
