@@ -78,33 +78,27 @@ class ValvePresenceBinarySensor(ChandlerValveEntity, BinarySensorEntity):
                 self._advertisement.radio_protocol_version
             )
         if can_report_low_salt and self._advertisement.salt_sensor_status is not None:
-            attributes["salt_sensor_status"] = (
-                self._advertisement.salt_sensor_status
-            )
             salt_display = _salt_sensor_status_display(
                 self._advertisement.salt_sensor_status
             )
             if salt_display is not None:
-                attributes["salt_sensor_status_display"] = salt_display
+                attributes["salt_sensor_status"] = salt_display
         if self._advertisement.water_status is not None:
-            attributes["water_status"] = self._advertisement.water_status
             water_display = _water_status_display(self._advertisement.water_status)
             if water_display is not None:
-                attributes["water_status_display"] = water_display
+                attributes["water_status"] = water_display
         if self._advertisement.bypass_status is not None:
-            attributes["bypass_status"] = self._advertisement.bypass_status
             bypass_display = _bypass_status_display(
                 self._advertisement.bypass_status
             )
             if bypass_display is not None:
-                attributes["bypass_status_display"] = bypass_display
+                attributes["bypass_status"] = bypass_display
         if self._advertisement.valve_error is not None:
-            attributes["valve_error"] = self._advertisement.valve_error
             error_display = _valve_error_display(
                 self._advertisement.valve_error, is_clack_valve
             )
             if error_display is not None:
-                attributes["valve_error_display"] = error_display
+                attributes["valve_error"] = error_display
         if self._advertisement.valve_time_hours is not None:
             attributes["valve_time_hours"] = self._advertisement.valve_time_hours
         if self._advertisement.valve_time_minutes is not None:
