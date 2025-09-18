@@ -36,6 +36,15 @@ _BLUETOOTH_ADVERTISEMENT_CHANGE: BluetoothChange | None = getattr(
     BluetoothChange, "ADVERTISEMENT", None
 )
 
+_EVB019_VALVE_ERROR_MAP: dict[int, int] = {
+    1: 2,
+    2: 3,
+    4: 4,
+    8: 5,
+    16: 6,
+    32: 7,
+}
+
 
 def _matches_valve_prefix(name: str | None) -> bool:
     """Return ``True`` if the Bluetooth local name matches known prefixes."""
@@ -337,7 +346,8 @@ def _parse_evb019_payload(
     classification.valve_data_parsed = True
     valve_status = payload[2]
     _apply_valve_status(classification, valve_status)
-    classification.valve_error = payload[3]
+    raw_valve_error = payload[3]
+    classification.valve_error = _EVB019_VALVE_ERROR_MAP.get(raw_valve_error, 0)
     classification.valve_time_hours = payload[4]
     classification.valve_time_minutes = payload[5]
 
