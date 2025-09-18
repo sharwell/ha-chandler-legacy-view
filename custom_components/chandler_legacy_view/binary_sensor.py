@@ -76,6 +76,23 @@ class ValvePresenceBinarySensor(ChandlerValveEntity, BinarySensorEntity):
             attributes["firmware_minor"] = self._advertisement.firmware_minor
         if self._advertisement.model:
             attributes["model"] = self._advertisement.model
+        if self._advertisement.is_twin_valve is not None:
+            attributes["is_twin_valve"] = self._advertisement.is_twin_valve
+        if self._advertisement.is_400_series is not None:
+            attributes["is_400_series"] = self._advertisement.is_400_series
+        attributes["has_connection_counter"] = (
+            self._advertisement.has_connection_counter
+        )
+        if self._advertisement.valve_data_parsed is not None:
+            attributes["valve_data_parsed"] = self._advertisement.valve_data_parsed
+        if self._advertisement.connection_counter is not None:
+            attributes["connection_counter"] = self._advertisement.connection_counter
+        if self._advertisement.bootloader_version is not None:
+            attributes["bootloader_version"] = self._advertisement.bootloader_version
+        if self._advertisement.radio_protocol_version is not None:
+            attributes["radio_protocol_version"] = (
+                self._advertisement.radio_protocol_version
+            )
         if self._advertisement.valve_status is not None:
             attributes["valve_status"] = self._advertisement.valve_status
         if self._advertisement.salt_sensor_status is not None:
