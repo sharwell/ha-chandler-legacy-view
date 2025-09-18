@@ -278,9 +278,14 @@ def _apply_valve_status(
     """Populate salt, water and bypass status flags from the valve status bits."""
 
     classification.valve_status = valve_status
-    classification.salt_sensor_status = 1 if valve_status & 0x80 else 0
-    classification.water_status = 1 if valve_status & 0x40 else 0
-    classification.bypass_status = 1 if valve_status & 0x20 else 0
+    if classification.model == "Evb019":
+        classification.salt_sensor_status = 1 if valve_status & 0x02 else 0
+        classification.water_status = 1 if valve_status & 0x04 else 0
+        classification.bypass_status = 1 if valve_status & 0x08 else 0
+    else:
+        classification.salt_sensor_status = 1 if valve_status & 0x80 else 0
+        classification.water_status = 1 if valve_status & 0x40 else 0
+        classification.bypass_status = 1 if valve_status & 0x20 else 0
 
 
 def _parse_evb034_payload(
