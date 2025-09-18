@@ -25,7 +25,6 @@ from .entity import (
     _salt_sensor_status_display,
     _valve_error_display,
     _valve_series_display,
-    _valve_type_display,
     _water_status_display,
 )
 from .models import ValveAdvertisement
@@ -67,26 +66,9 @@ class ValvePresenceBinarySensor(ChandlerValveEntity, BinarySensorEntity):
             attributes["rssi"] = self._advertisement.rssi
         if self._advertisement.name:
             attributes["advertised_name"] = self._advertisement.name
-        if self._advertisement.firmware_version is not None:
-            attributes["firmware_version"] = self._advertisement.firmware_version
-            formatted_version = self._format_firmware_version(self._advertisement)
-            if formatted_version:
-                attributes["firmware_display"] = formatted_version
-        if self._advertisement.firmware_major is not None:
-            attributes["firmware_major"] = self._advertisement.firmware_major
-        if self._advertisement.firmware_minor is not None:
-            attributes["firmware_minor"] = self._advertisement.firmware_minor
-        if self._advertisement.model:
-            attributes["model"] = self._advertisement.model
-        if self._advertisement.is_twin_valve is not None:
-            attributes["is_twin_valve"] = self._advertisement.is_twin_valve
-        if self._advertisement.is_400_series is not None:
-            attributes["is_400_series"] = self._advertisement.is_400_series
-        attributes["has_connection_counter"] = (
-            self._advertisement.has_connection_counter
-        )
-        if self._advertisement.valve_data_parsed is not None:
-            attributes["valve_data_parsed"] = self._advertisement.valve_data_parsed
+        formatted_version = self._format_firmware_version(self._advertisement)
+        if formatted_version:
+            attributes["firmware_version"] = formatted_version
         if self._advertisement.connection_counter is not None:
             attributes["connection_counter"] = self._advertisement.connection_counter
         if self._advertisement.bootloader_version is not None:
@@ -95,45 +77,34 @@ class ValvePresenceBinarySensor(ChandlerValveEntity, BinarySensorEntity):
             attributes["radio_protocol_version"] = (
                 self._advertisement.radio_protocol_version
             )
-        if self._advertisement.valve_status is not None:
-            attributes["valve_status"] = self._advertisement.valve_status
         if can_report_low_salt and self._advertisement.salt_sensor_status is not None:
-            attributes["salt_sensor_status"] = (
-                self._advertisement.salt_sensor_status
-            )
             salt_display = _salt_sensor_status_display(
                 self._advertisement.salt_sensor_status
             )
             if salt_display is not None:
-                attributes["salt_sensor_status_display"] = salt_display
+                attributes["salt_sensor_status"] = salt_display
         if self._advertisement.water_status is not None:
-            attributes["water_status"] = self._advertisement.water_status
             water_display = _water_status_display(self._advertisement.water_status)
             if water_display is not None:
-                attributes["water_status_display"] = water_display
+                attributes["water_status"] = water_display
         if self._advertisement.bypass_status is not None:
-            attributes["bypass_status"] = self._advertisement.bypass_status
             bypass_display = _bypass_status_display(
                 self._advertisement.bypass_status
             )
             if bypass_display is not None:
-                attributes["bypass_status_display"] = bypass_display
+                attributes["bypass_status"] = bypass_display
         if self._advertisement.valve_error is not None:
-            attributes["valve_error"] = self._advertisement.valve_error
             error_display = _valve_error_display(
                 self._advertisement.valve_error, is_clack_valve
             )
             if error_display is not None:
-                attributes["valve_error_display"] = error_display
+                attributes["valve_error"] = error_display
         if self._advertisement.valve_time_hours is not None:
             attributes["valve_time_hours"] = self._advertisement.valve_time_hours
         if self._advertisement.valve_time_minutes is not None:
             attributes["valve_time_minutes"] = self._advertisement.valve_time_minutes
         if self._advertisement.valve_type is not None:
             attributes["valve_type"] = self._advertisement.valve_type
-            type_display = _valve_type_display(self._advertisement.valve_type)
-            if type_display is not None:
-                attributes["valve_type_display"] = type_display
         if self._advertisement.valve_series_version is not None:
             attributes["valve_series_version"] = (
                 self._advertisement.valve_series_version

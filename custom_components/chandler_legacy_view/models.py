@@ -30,7 +30,8 @@ class ValveAdvertisement:
     valve_error: int | None = None
     valve_time_hours: int | None = None
     valve_time_minutes: int | None = None
-    valve_type: int | None = None
+    valve_type_full: int | None = None
+    valve_type: str | None = None
     valve_series_version: int | None = None
     connection_counter: int | None = None
     bootloader_version: int | None = None

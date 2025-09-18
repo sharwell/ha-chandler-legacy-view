@@ -16,6 +16,7 @@ from homeassistant.components.bluetooth import (
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant
 
 from .const import CSI_MANUFACTURER_ID, VALVE_MATCHERS, VALVE_NAME_PREFIXES
+from .entity import _is_clack_valve
 from .models import ValveAdvertisement
 
 _LOGGER = logging.getLogger(__name__)
@@ -25,6 +26,60 @@ ValveListener = Callable[[ValveAdvertisement, BluetoothChange], None]
 _VALVE_NAME_PREFIXES_CASEFOLD = tuple(
     prefix.casefold() for prefix in VALVE_NAME_PREFIXES
 )
+
+_CLACK_VALVE_TYPE_MAP: dict[int, str] = {
+    1: "MeteredSoftener",
+    4: "MeteredSoftener",
+    6: "MeteredSoftener",
+    8: "MeteredSoftener",
+    2: "BackwashingFilter",
+    5: "BackwashingFilter",
+    7: "BackwashingFilter",
+    9: "BackwashingFilter",
+    3: "ClackAeration",
+}
+
+_STANDARD_VALVE_TYPE_MAP: dict[int, str] = {
+    1: "MeteredSoftener",
+    3: "MeteredSoftener",
+    19: "MeteredSoftener",
+    21: "MeteredSoftener",
+    2: "TimeClockSoftener",
+    4: "BackwashingFilter",
+    5: "BackwashingFilter",
+    6: "BackwashingFilter",
+    7: "BackwashingFilter",
+    20: "BackwashingFilter",
+    22: "BackwashingFilter",
+    26: "BackwashingFilter",
+    27: "BackwashingFilter",
+    8: "UltraFilter",
+    9: "CenturionNitro",
+    11: "CenturionNitro",
+    10: "CenturionNitroSidekick",
+    12: "CenturionNitroSidekick",
+    13: "NitroPro",
+    14: "NitroProSidekick",
+    15: "NitroProSidekick",
+    16: "CenturionNitroSidekickV3",
+    17: "CommercialMeteredSoftener",
+    18: "CommercialBackwashingFilter",
+    23: "NitroFilter",
+    24: "Sidekick",
+    25: "CommercialAeration",
+}
+
+def _map_valve_type(value: int | None, is_clack_valve: bool) -> str | None:
+    """Map a raw valve type value to the consolidated CsValveType string."""
+
+    if value is None:
+        return None
+
+    if is_clack_valve:
+        return _CLACK_VALVE_TYPE_MAP.get(value, "Unknown")
+
+    return _STANDARD_VALVE_TYPE_MAP.get(value, "Unknown")
+
 
 BLUETOOTH_LOST_CHANGES: tuple[BluetoothChange, ...] = tuple(
     getattr(BluetoothChange, change_name)
@@ -110,7 +165,8 @@ class _ManufacturerClassification:
     valve_error: int | None = None
     valve_time_hours: int | None = None
     valve_time_minutes: int | None = None
-    valve_type: int | None = None
+    valve_type_full: int | None = None
+    valve_type: str | None = None
     valve_series_version: int | None = None
     connection_counter: int | None = None
     bootloader_version: int | None = None
@@ -315,7 +371,7 @@ def _parse_evb034_payload(
     classification.valve_error = payload[3]
     classification.valve_time_hours = payload[4]
     classification.valve_time_minutes = payload[5]
-    classification.valve_type = payload[6]
+    classification.valve_type_full = payload[6]
     classification.valve_series_version = payload[7]
 
 
@@ -361,7 +417,7 @@ def _parse_evb019_payload(
         if len(payload) > 10:
             classification.radio_protocol_version = payload[10]
         if len(payload) > 11:
-            classification.valve_type = payload[11]
+            classification.valve_type_full = payload[11]
     else:
         if len(payload) > 6:
             classification.bootloader_version = payload[6]
@@ -371,9 +427,9 @@ def _parse_evb019_payload(
             if len(payload) > 8:
                 classification.radio_protocol_version = payload[8]
             if len(payload) > 9:
-                classification.valve_type = payload[9]
+                classification.valve_type_full = payload[9]
         elif len(payload) > 8:
-            classification.valve_type = payload[8]
+            classification.valve_type_full = payload[8]
 
 class ValveDiscoveryManager:
     """Track Bluetooth advertisements originating from known valves."""
@@ -478,6 +534,11 @@ class ValveDiscoveryManager:
                 )
                 return
 
+            is_clack_valve = _is_clack_valve(service_info.name)
+            classification.valve_type = _map_valve_type(
+                classification.valve_type_full, is_clack_valve
+            )
+
             advertisement = ValveAdvertisement(
                 address=service_info.address,
                 name=service_info.name,
@@ -499,6 +560,7 @@ class ValveDiscoveryManager:
                 valve_error=classification.valve_error,
                 valve_time_hours=classification.valve_time_hours,
                 valve_time_minutes=classification.valve_time_minutes,
+                valve_type_full=classification.valve_type_full,
                 valve_type=classification.valve_type,
                 valve_series_version=classification.valve_series_version,
                 connection_counter=classification.connection_counter,
