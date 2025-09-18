@@ -19,4 +19,10 @@ class ValveAdvertisement:
     firmware_minor: int | None = None
     firmware_version: int | None = None
     model: str | None = None
+    valve_status: int | None = None
+    valve_error: int | None = None
+    valve_time_hours: int | None = None
+    valve_time_minutes: int | None = None
+    valve_type: int | None = None
+    valve_series_version: int | None = None
 

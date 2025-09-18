@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import Any, Dict, Mapping
 
 from homeassistant.components.bluetooth import (
@@ -80,14 +81,31 @@ def _flatten_manufacturer_data(value: Any) -> bytes | None:
         return None
 
 
+@dataclass(slots=True)
+class _ManufacturerClassification:
+    """Details parsed from a Chandler manufacturer data payload."""
+
+    is_csi_device: bool
+    firmware_major: int | None = None
+    firmware_minor: int | None = None
+    firmware_version: int | None = None
+    model: str | None = None
+    valve_status: int | None = None
+    valve_error: int | None = None
+    valve_time_hours: int | None = None
+    valve_time_minutes: int | None = None
+    valve_type: int | None = None
+    valve_series_version: int | None = None
+
+
 def _classify_manufacturer_data(
     manufacturer_data: Mapping[int, bytes]
-) -> tuple[bool, int | None, int | None, int | None, str | None]:
+) -> _ManufacturerClassification:
     """Identify Chandler valves and extract firmware details from manufacturer data."""
 
     raw_payload = manufacturer_data.get(CSI_MANUFACTURER_ID)
     if raw_payload is None:
-        return False, None, None, None, None
+        return _ManufacturerClassification(False)
 
     payload = _flatten_manufacturer_data(raw_payload)
     if payload is None:
@@ -96,7 +114,7 @@ def _classify_manufacturer_data(
             CSI_MANUFACTURER_ID,
             raw_payload,
         )
-        return True, None, None, None, None
+        return _ManufacturerClassification(True)
 
     if len(payload) < 2:
         _LOGGER.debug(
@@ -104,7 +122,7 @@ def _classify_manufacturer_data(
             CSI_MANUFACTURER_ID,
             payload,
         )
-        return True, None, None, None, None
+        return _ManufacturerClassification(True)
 
     firmware_major = payload[-2]
     firmware_minor_raw = payload[-1]
@@ -115,7 +133,24 @@ def _classify_manufacturer_data(
         model = "Evb034"
     else:
         model = "Evb019"
-    return True, firmware_major, firmware_minor, firmware_version, model
+
+    classification = _ManufacturerClassification(
+        True,
+        firmware_major,
+        firmware_minor,
+        firmware_version,
+        model,
+    )
+
+    if len(payload) >= 10 and payload[0:2] == b"\x07\x3a":
+        classification.valve_status = payload[2]
+        classification.valve_error = payload[3]
+        classification.valve_time_hours = payload[4]
+        classification.valve_time_minutes = payload[5]
+        classification.valve_type = payload[6]
+        classification.valve_series_version = payload[7]
+
+    return classification
 
 
 class ValveDiscoveryManager:
@@ -192,15 +227,11 @@ class ValveDiscoveryManager:
                 )
                 return
 
-            (
-                is_csi_device,
-                firmware_major,
-                firmware_minor,
-                firmware_version,
-                model,
-            ) = _classify_manufacturer_data(service_info.manufacturer_data)
+            classification = _classify_manufacturer_data(
+                service_info.manufacturer_data
+            )
 
-            if not is_csi_device:
+            if not classification.is_csi_device:
                 _LOGGER.debug(
                     "Ignoring Bluetooth advertisement from %s; manufacturer data %s does not match Chandler signature",
                     service_info.address,
@@ -214,18 +245,24 @@ class ValveDiscoveryManager:
                 rssi=service_info.rssi,
                 manufacturer_data=service_info.manufacturer_data,
                 service_data=service_info.service_data,
-                firmware_major=firmware_major,
-                firmware_minor=firmware_minor,
-                firmware_version=firmware_version,
-                model=model,
+                firmware_major=classification.firmware_major,
+                firmware_minor=classification.firmware_minor,
+                firmware_version=classification.firmware_version,
+                model=classification.model,
+                valve_status=classification.valve_status,
+                valve_error=classification.valve_error,
+                valve_time_hours=classification.valve_time_hours,
+                valve_time_minutes=classification.valve_time_minutes,
+                valve_type=classification.valve_type,
+                valve_series_version=classification.valve_series_version,
             )
             self._devices[service_info.address] = advertisement
-            if firmware_version is not None:
+            if classification.firmware_version is not None:
                 _LOGGER.debug(
                     "Valve %s seen (RSSI=%s, firmware=%s)",
                     service_info.address,
                     service_info.rssi,
-                    firmware_version,
+                    classification.firmware_version,
                 )
             else:
                 _LOGGER.debug(

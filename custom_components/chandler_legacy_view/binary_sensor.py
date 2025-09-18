@@ -15,7 +15,15 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DATA_DISCOVERY_MANAGER, DOMAIN
 from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
-from .entity import ChandlerValveEntity
+from .entity import (
+    ChandlerValveEntity,
+    _VALVE_SERIES_EVB034_DISPLAY,
+    _VALVE_SERIES_EBX044_DISPLAY,
+    _is_clack_valve,
+    _valve_error_display,
+    _valve_series_display,
+    _valve_type_display,
+)
 from .models import ValveAdvertisement
 
 
@@ -49,6 +57,7 @@ class ValvePresenceBinarySensor(ChandlerValveEntity, BinarySensorEntity):
         """Provide metadata about the most recent advertisement."""
 
         attributes: dict[str, int | str] = {}
+        is_clack_valve = _is_clack_valve(self._advertisement.name)
         if self._advertisement.rssi is not None:
             attributes["rssi"] = self._advertisement.rssi
         if self._advertisement.name:
@@ -64,6 +73,38 @@ class ValvePresenceBinarySensor(ChandlerValveEntity, BinarySensorEntity):
             attributes["firmware_minor"] = self._advertisement.firmware_minor
         if self._advertisement.model:
             attributes["model"] = self._advertisement.model
+        if self._advertisement.valve_status is not None:
+            attributes["valve_status"] = self._advertisement.valve_status
+        if self._advertisement.valve_error is not None:
+            attributes["valve_error"] = self._advertisement.valve_error
+            error_display = _valve_error_display(
+                self._advertisement.valve_error, is_clack_valve
+            )
+            if error_display is not None:
+                attributes["valve_error_display"] = error_display
+        if self._advertisement.valve_time_hours is not None:
+            attributes["valve_time_hours"] = self._advertisement.valve_time_hours
+        if self._advertisement.valve_time_minutes is not None:
+            attributes["valve_time_minutes"] = self._advertisement.valve_time_minutes
+        if self._advertisement.valve_type is not None:
+            attributes["valve_type"] = self._advertisement.valve_type
+            type_display = _valve_type_display(self._advertisement.valve_type)
+            if type_display is not None:
+                attributes["valve_type_display"] = type_display
+        if self._advertisement.valve_series_version is not None:
+            attributes["valve_series_version"] = (
+                self._advertisement.valve_series_version
+            )
+            evb034_display = _valve_series_display(
+                _VALVE_SERIES_EVB034_DISPLAY, self._advertisement.valve_series_version
+            )
+            if evb034_display is not None:
+                attributes["valve_series_version_evb034_display"] = evb034_display
+            ebx044_display = _valve_series_display(
+                _VALVE_SERIES_EBX044_DISPLAY, self._advertisement.valve_series_version
+            )
+            if ebx044_display is not None:
+                attributes["valve_series_version_ebx044_display"] = ebx044_display
         return attributes
 
 

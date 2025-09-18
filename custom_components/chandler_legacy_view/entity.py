@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from homeassistant.helpers.entity import DeviceInfo, Entity
 
 from .const import (
@@ -15,6 +17,44 @@ from .models import ValveAdvertisement
 
 
 _CLACK_NAME_PREFIX = "cl_"
+_VALVE_ERROR_TIMEOUT_CODE = 7
+
+_VALVE_ERROR_DISPLAY: dict[int, str] = {
+    0: "No Error",
+    2: "Lost home, but looking for home",
+    3: "Not seeing slots, normal motor current",
+    4: "Lost home, can't find it after looking",
+    5: "Not seeing slots, high motor current",
+    6: "Not seeing slots, no motor current",
+    192: "Regen aborted, can't start a regen while on battery",
+}
+
+_VALVE_TYPE_DISPLAY: dict[int, str] = {
+    0: "Unknown",
+    254: "Commercial test valve",
+    255: "Test valve",
+}
+_VALVE_TYPE_DISPLAY.update({index: f"Valve type {index:02d}" for index in range(1, 28)})
+
+_VALVE_SERIES_EVB034_DISPLAY: dict[int, str] = {
+    0: "Unknown",
+    2: "Series 2",
+    3: "Series 3",
+    4: "Series 4",
+    5: "Series 5",
+    6: "Series 6",
+}
+
+_VALVE_SERIES_EBX044_DISPLAY: dict[int, str] = {
+    0: "Unknown",
+    1: "Series 1",
+    2: "Series 2",
+    3: "Series 3",
+    4: "Series 4",
+    5: "Series 5",
+    6: "Series 6",
+    7: "Series 7",
+}
 
 
 def friendly_name_from_advertised_name(advertised_name: str | None) -> str:
@@ -36,6 +76,34 @@ def _is_clack_valve(advertised_name: str | None) -> bool:
     if not advertised_name:
         return False
     return advertised_name.strip().casefold().startswith(_CLACK_NAME_PREFIX)
+
+
+def _valve_error_display(error_code: int | None, is_clack_valve: bool) -> str | None:
+    """Return the display string for a valve error enumeration value."""
+
+    if error_code is None:
+        return None
+    if error_code == _VALVE_ERROR_TIMEOUT_CODE:
+        return "Drive 1 motor timeout error" if is_clack_valve else "TWEDO motor timeout error"
+    return _VALVE_ERROR_DISPLAY.get(error_code)
+
+
+def _valve_type_display(valve_type: int | None) -> str | None:
+    """Return the display string for a valve type enumeration value."""
+
+    if valve_type is None:
+        return None
+    return _VALVE_TYPE_DISPLAY.get(valve_type)
+
+
+def _valve_series_display(
+    mapping: Mapping[int, str], series_value: int | None
+) -> str | None:
+    """Return the display string for a valve series enumeration value."""
+
+    if series_value is None:
+        return None
+    return mapping.get(series_value)
 
 
 def _convert_version_number_to_string(
