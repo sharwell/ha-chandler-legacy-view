@@ -91,6 +91,9 @@ class _ManufacturerClassification:
     firmware_version: int | None = None
     model: str | None = None
     valve_status: int | None = None
+    salt_sensor_status: int | None = None
+    water_status: int | None = None
+    bypass_status: int | None = None
     valve_error: int | None = None
     valve_time_hours: int | None = None
     valve_time_minutes: int | None = None
@@ -143,7 +146,11 @@ def _classify_manufacturer_data(
     )
 
     if len(payload) >= 10 and payload[0:2] == b"\x07\x3a":
-        classification.valve_status = payload[2]
+        valve_status = payload[2]
+        classification.valve_status = valve_status
+        classification.salt_sensor_status = 1 if valve_status & 0x80 else 0
+        classification.water_status = 1 if valve_status & 0x40 else 0
+        classification.bypass_status = 1 if valve_status & 0x20 else 0
         classification.valve_error = payload[3]
         classification.valve_time_hours = payload[4]
         classification.valve_time_minutes = payload[5]
@@ -250,6 +257,9 @@ class ValveDiscoveryManager:
                 firmware_version=classification.firmware_version,
                 model=classification.model,
                 valve_status=classification.valve_status,
+                salt_sensor_status=classification.salt_sensor_status,
+                water_status=classification.water_status,
+                bypass_status=classification.bypass_status,
                 valve_error=classification.valve_error,
                 valve_time_hours=classification.valve_time_hours,
                 valve_time_minutes=classification.valve_time_minutes,

@@ -56,6 +56,24 @@ _VALVE_SERIES_EBX044_DISPLAY: dict[int, str] = {
     7: "Series 7",
 }
 
+_SALT_SENSOR_STATUS_DISPLAY: dict[int, str] = {
+    -1: "Unknown",
+    0: "Salt okay",
+    1: "Salt low",
+}
+
+_WATER_STATUS_DISPLAY: dict[int, str] = {
+    -1: "Unknown",
+    0: "Water on",
+    1: "Water off",
+}
+
+_BYPASS_STATUS_DISPLAY: dict[int, str] = {
+    -1: "Unknown",
+    0: "Bypass off",
+    1: "Bypass on",
+}
+
 
 def friendly_name_from_advertised_name(advertised_name: str | None) -> str:
     """Return a friendly valve name for a Bluetooth advertised local name."""
@@ -94,6 +112,30 @@ def _valve_type_display(valve_type: int | None) -> str | None:
     if valve_type is None:
         return None
     return _VALVE_TYPE_DISPLAY.get(valve_type)
+
+
+def _salt_sensor_status_display(status: int | None) -> str | None:
+    """Return the display string for a salt sensor status enumeration value."""
+
+    if status is None:
+        return None
+    return _SALT_SENSOR_STATUS_DISPLAY.get(status)
+
+
+def _water_status_display(status: int | None) -> str | None:
+    """Return the display string for a water status enumeration value."""
+
+    if status is None:
+        return None
+    return _WATER_STATUS_DISPLAY.get(status)
+
+
+def _bypass_status_display(status: int | None) -> str | None:
+    """Return the display string for a bypass status enumeration value."""
+
+    if status is None:
+        return None
+    return _BYPASS_STATUS_DISPLAY.get(status)
 
 
 def _valve_series_display(

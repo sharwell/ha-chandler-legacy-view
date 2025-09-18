@@ -19,10 +19,13 @@ from .entity import (
     ChandlerValveEntity,
     _VALVE_SERIES_EVB034_DISPLAY,
     _VALVE_SERIES_EBX044_DISPLAY,
+    _bypass_status_display,
     _is_clack_valve,
+    _salt_sensor_status_display,
     _valve_error_display,
     _valve_series_display,
     _valve_type_display,
+    _water_status_display,
 )
 from .models import ValveAdvertisement
 
@@ -75,6 +78,27 @@ class ValvePresenceBinarySensor(ChandlerValveEntity, BinarySensorEntity):
             attributes["model"] = self._advertisement.model
         if self._advertisement.valve_status is not None:
             attributes["valve_status"] = self._advertisement.valve_status
+        if self._advertisement.salt_sensor_status is not None:
+            attributes["salt_sensor_status"] = (
+                self._advertisement.salt_sensor_status
+            )
+            salt_display = _salt_sensor_status_display(
+                self._advertisement.salt_sensor_status
+            )
+            if salt_display is not None:
+                attributes["salt_sensor_status_display"] = salt_display
+        if self._advertisement.water_status is not None:
+            attributes["water_status"] = self._advertisement.water_status
+            water_display = _water_status_display(self._advertisement.water_status)
+            if water_display is not None:
+                attributes["water_status_display"] = water_display
+        if self._advertisement.bypass_status is not None:
+            attributes["bypass_status"] = self._advertisement.bypass_status
+            bypass_display = _bypass_status_display(
+                self._advertisement.bypass_status
+            )
+            if bypass_display is not None:
+                attributes["bypass_status_display"] = bypass_display
         if self._advertisement.valve_error is not None:
             attributes["valve_error"] = self._advertisement.valve_error
             error_display = _valve_error_display(

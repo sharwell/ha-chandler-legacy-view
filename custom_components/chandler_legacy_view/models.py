@@ -20,6 +20,9 @@ class ValveAdvertisement:
     firmware_version: int | None = None
     model: str | None = None
     valve_status: int | None = None
+    salt_sensor_status: int | None = None
+    water_status: int | None = None
+    bypass_status: int | None = None
     valve_error: int | None = None
     valve_time_hours: int | None = None
     valve_time_minutes: int | None = None
