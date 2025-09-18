@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
-from typing import Dict, Mapping
+from collections.abc import Callable, Iterable
+from typing import Any, Dict, Mapping
 
 from homeassistant.components.bluetooth import (
     BluetoothChange,
@@ -48,14 +48,55 @@ def _matches_valve_prefix(name: str | None) -> bool:
     )
 
 
+def _flatten_manufacturer_data(value: Any) -> bytes | None:
+    """Collapse a manufacturer data value into a single ``bytes`` object."""
+
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value)
+
+    if isinstance(value, str):
+        return value.encode()
+
+    if isinstance(value, int):
+        if 0 <= value <= 255:
+            return bytes((value,))
+        return None
+
+    if isinstance(value, Mapping):
+        return _flatten_manufacturer_data(value.values())
+
+    if isinstance(value, Iterable):
+        flattened = bytearray()
+        for item in value:
+            part = _flatten_manufacturer_data(item)
+            if part is None:
+                return None
+            flattened.extend(part)
+        return bytes(flattened)
+
+    try:
+        return bytes(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _classify_manufacturer_data(
     manufacturer_data: Mapping[int, bytes]
 ) -> tuple[bool, int | None, int | None, int | None, str | None]:
     """Identify Chandler valves and extract firmware details from manufacturer data."""
 
-    payload = manufacturer_data.get(CSI_MANUFACTURER_ID)
-    if payload is None:
+    raw_payload = manufacturer_data.get(CSI_MANUFACTURER_ID)
+    if raw_payload is None:
         return False, None, None, None, None
+
+    payload = _flatten_manufacturer_data(raw_payload)
+    if payload is None:
+        _LOGGER.debug(
+            "Manufacturer data for Chandler valve (id %s) had unexpected structure: %s",
+            CSI_MANUFACTURER_ID,
+            raw_payload,
+        )
+        return True, None, None, None, None
 
     if len(payload) < 2:
         _LOGGER.debug(

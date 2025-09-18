@@ -14,6 +14,9 @@ from .const import (
 from .models import ValveAdvertisement
 
 
+_CLACK_NAME_PREFIX = "cl_"
+
+
 def friendly_name_from_advertised_name(advertised_name: str | None) -> str:
     """Return a friendly valve name for a Bluetooth advertised local name."""
 
@@ -25,6 +28,30 @@ def friendly_name_from_advertised_name(advertised_name: str | None) -> str:
         return DEFAULT_FRIENDLY_NAME
 
     return FRIENDLY_NAME_OVERRIDES.get(normalized_name, DEFAULT_FRIENDLY_NAME)
+
+
+def _is_clack_valve(advertised_name: str | None) -> bool:
+    """Return ``True`` if the Bluetooth name indicates a Clack valve."""
+
+    if not advertised_name:
+        return False
+    return advertised_name.strip().casefold().startswith(_CLACK_NAME_PREFIX)
+
+
+def _convert_version_number_to_string(
+    firmware_version: int, is_clack_valve: bool
+) -> str:
+    """Render a firmware version number similar to Chandler's mobile app."""
+
+    if 100 <= firmware_version <= 199:
+        prefix = "D"
+    elif is_clack_valve:
+        prefix = "L"
+    else:
+        prefix = "C"
+    major = firmware_version // 100
+    minor = firmware_version % 100
+    return f"{prefix}{major}.{minor:02d}"
 
 
 class ChandlerValveEntity(Entity):
@@ -67,9 +94,20 @@ class ChandlerValveEntity(Entity):
     def _format_firmware_version(self, advertisement: ValveAdvertisement) -> str | None:
         """Format the firmware version reported by the advertisement."""
 
-        if (
-            advertisement.firmware_major is None
-            or advertisement.firmware_minor is None
-        ):
+        firmware_version = advertisement.firmware_version
+        if firmware_version is None:
+            if (
+                advertisement.firmware_major is None
+                or advertisement.firmware_minor is None
+            ):
+                return None
+            firmware_version = (
+                advertisement.firmware_major * 100 + advertisement.firmware_minor
+            )
+
+        if firmware_version < 0:
             return None
-        return f"{advertisement.firmware_major}.{advertisement.firmware_minor:02d}"
+
+        return _convert_version_number_to_string(
+            firmware_version, _is_clack_valve(advertisement.name)
+        )
