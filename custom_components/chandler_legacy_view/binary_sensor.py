@@ -67,26 +67,9 @@ class ValvePresenceBinarySensor(ChandlerValveEntity, BinarySensorEntity):
             attributes["rssi"] = self._advertisement.rssi
         if self._advertisement.name:
             attributes["advertised_name"] = self._advertisement.name
-        if self._advertisement.firmware_version is not None:
-            attributes["firmware_version"] = self._advertisement.firmware_version
-            formatted_version = self._format_firmware_version(self._advertisement)
-            if formatted_version:
-                attributes["firmware_display"] = formatted_version
-        if self._advertisement.firmware_major is not None:
-            attributes["firmware_major"] = self._advertisement.firmware_major
-        if self._advertisement.firmware_minor is not None:
-            attributes["firmware_minor"] = self._advertisement.firmware_minor
-        if self._advertisement.model:
-            attributes["model"] = self._advertisement.model
-        if self._advertisement.is_twin_valve is not None:
-            attributes["is_twin_valve"] = self._advertisement.is_twin_valve
-        if self._advertisement.is_400_series is not None:
-            attributes["is_400_series"] = self._advertisement.is_400_series
-        attributes["has_connection_counter"] = (
-            self._advertisement.has_connection_counter
-        )
-        if self._advertisement.valve_data_parsed is not None:
-            attributes["valve_data_parsed"] = self._advertisement.valve_data_parsed
+        formatted_version = self._format_firmware_version(self._advertisement)
+        if formatted_version:
+            attributes["firmware_version"] = formatted_version
         if self._advertisement.connection_counter is not None:
             attributes["connection_counter"] = self._advertisement.connection_counter
         if self._advertisement.bootloader_version is not None:
