@@ -101,16 +101,120 @@ class _ManufacturerClassification:
     valve_series_version: int | None = None
 
 
+def _has_manufacturer_data_values(value: Any) -> bool:
+    """Return ``True`` if the manufacturer data value contains at least one item."""
+
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return len(value) > 0
+
+    if isinstance(value, str):
+        return len(value) > 0
+
+    if isinstance(value, int):
+        return True
+
+    if isinstance(value, Mapping):
+        return any(_has_manufacturer_data_values(item) for item in value.values())
+
+    if isinstance(value, Iterable):
+        for item in value:
+            if _has_manufacturer_data_values(item):
+                return True
+        return False
+
+    return value is not None
+
+
+def _extract_raw_manufacturer_segments(
+    raw_advertisement: bytes | bytearray | memoryview | None,
+) -> list[tuple[bytes, bool]]:
+    """Return raw Chandler manufacturer segments from a Bluetooth advertisement."""
+
+    if not raw_advertisement:
+        return []
+
+    data = bytes(raw_advertisement)
+    if not data:
+        return []
+
+    index = 0
+    total_length = len(data)
+    prefix_le = CSI_MANUFACTURER_ID.to_bytes(2, "little")
+    prefix_be = CSI_MANUFACTURER_ID.to_bytes(2, "big")
+    segments: list[tuple[bytes, bool]] = []
+
+    while index < total_length:
+        segment_length = data[index]
+        index += 1
+        if segment_length == 0:
+            break
+
+        if index + segment_length > total_length:
+            break
+
+        ad_type = data[index]
+        index += 1
+        payload_length = segment_length - 1
+        segment_payload = data[index : index + payload_length]
+        index += payload_length
+
+        if ad_type != 0xFF or payload_length < 2:
+            continue
+
+        if segment_payload.startswith(prefix_le):
+            segments.append((bytes(segment_payload), True))
+        elif segment_payload.startswith(prefix_be):
+            segments.append((bytes(segment_payload), False))
+
+    return segments
+
+
+def _combine_manufacturer_segments(segments: list[tuple[bytes, bool]]) -> bytes | None:
+    """Collapse segmented manufacturer data into a single payload."""
+
+    if not segments:
+        return None
+
+    combined = bytearray()
+    prefix_be = CSI_MANUFACTURER_ID.to_bytes(2, "big")
+
+    first_segment, is_little_endian = segments[0]
+    if is_little_endian:
+        combined.extend(prefix_be)
+        combined.extend(first_segment[2:])
+    else:
+        combined.extend(first_segment)
+
+    for segment, _ in segments[1:]:
+        combined.extend(segment[2:])
+
+    return bytes(combined)
+
+
+def _get_full_manufacturer_payload(
+    raw_payload: Any, raw_advertisement: bytes | bytearray | memoryview | None
+) -> bytes | None:
+    """Return the complete Chandler manufacturer payload."""
+
+    segments = _extract_raw_manufacturer_segments(raw_advertisement)
+    payload = _combine_manufacturer_segments(segments)
+    if payload is not None:
+        return payload
+
+    return _flatten_manufacturer_data(raw_payload)
+
+
 def _classify_manufacturer_data(
-    manufacturer_data: Mapping[int, bytes]
+    manufacturer_data: Mapping[int, bytes],
+    raw_advertisement: bytes | bytearray | memoryview | None,
 ) -> _ManufacturerClassification:
     """Identify Chandler valves and extract firmware details from manufacturer data."""
 
     raw_payload = manufacturer_data.get(CSI_MANUFACTURER_ID)
-    if raw_payload is None:
+    if raw_payload is None or not _has_manufacturer_data_values(raw_payload):
         return _ManufacturerClassification(False)
 
-    payload = _flatten_manufacturer_data(raw_payload)
+    payload = _get_full_manufacturer_payload(raw_payload, raw_advertisement)
     if payload is None:
         _LOGGER.debug(
             "Manufacturer data for Chandler valve (id %s) had unexpected structure: %s",
@@ -235,7 +339,8 @@ class ValveDiscoveryManager:
                 return
 
             classification = _classify_manufacturer_data(
-                service_info.manufacturer_data
+                service_info.manufacturer_data,
+                getattr(service_info, "raw", None),
             )
 
             if not classification.is_csi_device:
