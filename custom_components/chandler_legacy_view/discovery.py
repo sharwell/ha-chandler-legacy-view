@@ -90,6 +90,9 @@ class _ManufacturerClassification:
     firmware_minor: int | None = None
     firmware_version: int | None = None
     model: str | None = None
+    is_twin_valve: bool = False
+    is_400_series: bool = False
+    valve_data_parsed: bool = False
     valve_status: int | None = None
     salt_sensor_status: int | None = None
     water_status: int | None = None
@@ -192,14 +195,7 @@ def _get_full_manufacturer_payload(
     """Return the complete Chandler manufacturer payload."""
 
     segments = _extract_raw_manufacturer_segments(raw_advertisement)
-    payload = _combine_manufacturer_segments(segments)
-    if payload is not None:
-        prefix_le = CSI_MANUFACTURER_ID.to_bytes(2, "little")
-        if payload.startswith(prefix_le):
-            return payload[2:]
-        return payload
-
-    return _flatten_manufacturer_data(raw_payload)
+    return _combine_manufacturer_segments(segments)
 
 
 def _classify_manufacturer_data(
@@ -221,7 +217,13 @@ def _classify_manufacturer_data(
         )
         return _ManufacturerClassification(True)
 
-    if len(payload) < 2:
+    prefix_le = CSI_MANUFACTURER_ID.to_bytes(2, "little")
+    if payload.startswith(prefix_le):
+        data = payload[2:]
+    else:
+        data = payload
+
+    if len(data) < 2:
         _LOGGER.debug(
             "Manufacturer data for Chandler valve (id %s) was too short to parse firmware: %s",
             CSI_MANUFACTURER_ID,
@@ -229,8 +231,8 @@ def _classify_manufacturer_data(
         )
         return _ManufacturerClassification(True)
 
-    firmware_major = payload[-2]
-    firmware_minor_raw = payload[-1]
+    firmware_major = data[-2]
+    firmware_minor_raw = data[-1]
     firmware_minor = 99 if firmware_minor_raw >= 250 else firmware_minor_raw
     firmware_version = firmware_major * 100 + firmware_minor
     model: str | None
@@ -247,17 +249,25 @@ def _classify_manufacturer_data(
         model,
     )
 
-    if len(payload) >= 10 and payload[0:2] == b"\x07\x3a":
-        valve_status = payload[2]
+    classification.is_twin_valve = 100 <= firmware_version <= 199
+    classification.is_400_series = 400 <= firmware_version <= 499
+
+    if classification.model == "Evb034":
+        classification.valve_data_parsed = len(data) >= 10
+    else:
+        classification.valve_data_parsed = len(data) >= 2
+
+    if len(data) >= 10 and data[0:2] == b"\x07\x3a":
+        valve_status = data[2]
         classification.valve_status = valve_status
         classification.salt_sensor_status = 1 if valve_status & 0x80 else 0
         classification.water_status = 1 if valve_status & 0x40 else 0
         classification.bypass_status = 1 if valve_status & 0x20 else 0
-        classification.valve_error = payload[3]
-        classification.valve_time_hours = payload[4]
-        classification.valve_time_minutes = payload[5]
-        classification.valve_type = payload[6]
-        classification.valve_series_version = payload[7]
+        classification.valve_error = data[3]
+        classification.valve_time_hours = data[4]
+        classification.valve_time_minutes = data[5]
+        classification.valve_type = data[6]
+        classification.valve_series_version = data[7]
 
     return classification
 
@@ -349,6 +359,22 @@ class ValveDiscoveryManager:
                 )
                 return
 
+            if (
+                (
+                    classification.firmware_version is not None
+                    and classification.firmware_version >= 412
+                )
+                or classification.is_twin_valve
+            ) and not classification.valve_data_parsed:
+                _LOGGER.debug(
+                    "Ignoring Bluetooth advertisement from %s; firmware %s requires parsed valve data",
+                    service_info.address,
+                    classification.firmware_version
+                    if classification.firmware_version is not None
+                    else "unknown",
+                )
+                return
+
             advertisement = ValveAdvertisement(
                 address=service_info.address,
                 name=service_info.name,
@@ -359,6 +385,9 @@ class ValveDiscoveryManager:
                 firmware_minor=classification.firmware_minor,
                 firmware_version=classification.firmware_version,
                 model=classification.model,
+                is_twin_valve=classification.is_twin_valve,
+                is_400_series=classification.is_400_series,
+                valve_data_parsed=classification.valve_data_parsed,
                 valve_status=classification.valve_status,
                 salt_sensor_status=classification.salt_sensor_status,
                 water_status=classification.water_status,

@@ -19,6 +19,9 @@ class ValveAdvertisement:
     firmware_minor: int | None = None
     firmware_version: int | None = None
     model: str | None = None
+    is_twin_valve: bool = False
+    is_400_series: bool = False
+    valve_data_parsed: bool = False
     valve_status: int | None = None
     salt_sensor_status: int | None = None
     water_status: int | None = None
