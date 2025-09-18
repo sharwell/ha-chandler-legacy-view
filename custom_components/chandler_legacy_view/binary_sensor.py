@@ -25,7 +25,6 @@ from .entity import (
     _salt_sensor_status_display,
     _valve_error_display,
     _valve_series_display,
-    _valve_type_display,
     _water_status_display,
 )
 from .models import ValveAdvertisement
@@ -112,11 +111,6 @@ class ValvePresenceBinarySensor(ChandlerValveEntity, BinarySensorEntity):
             attributes["valve_time_minutes"] = self._advertisement.valve_time_minutes
         if self._advertisement.valve_type is not None:
             attributes["valve_type"] = self._advertisement.valve_type
-        if self._advertisement.valve_type_full is not None:
-            attributes["valve_type_full"] = self._advertisement.valve_type_full
-            type_display = _valve_type_display(self._advertisement.valve_type_full)
-            if type_display is not None:
-                attributes["valve_type_display"] = type_display
         if self._advertisement.valve_series_version is not None:
             attributes["valve_series_version"] = (
                 self._advertisement.valve_series_version
