@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import datetime
 from enum import IntEnum
 
@@ -41,6 +41,8 @@ class ValveRequestCommand(IntEnum):
 
 
 _EVB019_REQUEST_PACKET_LENGTH = 20
+_DEVICE_LIST_RESPONSE_TIMEOUT_SECONDS = 5
+_DEFAULT_SERIAL_NUMBER = "FFFFFFFF"
 
 
 class ValveConnection:
@@ -58,6 +60,8 @@ class ValveConnection:
         self._lock = asyncio.Lock()
         self._unloaded = False
         self._request_characteristic: tuple[str, set[str]] | None = None
+        self._serial_number: str | None = None
+        self._device_list_is_twin_valve: bool | None = None
 
     @property
     def address(self) -> str:
@@ -76,6 +80,18 @@ class ValveConnection:
         """Return the timestamp of the last successful poll."""
 
         return self._last_success
+
+    @property
+    def serial_number(self) -> str | None:
+        """Return the serial number parsed from the most recent DeviceList packet."""
+
+        return self._serial_number
+
+    @property
+    def device_list_is_twin_valve(self) -> bool | None:
+        """Return ``True`` if the most recent DeviceList packet identified a twin valve."""
+
+        return self._device_list_is_twin_valve
 
     def update_from_advertisement(self, advertisement: ValveAdvertisement) -> None:
         """Record the most recent Bluetooth advertisement for the valve."""
@@ -193,14 +209,22 @@ class ValveConnection:
             )
             return
 
-        if await self._async_send_request(client, ValveRequestCommand.DEVICE_LIST):
+        request_sent, response_received = await self._async_request_device_list(client)
+        if not request_sent:
             _LOGGER.debug(
-                "Sent DeviceList request to valve %s to prime extended polling",
+                "Unable to send DeviceList request to valve %s; will retry on next poll",
+                self._address,
+            )
+            return
+
+        if response_received:
+            _LOGGER.debug(
+                "Retrieved DeviceList response from valve %s during diagnostic poll",
                 self._address,
             )
         else:
             _LOGGER.debug(
-                "Unable to send DeviceList request to valve %s; will retry on next poll",
+                "Valve %s did not provide a DeviceList response during this poll",
                 self._address,
             )
 
@@ -340,6 +364,182 @@ class ValveConnection:
             return False
 
         return True
+
+    async def _async_request_device_list(
+        self, client: BaseBleakClient
+    ) -> tuple[bool, bool]:
+        """Send a DeviceList request and wait for a matching response packet."""
+
+        loop = asyncio.get_running_loop()
+        response_future: asyncio.Future[bytes] = loop.create_future()
+
+        def _notification_handler(_: int | str, data: bytearray) -> None:
+            if response_future.done():
+                return
+
+            packet = bytes(data)
+            if self._is_device_list_packet(packet):
+                response_future.set_result(packet)
+
+        subscriptions = await self._async_subscribe_to_notifications(
+            client, _notification_handler
+        )
+
+        try:
+            request_sent = await self._async_send_request(
+                client, ValveRequestCommand.DEVICE_LIST
+            )
+            if not request_sent:
+                if not response_future.done():
+                    response_future.cancel()
+                return False, False
+
+            if not subscriptions:
+                if not response_future.done():
+                    response_future.cancel()
+                _LOGGER.debug(
+                    "Valve %s does not expose a notifying characteristic for DeviceList responses",
+                    self._address,
+                )
+                return True, False
+
+            try:
+                async with asyncio.timeout(
+                    _DEVICE_LIST_RESPONSE_TIMEOUT_SECONDS
+                ):
+                    packet = await response_future
+            except asyncio.TimeoutError:
+                if not response_future.done():
+                    response_future.cancel()
+                _LOGGER.debug(
+                    "Timed out waiting for DeviceList response from valve %s",
+                    self._address,
+                )
+                return True, False
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if not response_future.done():
+                    response_future.cancel()
+                _LOGGER.exception(
+                    "Unexpected error while waiting for DeviceList response from valve %s",
+                    self._address,
+                )
+                return True, False
+
+            self._handle_device_list_packet(packet)
+            return True, True
+        finally:
+            await self._async_unsubscribe_notifications(client, subscriptions)
+
+    async def _async_subscribe_to_notifications(
+        self,
+        client: BaseBleakClient,
+        handler: Callable[[int | str, bytearray], None],
+    ) -> list[str]:
+        """Subscribe to every notifying characteristic exposed by the valve."""
+
+        try:
+            services = await client.get_services()
+        except Exception as exc:  # pragma: no cover - bleak raises platform errors
+            _LOGGER.debug(
+                "Unable to resolve GATT services for valve %s while preparing notifications: %s",
+                self._address,
+                exc,
+            )
+            return []
+
+        subscriptions: list[str] = []
+        for service in services:
+            for characteristic in getattr(service, "characteristics", ()):
+                uuid = getattr(characteristic, "uuid", None)
+                if not isinstance(uuid, str):
+                    continue
+
+                properties = set(getattr(characteristic, "properties", ()))
+                if not properties.intersection({"notify", "indicate"}):
+                    continue
+
+                try:
+                    await client.start_notify(uuid, handler)
+                except BLEAK_RETRY_EXCEPTIONS as exc:
+                    _LOGGER.debug(
+                        "Failed to subscribe to notifications from %s on valve %s: %s",
+                        uuid,
+                        self._address,
+                        exc,
+                    )
+                except Exception:  # pragma: no cover - unexpected Bluetooth errors are logged
+                    _LOGGER.exception(
+                        "Unexpected error while subscribing to notifications from valve %s characteristic %s",
+                        self._address,
+                        uuid,
+                    )
+                else:
+                    subscriptions.append(uuid)
+
+        return subscriptions
+
+    async def _async_unsubscribe_notifications(
+        self, client: BaseBleakClient, subscriptions: Iterable[str]
+    ) -> None:
+        """Cancel notification subscriptions for the provided characteristic UUIDs."""
+
+        for uuid in subscriptions:
+            with contextlib.suppress(Exception):
+                await client.stop_notify(uuid)
+
+    def _handle_device_list_packet(self, packet: bytes) -> None:
+        """Update internal state from a DeviceList response packet."""
+
+        self._device_list_is_twin_valve = bool(packet[2])
+
+        serial_number = self._extract_serial_number(packet)
+        if serial_number is None:
+            if self._serial_number is not None:
+                _LOGGER.debug(
+                    "Clearing stored serial number for valve %s due to empty DeviceList value",
+                    self._address,
+                )
+            self._serial_number = None
+            return
+
+        if serial_number != self._serial_number:
+            _LOGGER.debug(
+                "Valve %s reported serial number %s", self._address, serial_number
+            )
+        self._serial_number = serial_number
+
+    def _extract_serial_number(self, packet: bytes) -> str | None:
+        """Return the valve serial number encoded within a DeviceList packet."""
+
+        if len(packet) < 18:
+            _LOGGER.debug(
+                "DeviceList response from valve %s was too short to contain a serial number",
+                self._address,
+            )
+            return None
+
+        # TODO: Determine whether certain Evb019 valves should be treated as "classic"
+        # models when deciding if a DeviceList packet can contain a serial number.
+        serial = "".join(f"{packet[index]:02X}" for index in range(13, 17)).strip()
+        if not serial or serial == _DEFAULT_SERIAL_NUMBER:
+            return None
+
+        return serial
+
+    @staticmethod
+    def _is_device_list_packet(packet: bytes) -> bool:
+        """Return ``True`` if the provided payload matches the DeviceList format."""
+
+        if len(packet) < 3:
+            return False
+
+        opcode = int(ValveRequestCommand.DEVICE_LIST)
+        if packet[0] != opcode or packet[1] != opcode:
+            return False
+
+        return packet[2] in (0, 1)
 
 
 class ValveConnectionManager:
