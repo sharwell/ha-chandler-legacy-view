@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
@@ -236,26 +236,44 @@ async def async_setup_entry(
 
     entry_data = hass.data[DOMAIN][entry.entry_id]
     manager: ValveDiscoveryManager = entry_data[DATA_DISCOVERY_MANAGER]
-    entities: dict[str, list[ChandlerValveEntity]] = {}
+    entities: dict[str, dict[str, ChandlerValveEntity]] = {}
 
-    def _create_entities_for_advertisement(
+    def _ensure_entities_for_advertisement(
         advertisement: ValveAdvertisement,
-    ) -> list[ChandlerValveEntity]:
-        """Instantiate entities backed by the provided advertisement."""
+    ) -> tuple[dict[str, ChandlerValveEntity], list[ChandlerValveEntity]]:
+        """Return existing entities and any newly created ones for an address."""
 
-        entities = [
-            ValvePresenceBinarySensor(advertisement),
-            ValveBypassBinarySensor(advertisement),
-        ]
+        device_entities = entities.get(advertisement.address)
+        if device_entities is None:
+            device_entities = {}
+            entities[advertisement.address] = device_entities
+
+        new_entities: list[ChandlerValveEntity] = []
+
+        def _get_or_create(
+            key: str, factory: Callable[[], ChandlerValveEntity]
+        ) -> ChandlerValveEntity:
+            entity = device_entities.get(key)
+            if entity is None:
+                entity = factory()
+                device_entities[key] = entity
+                new_entities.append(entity)
+            return entity
+
+        _get_or_create(
+            "presence", lambda: ValvePresenceBinarySensor(advertisement)
+        )
+        _get_or_create("bypass", lambda: ValveBypassBinarySensor(advertisement))
+
         if _can_report_low_salt(advertisement.name):
-            entities.append(ValveSaltBinarySensor(advertisement))
-        return entities
+            _get_or_create("salt", lambda: ValveSaltBinarySensor(advertisement))
+
+        return device_entities, new_entities
 
     initial_entities: list[ChandlerValveEntity] = []
     for advertisement in manager.devices.values():
-        device_entities = _create_entities_for_advertisement(advertisement)
-        entities[advertisement.address] = device_entities
-        initial_entities.extend(device_entities)
+        _, new_entities = _ensure_entities_for_advertisement(advertisement)
+        initial_entities.extend(new_entities)
 
     if initial_entities:
         async_add_entities(initial_entities)
@@ -264,18 +282,21 @@ async def async_setup_entry(
     def _handle_discovery(
         advertisement: ValveAdvertisement, change: BluetoothChange
     ) -> None:
-        device_entities = entities.get(advertisement.address)
-        if device_entities is not None:
-            for entity in device_entities:
+        if change in BLUETOOTH_LOST_CHANGES:
+            device_entities = entities.get(advertisement.address)
+            if device_entities is None:
+                return
+            for entity in device_entities.values():
                 entity.async_handle_bluetooth_update(advertisement, change)
             return
 
-        if change in BLUETOOTH_LOST_CHANGES:
-            return
-
-        device_entities = _create_entities_for_advertisement(advertisement)
-        entities[advertisement.address] = device_entities
-        async_add_entities(device_entities)
+        device_entities, new_entities = _ensure_entities_for_advertisement(
+            advertisement
+        )
+        if new_entities:
+            async_add_entities(new_entities)
+        for entity in device_entities.values():
+            entity.async_handle_bluetooth_update(advertisement, change)
 
     remove_listener = manager.async_add_listener(_handle_discovery)
     entry.async_on_unload(remove_listener)
