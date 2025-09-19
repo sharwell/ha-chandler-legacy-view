@@ -20,10 +20,14 @@ from bleak_retry_connector import (
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import BluetoothChange
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.util import dt as dt_util
 
-from .const import CONNECTION_POLL_INTERVAL, CONNECTION_TIMEOUT_SECONDS
+from .const import (
+    CONNECTION_MIN_RETRY_INTERVAL,
+    CONNECTION_POLL_INTERVAL,
+    CONNECTION_TIMEOUT_SECONDS,
+)
 from .device_registry import async_update_device_serial_number
 from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
 from .models import ValveAdvertisement
@@ -90,6 +94,8 @@ class ValveConnection:
         self._last_success: datetime | None = None
         self._lock = asyncio.Lock()
         self._unloaded = False
+        self._next_connection_time: datetime | None = None
+        self._cooldown_cancel: CALLBACK_TYPE | None = None
         self._request_characteristic: tuple[str, set[str]] | None = None
         self._serial_number: str | None = None
         self._device_list_is_twin_valve: bool | None = None
@@ -143,10 +149,45 @@ class ValveConnection:
             return
         self._hass.async_create_task(self.async_poll())
 
+    def _cancel_cooldown(self) -> None:
+        """Cancel any scheduled retry callback."""
+
+        if self._cooldown_cancel is not None:
+            self._cooldown_cancel()
+            self._cooldown_cancel = None
+
+    def _set_connection_cooldown(self) -> None:
+        """Record the time when the next connection attempt is allowed."""
+
+        self._next_connection_time = dt_util.utcnow() + CONNECTION_MIN_RETRY_INTERVAL
+
+    def _schedule_cooldown_retry(self, delay: float) -> None:
+        """Schedule a poll retry once the cooldown expires."""
+
+        if self._cooldown_cancel is not None:
+            return
+
+        if delay <= 0:
+            self._handle_cooldown_complete(dt_util.utcnow())
+            return
+
+        self._cooldown_cancel = async_call_later(
+            self._hass, delay, self._handle_cooldown_complete
+        )
+
+    @callback
+    def _handle_cooldown_complete(self, _: datetime) -> None:
+        """Retry polling after the cooldown period."""
+
+        self._cooldown_cancel = None
+        if self.available:
+            self.schedule_poll()
+
     async def async_unload(self) -> None:
         """Prevent future polls and wait for any active poll to finish."""
 
         self._unloaded = True
+        self._cancel_cooldown()
         async with self._lock:
             return
 
@@ -168,60 +209,83 @@ class ValveConnection:
     async def _async_poll_locked(self) -> None:
         """Perform a Bluetooth connection cycle for the valve."""
 
-        advertisement = self._advertisement
-        if advertisement is None:
+        now = dt_util.utcnow()
+        next_connection_time = self._next_connection_time
+        if next_connection_time is not None and now < next_connection_time:
+            remaining = max((next_connection_time - now).total_seconds(), 0)
             _LOGGER.debug(
-                "Skipping poll for %s; no advertisement data is available", self._address
-            )
-            return
-
-        ble_device = bluetooth.async_ble_device_from_address(
-            self._hass, self._address, connectable=True
-        )
-        if ble_device is None:
-            _LOGGER.debug(
-                "Bluetooth device %s is not currently connectable", self._address
-            )
-            return
-
-        _LOGGER.debug("Connecting to valve %s to refresh diagnostic data", self._address)
-
-        try:
-            async with asyncio.timeout(CONNECTION_TIMEOUT_SECONDS):
-                client = await establish_connection(
-                    BleakClientWithServiceCache,
-                    ble_device,
-                    self._address,
-                )
-        except asyncio.TimeoutError:
-            _LOGGER.warning(
-                "Timed out while attempting to connect to valve %s", self._address
-            )
-            return
-        except BLEAK_RETRY_EXCEPTIONS as exc:
-            _LOGGER.debug(
-                "Unable to establish Bluetooth connection to valve %s: %s",
+                "Skipping poll for %s; retrying after %.1f seconds",
                 self._address,
-                exc,
+                remaining,
             )
-            return
-        except Exception:  # pragma: no cover - unexpected errors are logged
-            _LOGGER.exception(
-                "Unexpected error connecting to valve %s", self._address
-            )
+            self._schedule_cooldown_retry(remaining)
             return
 
+        connection_attempted = False
+
         try:
-            await self._async_fetch_device_information(client)
-        except Exception:  # pragma: no cover - future protocol work may raise
-            _LOGGER.exception(
-                "Error while retrieving extended data from valve %s", self._address
+            advertisement = self._advertisement
+            if advertisement is None:
+                _LOGGER.debug(
+                    "Skipping poll for %s; no advertisement data is available", self._address
+                )
+                return
+
+            ble_device = bluetooth.async_ble_device_from_address(
+                self._hass, self._address, connectable=True
             )
-        else:
-            self._last_success = dt_util.utcnow()
+            if ble_device is None:
+                _LOGGER.debug(
+                    "Bluetooth device %s is not currently connectable", self._address
+                )
+                return
+
+            _LOGGER.debug(
+                "Connecting to valve %s to refresh diagnostic data", self._address
+            )
+
+            connection_attempted = True
+            self._cancel_cooldown()
+
+            try:
+                async with asyncio.timeout(CONNECTION_TIMEOUT_SECONDS):
+                    client = await establish_connection(
+                        BleakClientWithServiceCache,
+                        ble_device,
+                        self._address,
+                    )
+            except asyncio.TimeoutError:
+                _LOGGER.warning(
+                    "Timed out while attempting to connect to valve %s", self._address
+                )
+                return
+            except BLEAK_RETRY_EXCEPTIONS as exc:
+                _LOGGER.debug(
+                    "Unable to establish Bluetooth connection to valve %s: %s",
+                    self._address,
+                    exc,
+                )
+                return
+            except Exception:  # pragma: no cover - unexpected errors are logged
+                _LOGGER.exception(
+                    "Unexpected error connecting to valve %s", self._address
+                )
+                return
+
+            try:
+                await self._async_fetch_device_information(client)
+            except Exception:  # pragma: no cover - future protocol work may raise
+                _LOGGER.exception(
+                    "Error while retrieving extended data from valve %s", self._address
+                )
+            else:
+                self._last_success = dt_util.utcnow()
+            finally:
+                with contextlib.suppress(Exception):
+                    await client.disconnect()
         finally:
-            with contextlib.suppress(Exception):
-                await client.disconnect()
+            if connection_attempted:
+                self._set_connection_cooldown()
 
     async def _async_fetch_device_information(
         self, client: BaseBleakClient
