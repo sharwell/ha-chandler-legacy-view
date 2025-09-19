@@ -7,6 +7,7 @@ import contextlib
 import logging
 from collections.abc import Iterable
 from datetime import datetime
+from enum import IntEnum
 
 from bleak.backends.client import BaseBleakClient
 from bleak_retry_connector import (
@@ -27,6 +28,21 @@ from .models import ValveAdvertisement
 _LOGGER = logging.getLogger(__name__)
 
 
+class ValveRequestCommand(IntEnum):
+    """Known EVB019 request opcodes."""
+
+    RESET = 114
+    SETTINGS = 121
+    DEVICE_LIST = 116
+    DASHBOARD = 117
+    ADVANCED_SETTINGS = 118
+    STATUS_AND_HISTORY = 119
+    DEALER_INFORMATION = 120
+
+
+_EVB019_REQUEST_PACKET_LENGTH = 20
+
+
 class ValveConnection:
     """Handle an active Bluetooth data poll for a valve."""
 
@@ -41,6 +57,7 @@ class ValveConnection:
         self._last_success: datetime | None = None
         self._lock = asyncio.Lock()
         self._unloaded = False
+        self._request_characteristic: tuple[str, set[str]] | None = None
 
     @property
     def address(self) -> str:
@@ -167,11 +184,162 @@ class ValveConnection:
         if self._advertisement is None:
             return
 
-        _LOGGER.debug(
-            "Connected to valve %s (%s); extended polling not yet implemented",
-            self._address,
-            self._advertisement.model or "unknown model",
+        model = self._advertisement.model
+        if model != "Evb019":
+            _LOGGER.debug(
+                "Connected to valve %s (%s); requests are only defined for Evb019 valves",
+                self._address,
+                model or "unknown model",
+            )
+            return
+
+        if await self._async_send_request(client, ValveRequestCommand.DEVICE_LIST):
+            _LOGGER.debug(
+                "Sent DeviceList request to valve %s to prime extended polling",
+                self._address,
+            )
+        else:
+            _LOGGER.debug(
+                "Unable to send DeviceList request to valve %s; will retry on next poll",
+                self._address,
+            )
+
+    @staticmethod
+    def _create_request_payload(request: ValveRequestCommand | int) -> bytes:
+        """Return the 20-byte EVB019 payload for the provided request value."""
+
+        value = int(request)
+        if not 0 <= value <= 255:
+            raise ValueError(f"Invalid request value {value}; must be 0-255")
+        return bytes([value] * _EVB019_REQUEST_PACKET_LENGTH)
+
+    async def _async_resolve_request_characteristic(
+        self, client: BaseBleakClient, characteristic_uuid: str | None = None
+    ) -> tuple[str, set[str]] | None:
+        """Return the writable GATT characteristic used for EVB019 requests."""
+
+        if characteristic_uuid is None and self._request_characteristic is not None:
+            return self._request_characteristic
+
+        try:
+            services = await client.get_services()
+        except Exception as exc:  # pragma: no cover - bleak raises platform errors
+            _LOGGER.debug(
+                "Unable to resolve GATT services for valve %s: %s",
+                self._address,
+                exc,
+            )
+            return None
+
+        if not services:
+            _LOGGER.debug(
+                "Valve %s did not provide any GATT services during discovery",
+                self._address,
+            )
+            return None
+
+        for service in services:
+            for characteristic in getattr(service, "characteristics", ()):
+                uuid = getattr(characteristic, "uuid", None)
+                if not isinstance(uuid, str):
+                    continue
+                if characteristic_uuid is not None and uuid != characteristic_uuid:
+                    continue
+
+                properties = set(getattr(characteristic, "properties", ()))
+                if not properties.intersection({"write", "write_without_response"}):
+                    continue
+
+                max_write = getattr(
+                    characteristic, "max_write_without_response_size", None
+                )
+                if (
+                    "write_without_response" in properties
+                    and isinstance(max_write, int)
+                    and max_write < _EVB019_REQUEST_PACKET_LENGTH
+                ):
+                    continue
+
+                resolved = (uuid, properties)
+                if characteristic_uuid is None:
+                    self._request_characteristic = resolved
+                return resolved
+
+        if characteristic_uuid is None:
+            _LOGGER.debug(
+                "Valve %s does not expose a writable characteristic suitable for EVB019 requests",
+                self._address,
+            )
+        else:
+            _LOGGER.debug(
+                "Valve %s does not expose writable characteristic %s",
+                self._address,
+                characteristic_uuid,
+            )
+        return None
+
+    async def _async_send_request(
+        self,
+        client: BaseBleakClient,
+        request: ValveRequestCommand | int,
+        *,
+        characteristic_uuid: str | None = None,
+        response: bool | None = None,
+    ) -> bool:
+        """Send an EVB019 request packet to the connected valve."""
+
+        command_value = int(request)
+        payload = self._create_request_payload(command_value)
+
+        try:
+            command_name = (
+                ValveRequestCommand(command_value).name.title().replace("_", "")
+            )
+        except ValueError:
+            command_name = f"value {command_value}"
+
+        resolved = await self._async_resolve_request_characteristic(
+            client, characteristic_uuid
         )
+        if resolved is None:
+            _LOGGER.debug(
+                "Cannot send %s request to valve %s; request characteristic not found",
+                command_name,
+                self._address,
+            )
+            return False
+
+        char_uuid, properties = resolved
+
+        if response is None:
+            write_with_response = "write" in properties
+        elif response and "write" not in properties:
+            write_with_response = False
+        else:
+            write_with_response = response
+
+        try:
+            await client.write_gatt_char(
+                char_uuid, payload, response=write_with_response
+            )
+        except BLEAK_RETRY_EXCEPTIONS as exc:
+            _LOGGER.debug(
+                "Failed to send %s request to valve %s via %s: %s",
+                command_name,
+                self._address,
+                char_uuid,
+                exc,
+            )
+            return False
+        except Exception:  # pragma: no cover - unexpected Bluetooth errors are logged
+            _LOGGER.exception(
+                "Unexpected error while sending %s request to valve %s",
+                command_name,
+                self._address,
+            )
+            return False
+
+        return True
 
 
 class ValveConnectionManager:
