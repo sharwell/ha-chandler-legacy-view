@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import datetime
 from enum import IntEnum
 
@@ -27,6 +29,34 @@ from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
 from .models import ValveAdvertisement
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _ValveGattProfile:
+    """Describe the expected BLE services for an EVB019 valve."""
+
+    service_uuid: str
+    notify_char_uuid: str
+    write_char_uuid: str
+
+
+_EVB019_GATT_PROFILES: tuple[_ValveGattProfile, ...] = (
+    _ValveGattProfile(
+        service_uuid="00001000-0000-1000-8000-00805f9b34fb",
+        notify_char_uuid="00001002-0000-1000-8000-00805f9b34fb",
+        write_char_uuid="00001001-0000-1000-8000-00805f9b34fb",
+    ),
+    _ValveGattProfile(
+        service_uuid="6e400001-b5a3-f393-e0a9-e50e24dcca9e",
+        notify_char_uuid="6e400003-b5a3-f393-e0a9-e50e24dcca9e",
+        write_char_uuid="6e400002-b5a3-f393-e0a9-e50e24dcca9e",
+    ),
+    _ValveGattProfile(
+        service_uuid="a725458c-bee1-4d2e-9555-edf5a8082303",
+        notify_char_uuid="a725458c-bee2-4d2e-9555-edf5a8082303",
+        write_char_uuid="a725458c-bee3-4d2e-9555-edf5a8082303",
+    ),
+)
 
 
 class ValveRequestCommand(IntEnum):
@@ -247,7 +277,7 @@ class ValveConnection:
             return self._request_characteristic
 
         try:
-            services = await client.get_services()
+            services = await self._async_get_services(client)
         except Exception as exc:  # pragma: no cover - bleak raises platform errors
             _LOGGER.debug(
                 "Unable to resolve GATT services for valve %s: %s",
@@ -263,32 +293,82 @@ class ValveConnection:
             )
             return None
 
-        for service in services:
-            for characteristic in getattr(service, "characteristics", ()):
-                uuid = getattr(characteristic, "uuid", None)
-                if not isinstance(uuid, str):
-                    continue
-                if characteristic_uuid is not None and uuid != characteristic_uuid:
-                    continue
-
-                properties = set(getattr(characteristic, "properties", ()))
-                if not properties.intersection({"write", "write_without_response"}):
-                    continue
-
-                max_write = getattr(
-                    characteristic, "max_write_without_response_size", None
+        if characteristic_uuid is not None:
+            candidate = self._locate_characteristic(
+                services,
+                characteristic_uuid=characteristic_uuid,
+            )
+            if candidate is None:
+                _LOGGER.debug(
+                    "Valve %s does not expose writable characteristic %s",
+                    self._address,
+                    characteristic_uuid,
                 )
-                if (
-                    "write_without_response" in properties
-                    and isinstance(max_write, int)
-                    and max_write < _EVB019_REQUEST_PACKET_LENGTH
-                ):
-                    continue
+                return None
 
-                resolved = (uuid, properties)
-                if characteristic_uuid is None:
-                    self._request_characteristic = resolved
-                return resolved
+            uuid, properties, characteristic = candidate
+            if not properties.intersection({"write", "write_without_response"}):
+                _LOGGER.debug(
+                    "Characteristic %s on valve %s does not support writes",
+                    characteristic_uuid,
+                    self._address,
+                )
+                return None
+
+            if self._characteristic_cannot_write_without_response(
+                characteristic, properties
+            ):
+                _LOGGER.debug(
+                    "Characteristic %s on valve %s cannot accept EVB019 request payloads",
+                    characteristic_uuid,
+                    self._address,
+                )
+                return None
+
+            return (uuid, properties)
+
+        attempted: set[str] = set()
+        for profile in _EVB019_GATT_PROFILES:
+            candidate = self._locate_characteristic(
+                services,
+                characteristic_uuid=profile.write_char_uuid,
+                service_uuid=profile.service_uuid,
+                required_properties={"write", "write_without_response"},
+            )
+            if candidate is None:
+                continue
+
+            uuid, properties, characteristic = candidate
+            attempted.add(uuid.lower())
+            if self._characteristic_cannot_write_without_response(
+                characteristic, properties
+            ):
+                continue
+
+            resolved = (uuid, properties)
+            self._request_characteristic = resolved
+            return resolved
+
+        for _, characteristic in self._iter_gatt_characteristics(services):
+            uuid = getattr(characteristic, "uuid", None)
+            if not isinstance(uuid, str):
+                continue
+
+            if uuid.lower() in attempted:
+                continue
+
+            properties = set(getattr(characteristic, "properties", ()) or ())
+            if not properties.intersection({"write", "write_without_response"}):
+                continue
+
+            if self._characteristic_cannot_write_without_response(
+                characteristic, properties
+            ):
+                continue
+
+            resolved = (uuid, properties)
+            self._request_characteristic = resolved
+            return resolved
 
         if characteristic_uuid is None:
             _LOGGER.debug(
@@ -441,7 +521,7 @@ class ValveConnection:
         """Subscribe to every notifying characteristic exposed by the valve."""
 
         try:
-            services = await client.get_services()
+            services = await self._async_get_services(client)
         except Exception as exc:  # pragma: no cover - bleak raises platform errors
             _LOGGER.debug(
                 "Unable to resolve GATT services for valve %s while preparing notifications: %s",
@@ -451,33 +531,44 @@ class ValveConnection:
             return []
 
         subscriptions: list[str] = []
-        for service in services:
-            for characteristic in getattr(service, "characteristics", ()):
-                uuid = getattr(characteristic, "uuid", None)
-                if not isinstance(uuid, str):
-                    continue
+        subscribed: set[str] = set()
+        attempted: set[str] = set()
 
-                properties = set(getattr(characteristic, "properties", ()))
-                if not properties.intersection({"notify", "indicate"}):
-                    continue
+        for profile in _EVB019_GATT_PROFILES:
+            candidate = self._locate_characteristic(
+                services,
+                characteristic_uuid=profile.notify_char_uuid,
+                service_uuid=profile.service_uuid,
+            )
+            if candidate is None:
+                continue
 
-                try:
-                    await client.start_notify(uuid, handler)
-                except BLEAK_RETRY_EXCEPTIONS as exc:
-                    _LOGGER.debug(
-                        "Failed to subscribe to notifications from %s on valve %s: %s",
-                        uuid,
-                        self._address,
-                        exc,
-                    )
-                except Exception:  # pragma: no cover - unexpected Bluetooth errors are logged
-                    _LOGGER.exception(
-                        "Unexpected error while subscribing to notifications from valve %s characteristic %s",
-                        self._address,
-                        uuid,
-                    )
-                else:
-                    subscriptions.append(uuid)
+            uuid, properties, _ = candidate
+            normalized = uuid.lower()
+            attempted.add(normalized)
+            if not properties.intersection({"notify", "indicate"}):
+                continue
+
+            if await self._async_try_start_notify(client, uuid, handler):
+                subscriptions.append(uuid)
+                subscribed.add(normalized)
+
+        for _, characteristic in self._iter_gatt_characteristics(services):
+            uuid = getattr(characteristic, "uuid", None)
+            if not isinstance(uuid, str):
+                continue
+
+            normalized = uuid.lower()
+            if normalized in attempted or normalized in subscribed:
+                continue
+
+            properties = set(getattr(characteristic, "properties", ()) or ())
+            if not properties.intersection({"notify", "indicate"}):
+                continue
+
+            if await self._async_try_start_notify(client, uuid, handler):
+                subscriptions.append(uuid)
+                subscribed.add(normalized)
 
         return subscriptions
 
@@ -489,6 +580,135 @@ class ValveConnection:
         for uuid in subscriptions:
             with contextlib.suppress(Exception):
                 await client.stop_notify(uuid)
+
+    async def _async_get_services(self, client: BaseBleakClient):
+        """Return the GATT services exposed by the connected client."""
+
+        services_property = getattr(client.__class__, "services", None)
+        if isinstance(services_property, property):
+            return client.services
+
+        get_services = getattr(client, "get_services", None)
+        if get_services is None:
+            raise AttributeError(
+                f"{client.__class__.__name__} does not expose a services property"
+            )
+
+        services = get_services()
+        if inspect.isawaitable(services):
+            services = await services
+
+        return services
+
+    @staticmethod
+    def _iter_gatt_services(services) -> Iterable:
+        """Yield each service object within a Bleak service collection."""
+
+        if services is None:
+            return
+
+        if isinstance(services, dict):
+            yield from services.values()
+            return
+
+        try:
+            iterator = iter(services)
+        except TypeError:
+            return
+
+        for service in iterator:
+            if service is None:
+                continue
+            yield service
+
+    @classmethod
+    def _iter_gatt_characteristics(cls, services) -> Iterable[tuple[object, object]]:
+        """Yield (service, characteristic) pairs from a Bleak service collection."""
+
+        for service in cls._iter_gatt_services(services):
+            characteristics = getattr(service, "characteristics", ())
+            if characteristics is None:
+                continue
+            for characteristic in characteristics:
+                yield service, characteristic
+
+    @classmethod
+    def _locate_characteristic(
+        cls,
+        services,
+        *,
+        characteristic_uuid: str,
+        service_uuid: str | None = None,
+        required_properties: Iterable[str] | None = None,
+    ) -> tuple[str, set[str], object] | None:
+        """Return the characteristic definition matching a UUID."""
+
+        target_uuid = characteristic_uuid.lower()
+        target_service_uuid = service_uuid.lower() if service_uuid else None
+        required = set(required_properties or ())
+
+        for service, characteristic in cls._iter_gatt_characteristics(services):
+            uuid = getattr(characteristic, "uuid", None)
+            if not isinstance(uuid, str) or uuid.lower() != target_uuid:
+                continue
+
+            if target_service_uuid is not None:
+                service_uuid_value = getattr(service, "uuid", None)
+                if not isinstance(service_uuid_value, str) or service_uuid_value.lower() != target_service_uuid:
+                    continue
+
+            properties = set(getattr(characteristic, "properties", ()) or ())
+            if required and not properties.intersection(required):
+                continue
+
+            return uuid, properties, characteristic
+
+        return None
+
+    @staticmethod
+    def _characteristic_cannot_write_without_response(
+        characteristic, properties: set[str]
+    ) -> bool:
+        """Return ``True`` if the characteristic cannot handle EVB019 payloads."""
+
+        if "write_without_response" not in properties:
+            return False
+
+        max_write = getattr(characteristic, "max_write_without_response_size", None)
+        if isinstance(max_write, int) and max_write < _EVB019_REQUEST_PACKET_LENGTH:
+            return True
+
+        return False
+
+    async def _async_try_start_notify(
+        self,
+        client: BaseBleakClient,
+        uuid: str,
+        handler: Callable[[int | str, bytearray], None],
+    ) -> bool:
+        """Attempt to enable notifications for a characteristic."""
+
+        try:
+            awaitable = client.start_notify(uuid, handler)
+            if inspect.isawaitable(awaitable):
+                await awaitable
+        except BLEAK_RETRY_EXCEPTIONS as exc:
+            _LOGGER.debug(
+                "Failed to subscribe to notifications from %s on valve %s: %s",
+                uuid,
+                self._address,
+                exc,
+            )
+            return False
+        except Exception:  # pragma: no cover - unexpected Bluetooth errors are logged
+            _LOGGER.exception(
+                "Unexpected error while subscribing to notifications from valve %s characteristic %s",
+                self._address,
+                uuid,
+            )
+            return False
+
+        return True
 
     def _handle_device_list_packet(self, packet: bytes) -> None:
         """Update internal state from a DeviceList response packet."""
