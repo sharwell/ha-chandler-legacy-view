@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 from collections.abc import Callable, Iterable
 from datetime import datetime
@@ -247,7 +248,7 @@ class ValveConnection:
             return self._request_characteristic
 
         try:
-            services = await client.get_services()
+            services = await self._async_get_services(client)
         except Exception as exc:  # pragma: no cover - bleak raises platform errors
             _LOGGER.debug(
                 "Unable to resolve GATT services for valve %s: %s",
@@ -441,7 +442,7 @@ class ValveConnection:
         """Subscribe to every notifying characteristic exposed by the valve."""
 
         try:
-            services = await client.get_services()
+            services = await self._async_get_services(client)
         except Exception as exc:  # pragma: no cover - bleak raises platform errors
             _LOGGER.debug(
                 "Unable to resolve GATT services for valve %s while preparing notifications: %s",
@@ -489,6 +490,25 @@ class ValveConnection:
         for uuid in subscriptions:
             with contextlib.suppress(Exception):
                 await client.stop_notify(uuid)
+
+    async def _async_get_services(self, client: BaseBleakClient):
+        """Return the GATT services exposed by the connected client."""
+
+        services_property = getattr(client.__class__, "services", None)
+        if isinstance(services_property, property):
+            return client.services
+
+        get_services = getattr(client, "get_services", None)
+        if get_services is None:
+            raise AttributeError(
+                f"{client.__class__.__name__} does not expose a services property"
+            )
+
+        services = get_services()
+        if inspect.isawaitable(services):
+            services = await services
+
+        return services
 
     def _handle_device_list_packet(self, packet: bytes) -> None:
         """Update internal state from a DeviceList response packet."""
