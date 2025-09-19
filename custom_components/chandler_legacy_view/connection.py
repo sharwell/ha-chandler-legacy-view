@@ -520,8 +520,9 @@ class ValveConnection:
             )
             return None
 
-        # TODO: Determine whether certain Evb019 valves should be treated as "classic"
-        # models when deciding if a DeviceList packet can contain a serial number.
+        # Chandler Legacy View only targets Evb019 hardware, which always reports
+        # serial numbers through the DeviceList response. Classic firmware variants
+        # handled elsewhere do not apply to this integration.
         serial = "".join(f"{packet[index]:02X}" for index in range(13, 17)).strip()
         if not serial or serial == _DEFAULT_SERIAL_NUMBER:
             return None
