@@ -17,6 +17,7 @@ DATA_CONNECTION_MANAGER: Final = "connection_manager"
 
 # Polling configuration for on-demand Bluetooth connections
 CONNECTION_POLL_INTERVAL: Final = timedelta(minutes=15)
+CONNECTION_MIN_RETRY_INTERVAL: Final = timedelta(seconds=15)
 CONNECTION_TIMEOUT_SECONDS: Final = 20
 
 # Default presentation details for discovered devices
