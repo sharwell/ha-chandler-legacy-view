@@ -172,6 +172,60 @@ class ValveBypassBinarySensor(ChandlerValveEntity, BinarySensorEntity):
         return attributes
 
 
+class ValveSaltBinarySensor(ChandlerValveEntity, BinarySensorEntity):
+    """Represent the salt status reported by a water system valve."""
+
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+
+    def __init__(self, advertisement: ValveAdvertisement) -> None:
+        super().__init__(advertisement)
+        self._attr_unique_id = f"{advertisement.address}_salt"
+        self._attr_name = f"{self._attr_name} Low Salt"
+        self._attr_available = True
+        self._update_from_advertisement(advertisement)
+
+    def _update_from_advertisement(self, advertisement: ValveAdvertisement) -> None:
+        """Update the entity state from the provided advertisement."""
+
+        status = advertisement.salt_sensor_status
+        if status is None or status < 0:
+            self._attr_is_on = None
+        else:
+            self._attr_is_on = status == 1
+
+    def async_update_from_advertisement(self, advertisement: ValveAdvertisement) -> None:
+        """Store advertisement details and refresh the current state."""
+
+        super().async_update_from_advertisement(advertisement)
+        self._attr_name = f"{self._attr_name} Low Salt"
+        self._update_from_advertisement(advertisement)
+
+    @callback
+    def async_handle_bluetooth_update(
+        self, advertisement: ValveAdvertisement, change: BluetoothChange
+    ) -> None:
+        """Handle updates from the Bluetooth discovery manager."""
+
+        if change in BLUETOOTH_LOST_CHANGES:
+            self._attr_available = False
+        else:
+            self.async_update_from_advertisement(advertisement)
+            self._attr_available = True
+        self.async_write_ha_state()
+
+    @property
+    def extra_state_attributes(self) -> Mapping[str, str]:
+        """Expose the textual salt status alongside the binary state."""
+
+        attributes: dict[str, str] = {}
+        salt_display = _salt_sensor_status_display(
+            self._advertisement.salt_sensor_status
+        )
+        if salt_display is not None:
+            attributes["salt_sensor_status"] = salt_display
+        return attributes
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -188,10 +242,13 @@ async def async_setup_entry(
     ) -> list[ChandlerValveEntity]:
         """Instantiate entities backed by the provided advertisement."""
 
-        return [
+        entities = [
             ValvePresenceBinarySensor(advertisement),
             ValveBypassBinarySensor(advertisement),
         ]
+        if _can_report_low_salt(advertisement.name):
+            entities.append(ValveSaltBinarySensor(advertisement))
+        return entities
 
     initial_entities: list[ChandlerValveEntity] = []
     for advertisement in manager.devices.values():
