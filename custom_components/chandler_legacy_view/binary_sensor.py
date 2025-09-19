@@ -122,6 +122,56 @@ class ValvePresenceBinarySensor(ChandlerValveEntity, BinarySensorEntity):
         return attributes
 
 
+class ValveBypassBinarySensor(ChandlerValveEntity, BinarySensorEntity):
+    """Represent the bypass status reported by a water system valve."""
+
+    def __init__(self, advertisement: ValveAdvertisement) -> None:
+        super().__init__(advertisement)
+        self._attr_unique_id = f"{advertisement.address}_bypass"
+        self._attr_name = f"{self._attr_name} Bypass"
+        self._attr_available = True
+        self._update_from_advertisement(advertisement)
+
+    def _update_from_advertisement(self, advertisement: ValveAdvertisement) -> None:
+        """Update the entity state from the provided advertisement."""
+
+        status = advertisement.bypass_status
+        if status is None or status < 0:
+            self._attr_is_on = None
+        else:
+            self._attr_is_on = status == 1
+
+    def async_update_from_advertisement(self, advertisement: ValveAdvertisement) -> None:
+        """Store advertisement details and refresh the current state."""
+
+        super().async_update_from_advertisement(advertisement)
+        self._attr_name = f"{self._attr_name} Bypass"
+        self._update_from_advertisement(advertisement)
+
+    @callback
+    def async_handle_bluetooth_update(
+        self, advertisement: ValveAdvertisement, change: BluetoothChange
+    ) -> None:
+        """Handle updates from the Bluetooth discovery manager."""
+
+        if change in BLUETOOTH_LOST_CHANGES:
+            self._attr_available = False
+        else:
+            self.async_update_from_advertisement(advertisement)
+            self._attr_available = True
+        self.async_write_ha_state()
+
+    @property
+    def extra_state_attributes(self) -> Mapping[str, str]:
+        """Expose the textual bypass status alongside the binary state."""
+
+        attributes: dict[str, str] = {}
+        bypass_display = _bypass_status_display(self._advertisement.bypass_status)
+        if bypass_display is not None:
+            attributes["bypass_status"] = bypass_display
+        return attributes
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -131,14 +181,23 @@ async def async_setup_entry(
 
     entry_data = hass.data[DOMAIN][entry.entry_id]
     manager: ValveDiscoveryManager = entry_data[DATA_DISCOVERY_MANAGER]
-    entities: dict[str, ValvePresenceBinarySensor] = {}
+    entities: dict[str, list[ChandlerValveEntity]] = {}
 
-    initial_entities = [
-        ValvePresenceBinarySensor(advertisement)
-        for advertisement in manager.devices.values()
-    ]
-    for entity in initial_entities:
-        entities[entity.unique_id] = entity
+    def _create_entities_for_advertisement(
+        advertisement: ValveAdvertisement,
+    ) -> list[ChandlerValveEntity]:
+        """Instantiate entities backed by the provided advertisement."""
+
+        return [
+            ValvePresenceBinarySensor(advertisement),
+            ValveBypassBinarySensor(advertisement),
+        ]
+
+    initial_entities: list[ChandlerValveEntity] = []
+    for advertisement in manager.devices.values():
+        device_entities = _create_entities_for_advertisement(advertisement)
+        entities[advertisement.address] = device_entities
+        initial_entities.extend(device_entities)
 
     if initial_entities:
         async_add_entities(initial_entities)
@@ -147,17 +206,18 @@ async def async_setup_entry(
     def _handle_discovery(
         advertisement: ValveAdvertisement, change: BluetoothChange
     ) -> None:
-        entity = entities.get(advertisement.address)
-        if entity is not None:
-            entity.async_handle_bluetooth_update(advertisement, change)
+        device_entities = entities.get(advertisement.address)
+        if device_entities is not None:
+            for entity in device_entities:
+                entity.async_handle_bluetooth_update(advertisement, change)
             return
 
         if change in BLUETOOTH_LOST_CHANGES:
             return
 
-        new_entity = ValvePresenceBinarySensor(advertisement)
-        entities[advertisement.address] = new_entity
-        async_add_entities([new_entity])
+        device_entities = _create_entities_for_advertisement(advertisement)
+        entities[advertisement.address] = device_entities
+        async_add_entities(device_entities)
 
     remove_listener = manager.async_add_listener(_handle_discovery)
     entry.async_on_unload(remove_listener)
