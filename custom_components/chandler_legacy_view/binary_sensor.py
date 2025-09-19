@@ -26,6 +26,7 @@ from .entity import (
     _valve_error_display,
     _valve_series_display,
     _water_status_display,
+    format_firmware_version,
 )
 from .models import ValveAdvertisement
 
@@ -66,7 +67,7 @@ class ValvePresenceBinarySensor(ChandlerValveEntity, BinarySensorEntity):
             attributes["rssi"] = self._advertisement.rssi
         if self._advertisement.name:
             attributes["advertised_name"] = self._advertisement.name
-        formatted_version = self._format_firmware_version(self._advertisement)
+        formatted_version = format_firmware_version(self._advertisement)
         if formatted_version:
             attributes["firmware_version"] = formatted_version
         if self._advertisement.connection_counter is not None:
