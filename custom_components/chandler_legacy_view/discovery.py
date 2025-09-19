@@ -145,6 +145,16 @@ def _flatten_manufacturer_data(value: Any) -> bytes | None:
         return None
 
 
+def _decode_firmware_number(value: int) -> int:
+    """Decode Chandler's unusual firmware byte representation."""
+
+    formatted = f"{value:02X}"
+    try:
+        return int(formatted)
+    except ValueError:
+        return value & 0xFF
+
+
 @dataclass(slots=True)
 class _ManufacturerClassification:
     """Details parsed from a Chandler manufacturer data payload."""
@@ -303,9 +313,12 @@ def _classify_manufacturer_data(
         )
         return _ManufacturerClassification(True)
 
-    firmware_major = payload[-2]
+    firmware_major_raw = payload[-2]
     firmware_minor_raw = payload[-1]
-    firmware_minor = 99 if firmware_minor_raw >= 250 else firmware_minor_raw
+
+    firmware_major = _decode_firmware_number(firmware_major_raw)
+    firmware_minor_converted = _decode_firmware_number(firmware_minor_raw)
+    firmware_minor = 99 if firmware_minor_converted >= 250 else firmware_minor_converted
     firmware_version = firmware_major * 100 + firmware_minor
     model: str | None
     if firmware_version >= 600:
