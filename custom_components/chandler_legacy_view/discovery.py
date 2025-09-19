@@ -182,6 +182,7 @@ class _ManufacturerClassification:
     connection_counter: int | None = None
     bootloader_version: int | None = None
     radio_protocol_version: int | None = None
+    ignore_advertisement: bool = False
 
 
 def _has_manufacturer_data_values(value: Any) -> bool:
@@ -295,7 +296,7 @@ def _classify_manufacturer_data(
             CSI_MANUFACTURER_ID,
             raw_payload,
         )
-        return _ManufacturerClassification(True)
+        return _ManufacturerClassification(True, ignore_advertisement=True)
 
     prefix_le = CSI_MANUFACTURER_ID.to_bytes(2, "little")
     if not payload.startswith(prefix_le):
@@ -523,6 +524,13 @@ class ValveDiscoveryManager:
                 service_info.manufacturer_data,
                 getattr(service_info, "raw", None),
             )
+
+            if classification.ignore_advertisement:
+                _LOGGER.debug(
+                    "Ignoring Bluetooth advertisement from %s; manufacturer data was incomplete",
+                    service_info.address,
+                )
+                return
 
             if not classification.is_csi_device:
                 _LOGGER.debug(
