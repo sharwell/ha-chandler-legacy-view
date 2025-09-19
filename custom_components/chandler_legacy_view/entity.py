@@ -190,6 +190,28 @@ def _convert_version_number_to_string(
     return f"{prefix}{major}.{minor:02d}"
 
 
+def format_firmware_version(advertisement: ValveAdvertisement) -> str | None:
+    """Format the firmware version reported by a Bluetooth advertisement."""
+
+    firmware_version = advertisement.firmware_version
+    if firmware_version is None:
+        if (
+            advertisement.firmware_major is None
+            or advertisement.firmware_minor is None
+        ):
+            return None
+        firmware_version = (
+            advertisement.firmware_major * 100 + advertisement.firmware_minor
+        )
+
+    if firmware_version < 0:
+        return None
+
+    return _convert_version_number_to_string(
+        firmware_version, _is_clack_valve(advertisement.name)
+    )
+
+
 class ChandlerValveEntity(Entity):
     """Base entity shared by Chandler Legacy valve platforms."""
 
@@ -213,7 +235,7 @@ class ChandlerValveEntity(Entity):
             manufacturer=DEFAULT_MANUFACTURER,
             model=self._advertisement.model,
             via_device=(DOMAIN, DISCOVERY_VIA_DEVICE_ID),
-            sw_version=self._format_firmware_version(self._advertisement),
+            sw_version=format_firmware_version(self._advertisement),
         )
 
     def async_update_from_advertisement(self, advertisement: ValveAdvertisement) -> None:
@@ -227,23 +249,3 @@ class ChandlerValveEntity(Entity):
 
         return friendly_name_from_advertised_name(advertisement.name)
 
-    def _format_firmware_version(self, advertisement: ValveAdvertisement) -> str | None:
-        """Format the firmware version reported by the advertisement."""
-
-        firmware_version = advertisement.firmware_version
-        if firmware_version is None:
-            if (
-                advertisement.firmware_major is None
-                or advertisement.firmware_minor is None
-            ):
-                return None
-            firmware_version = (
-                advertisement.firmware_major * 100 + advertisement.firmware_minor
-            )
-
-        if firmware_version < 0:
-            return None
-
-        return _convert_version_number_to_string(
-            firmware_version, _is_clack_valve(advertisement.name)
-        )

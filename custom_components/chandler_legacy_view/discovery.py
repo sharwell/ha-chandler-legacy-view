@@ -16,7 +16,8 @@ from homeassistant.components.bluetooth import (
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant
 
 from .const import CSI_MANUFACTURER_ID, VALVE_MATCHERS, VALVE_NAME_PREFIXES
-from .entity import _is_clack_valve
+from .device_registry import async_update_device_sw_version
+from .entity import _is_clack_valve, format_firmware_version
 from .models import ValveAdvertisement
 
 _LOGGER = logging.getLogger(__name__)
@@ -579,6 +580,11 @@ class ValveDiscoveryManager:
                 connection_counter=classification.connection_counter,
                 bootloader_version=classification.bootloader_version,
                 radio_protocol_version=classification.radio_protocol_version,
+            )
+            async_update_device_sw_version(
+                self._hass,
+                advertisement.address,
+                format_firmware_version(advertisement),
             )
             self._devices[service_info.address] = advertisement
             if classification.firmware_version is not None:

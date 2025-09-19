@@ -22,6 +22,7 @@ from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.util import dt as dt_util
 
 from .const import CONNECTION_POLL_INTERVAL, CONNECTION_TIMEOUT_SECONDS
+from .device_registry import async_update_device_serial_number
 from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
 from .models import ValveAdvertisement
 
@@ -502,6 +503,7 @@ class ValveConnection:
                     self._address,
                 )
             self._serial_number = None
+            async_update_device_serial_number(self._hass, self._address, None)
             return
 
         if serial_number != self._serial_number:
@@ -509,6 +511,7 @@ class ValveConnection:
                 "Valve %s reported serial number %s", self._address, serial_number
             )
         self._serial_number = serial_number
+        async_update_device_serial_number(self._hass, self._address, serial_number)
 
     def _extract_serial_number(self, packet: bytes) -> str | None:
         """Return the valve serial number encoded within a DeviceList packet."""
