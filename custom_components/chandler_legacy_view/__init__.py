@@ -11,6 +11,7 @@ from homeassistant.helpers.device_registry import DeviceEntryType
 from homeassistant.helpers.typing import ConfigType
 
 from .const import (
+    DATA_CONNECTION_MANAGER,
     DATA_DISCOVERY_MANAGER,
     DEFAULT_MANUFACTURER,
     DISCOVERY_DEVICE_MODEL,
@@ -19,6 +20,7 @@ from .const import (
     DOMAIN,
     PLATFORMS,
 )
+from .connection import ValveConnectionManager
 from .discovery import ValveDiscoveryManager
 
 _LOGGER = logging.getLogger(__name__)
@@ -46,10 +48,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry_type=DeviceEntryType.SERVICE,
     )
 
-    manager = ValveDiscoveryManager(hass)
-    await manager.async_setup()
+    discovery_manager = ValveDiscoveryManager(hass)
+    await discovery_manager.async_setup()
 
-    hass.data[DOMAIN][entry.entry_id] = {DATA_DISCOVERY_MANAGER: manager}
+    connection_manager = ValveConnectionManager(hass, discovery_manager)
+    await connection_manager.async_setup()
+
+    hass.data[DOMAIN][entry.entry_id] = {
+        DATA_DISCOVERY_MANAGER: discovery_manager,
+        DATA_CONNECTION_MANAGER: connection_manager,
+    }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -65,6 +73,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     data = hass.data[DOMAIN].pop(entry.entry_id, None)
     if data is not None:
+        await data[DATA_CONNECTION_MANAGER].async_unload()
         await data[DATA_DISCOVERY_MANAGER].async_unload()
 
     if not hass.data[DOMAIN]:

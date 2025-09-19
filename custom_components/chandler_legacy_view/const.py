@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from itertools import product
 from typing import Final
 
@@ -12,6 +13,11 @@ PLATFORMS: Final[list[Platform]] = [Platform.BINARY_SENSOR]
 
 # Storage keys used inside ``hass.data``
 DATA_DISCOVERY_MANAGER: Final = "discovery_manager"
+DATA_CONNECTION_MANAGER: Final = "connection_manager"
+
+# Polling configuration for on-demand Bluetooth connections
+CONNECTION_POLL_INTERVAL: Final = timedelta(minutes=15)
+CONNECTION_TIMEOUT_SECONDS: Final = 20
 
 # Default presentation details for discovered devices
 DEFAULT_FRIENDLY_NAME: Final = "Treatment Valve"
