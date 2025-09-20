@@ -8,6 +8,12 @@ from typing import Final
 
 from homeassistant.const import Platform
 
+CONF_DEFAULT_PASSCODE: Final = "default_passcode"
+CONF_DEVICE_ADDRESS: Final = "device_address"
+CONF_DEVICE_PASSCODE: Final = "device_passcode"
+CONF_DEVICE_PASSCODES: Final = "device_passcodes"
+CONF_REMOVE_OVERRIDE: Final = "remove_override"
+
 DOMAIN: Final = "chandler_legacy_view"
 PLATFORMS: Final[list[Platform]] = [Platform.BINARY_SENSOR, Platform.SENSOR]
 

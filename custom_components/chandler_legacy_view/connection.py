@@ -19,11 +19,14 @@ from bleak_retry_connector import (
 )
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import BluetoothChange
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_DEFAULT_PASSCODE,
+    CONF_DEVICE_PASSCODES,
     CONNECTION_MIN_RETRY_INTERVAL,
     CONNECTION_POLL_INTERVAL,
     CONNECTION_TIMEOUT_SECONDS,
@@ -85,7 +88,12 @@ _DEFAULT_SERIAL_NUMBER = "FFFFFFFF"
 class ValveConnection:
     """Handle an active Bluetooth data poll for a valve."""
 
-    def __init__(self, hass: HomeAssistant, address: str) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        address: str,
+        passcode_getter: Callable[[str], str | None] | None = None,
+    ) -> None:
         """Initialize the valve connection handler."""
 
         self._hass = hass
@@ -103,6 +111,7 @@ class ValveConnection:
         self._device_list_is_twin_valve: bool | None = None
         self._dashboard_data: ValveDashboardData | None = None
         self._dashboard_listeners: list[Callable[[ValveDashboardData | None], None]] = []
+        self._passcode_getter = passcode_getter
 
     @property
     def address(self) -> str:
@@ -139,6 +148,14 @@ class ValveConnection:
         """Return the parsed data from the most recent Dashboard response."""
 
         return self._dashboard_data
+
+    def get_configured_passcode(self) -> str | None:
+        """Return the configured passcode for this valve, if available."""
+
+        if self._passcode_getter is None:
+            return None
+
+        return self._passcode_getter(self._address)
 
     def add_dashboard_listener(
         self, listener: Callable[[ValveDashboardData | None], None]
@@ -350,10 +367,17 @@ class ValveConnection:
             )
 
         if self._advertisement.authentication_required:
-            _LOGGER.debug(
-                "Skipping Dashboard request to valve %s; authentication is required",
-                self._address,
-            )
+            passcode = self.get_configured_passcode()
+            if passcode is None:
+                _LOGGER.debug(
+                    "Skipping Dashboard request to valve %s; authentication is required and no passcode is configured",
+                    self._address,
+                )
+            else:
+                _LOGGER.debug(
+                    "Skipping Dashboard request to valve %s; authentication requires additional implementation",
+                    self._address,
+                )
             return
 
         dashboard_request_sent, dashboard_response_received = (
@@ -1177,11 +1201,13 @@ class ValveConnectionManager:
     def __init__(
         self,
         hass: HomeAssistant,
+        config_entry: ConfigEntry,
         discovery_manager: ValveDiscoveryManager,
     ) -> None:
         """Initialize the connection manager."""
 
         self._hass = hass
+        self._config_entry = config_entry
         self._discovery_manager = discovery_manager
         self._connections: dict[str, ValveConnection] = {}
         self._remove_listener: CALLBACK_TYPE | None = None
@@ -1245,7 +1271,11 @@ class ValveConnectionManager:
 
         connection = self._connections.get(advertisement.address)
         if connection is None:
-            connection = ValveConnection(self._hass, advertisement.address)
+            connection = ValveConnection(
+                self._hass,
+                advertisement.address,
+                self.get_passcode,
+            )
             self._connections[advertisement.address] = connection
         connection.update_from_advertisement(advertisement)
         return connection
@@ -1259,3 +1289,14 @@ class ValveConnectionManager:
         """Return the connection for a specific valve address, if available."""
 
         return self._connections.get(address)
+
+    def get_passcode(self, address: str | None = None) -> str | None:
+        """Return the configured passcode for a valve address."""
+
+        overrides = self._config_entry.options.get(CONF_DEVICE_PASSCODES, {})
+        if address is not None:
+            override = overrides.get(address)
+            if override is not None:
+                return override
+
+        return self._config_entry.data.get(CONF_DEFAULT_PASSCODE)

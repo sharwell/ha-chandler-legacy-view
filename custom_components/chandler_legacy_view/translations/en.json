@@ -4,11 +4,36 @@
       "user": {
         "title": "Chandler Legacy View",
         "description": "Set up discovery of Chandler Legacy water system valves.",
-        "data": {}
+        "data": {
+          "default_passcode": "Default valve passcode"
+        }
       }
+    },
+    "error": {
+      "invalid_passcode": "Passcode must be exactly four digits."
     },
     "abort": {
       "single_instance_allowed": "Only one Chandler Legacy View configuration is permitted."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Chandler Legacy View options",
+        "description": "Update the default passcode or configure per-device overrides.",
+        "data": {
+          "default_passcode": "Default valve passcode",
+          "device_address": "Valve to configure",
+          "device_passcode": "Override passcode",
+          "remove_override": "Remove override"
+        }
+      }
+    },
+    "error": {
+      "device_required": "Select a valve before changing overrides.",
+      "invalid_passcode": "Passcode must be exactly four digits.",
+      "passcode_not_expected": "Clear the passcode field before removing an override.",
+      "passcode_required": "Enter a passcode or choose Remove override to clear it."
     }
   }
 }
