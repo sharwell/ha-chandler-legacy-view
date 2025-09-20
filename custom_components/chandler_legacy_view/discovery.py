@@ -361,13 +361,11 @@ def _apply_valve_status(
     classification.valve_status = valve_status
     if classification.model == "Evb019":
         classification.authentication_required = bool(valve_status & 0x01)
-    else:
-        classification.authentication_required = False
-    if classification.model == "Evb019":
         classification.salt_sensor_status = 1 if valve_status & 0x02 else 0
         classification.water_status = 1 if valve_status & 0x04 else 0
         classification.bypass_status = 1 if valve_status & 0x08 else 0
     else:
+        classification.authentication_required = False
         classification.salt_sensor_status = 1 if valve_status & 0x01 else 0
         classification.water_status = 1 if valve_status & 0x02 else 0
         classification.bypass_status = 1 if valve_status & 0x04 else 0
