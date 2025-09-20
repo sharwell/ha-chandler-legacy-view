@@ -102,6 +102,7 @@ class ValveConnection:
         self._serial_number: str | None = None
         self._device_list_is_twin_valve: bool | None = None
         self._dashboard_data: ValveDashboardData | None = None
+        self._dashboard_listeners: list[Callable[[ValveDashboardData | None], None]] = []
 
     @property
     def address(self) -> str:
@@ -138,6 +139,22 @@ class ValveConnection:
         """Return the parsed data from the most recent Dashboard response."""
 
         return self._dashboard_data
+
+    def add_dashboard_listener(
+        self, listener: Callable[[ValveDashboardData | None], None]
+    ) -> CALLBACK_TYPE:
+        """Register a callback for Dashboard data updates."""
+
+        self._dashboard_listeners.append(listener)
+
+        if self._dashboard_data is not None:
+            self._hass.loop.call_soon(listener, self._dashboard_data)
+
+        def _remove_listener() -> None:
+            with contextlib.suppress(ValueError):
+                self._dashboard_listeners.remove(listener)
+
+        return _remove_listener
 
     def update_from_advertisement(self, advertisement: ValveAdvertisement) -> None:
         """Record the most recent Bluetooth advertisement for the valve."""
@@ -1011,6 +1028,20 @@ class ValveConnection:
             return
 
         self._dashboard_data = dashboard
+        self._notify_dashboard_listeners(dashboard)
+
+    def _notify_dashboard_listeners(
+        self, dashboard: ValveDashboardData | None
+    ) -> None:
+        """Notify registered callbacks about a Dashboard data update."""
+
+        for listener in list(self._dashboard_listeners):
+            try:
+                listener(dashboard)
+            except Exception:  # pragma: no cover - listener failures are logged
+                _LOGGER.exception(
+                    "Unexpected error in Dashboard listener for valve %s", self._address
+                )
 
     @staticmethod
     def _read_uint16_be(packet: bytes, index: int) -> int:
@@ -1180,3 +1211,8 @@ class ValveConnectionManager:
         """Return an iterable over the tracked valve connections."""
 
         return self._connections.values()
+
+    def get_connection(self, address: str) -> ValveConnection | None:
+        """Return the connection for a specific valve address, if available."""
+
+        return self._connections.get(address)

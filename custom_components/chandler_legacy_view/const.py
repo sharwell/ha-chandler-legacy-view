@@ -9,7 +9,7 @@ from typing import Final
 from homeassistant.const import Platform
 
 DOMAIN: Final = "chandler_legacy_view"
-PLATFORMS: Final[list[Platform]] = [Platform.BINARY_SENSOR]
+PLATFORMS: Final[list[Platform]] = [Platform.BINARY_SENSOR, Platform.SENSOR]
 
 # Storage keys used inside ``hass.data``
 DATA_DISCOVERY_MANAGER: Final = "discovery_manager"
