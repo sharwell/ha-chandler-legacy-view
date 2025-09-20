@@ -183,6 +183,7 @@ class _ManufacturerClassification:
     bootloader_version: int | None = None
     radio_protocol_version: int | None = None
     ignore_advertisement: bool = False
+    authentication_required: bool = False
 
 
 def _has_manufacturer_data_values(value: Any) -> bool:
@@ -359,10 +360,12 @@ def _apply_valve_status(
 
     classification.valve_status = valve_status
     if classification.model == "Evb019":
+        classification.authentication_required = bool(valve_status & 0x01)
         classification.salt_sensor_status = 1 if valve_status & 0x02 else 0
         classification.water_status = 1 if valve_status & 0x04 else 0
         classification.bypass_status = 1 if valve_status & 0x08 else 0
     else:
+        classification.authentication_required = False
         classification.salt_sensor_status = 1 if valve_status & 0x01 else 0
         classification.water_status = 1 if valve_status & 0x02 else 0
         classification.bypass_status = 1 if valve_status & 0x04 else 0
@@ -579,6 +582,7 @@ class ValveDiscoveryManager:
                 salt_sensor_status=classification.salt_sensor_status,
                 water_status=classification.water_status,
                 bypass_status=classification.bypass_status,
+                authentication_required=classification.authentication_required,
                 valve_error=classification.valve_error,
                 valve_time_hours=classification.valve_time_hours,
                 valve_time_minutes=classification.valve_time_minutes,

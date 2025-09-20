@@ -36,6 +36,7 @@ class ValveAdvertisement:
     connection_counter: int | None = None
     bootloader_version: int | None = None
     radio_protocol_version: int | None = None
+    authentication_required: bool = False
 
 
 @dataclass(slots=True)
