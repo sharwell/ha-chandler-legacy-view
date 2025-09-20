@@ -349,6 +349,13 @@ class ValveConnection:
                 self._address,
             )
 
+        if self._advertisement.authentication_required:
+            _LOGGER.debug(
+                "Skipping Dashboard request to valve %s; authentication is required",
+                self._address,
+            )
+            return
+
         dashboard_request_sent, dashboard_response_received = (
             await self._async_request_dashboard(client)
         )
