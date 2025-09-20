@@ -639,6 +639,17 @@ class ValveConnection:
 
             packet = bytes(data)
             index = self._get_dashboard_packet_index(packet, packets)
+            status: str
+            if index is None:
+                status = "ignored"
+            else:
+                status = f"index {index}"
+            _LOGGER.debug(
+                "Valve %s Dashboard packet %s -> %s",
+                self._address,
+                packet.hex(),
+                status,
+            )
             if index is None:
                 return
 
