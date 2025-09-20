@@ -37,3 +37,36 @@ class ValveAdvertisement:
     bootloader_version: int | None = None
     radio_protocol_version: int | None = None
 
+
+@dataclass(slots=True)
+class ValveDashboardData:
+    """Parsed data returned by the EVB019 Dashboard request."""
+
+    time_hour: int
+    time_minute: int
+    is_pm: bool
+    battery_capacity: int
+    present_flow: float
+    water_remaining_until_regeneration: int
+    water_usage: int
+    peak_flow: float
+    water_hardness: int
+    regeneration_time_hour: int
+    regeneration_time_is_pm: bool
+    shutoff_setting_enabled: bool
+    bypass_setting_enabled: bool
+    shutoff_active: bool
+    bypass_active: bool
+    display_off: bool
+    filter_backwash: int
+    air_recharge: int
+    pos_time: int
+    pos_option_seconds: int
+    regen_cycle_position: int
+    regen_active: int
+    prefill_soak_mode: bool
+    soak_timer: int
+    is_in_aeration: bool
+    tank_in_service: int
+    graph_usage_ten_gallons: tuple[int, ...]
+

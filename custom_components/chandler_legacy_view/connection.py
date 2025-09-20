@@ -30,7 +30,7 @@ from .const import (
 )
 from .device_registry import async_update_device_serial_number
 from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
-from .models import ValveAdvertisement
+from .models import ValveAdvertisement, ValveDashboardData
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -77,6 +77,8 @@ class ValveRequestCommand(IntEnum):
 
 _EVB019_REQUEST_PACKET_LENGTH = 20
 _DEVICE_LIST_RESPONSE_TIMEOUT_SECONDS = 5
+_DASHBOARD_RESPONSE_TIMEOUT_SECONDS = 5
+_DASHBOARD_PACKET_COUNT = 6
 _DEFAULT_SERIAL_NUMBER = "FFFFFFFF"
 
 
@@ -99,6 +101,8 @@ class ValveConnection:
         self._request_characteristic: tuple[str, set[str]] | None = None
         self._serial_number: str | None = None
         self._device_list_is_twin_valve: bool | None = None
+        self._dashboard_data: ValveDashboardData | None = None
+        self._dashboard_listeners: list[Callable[[ValveDashboardData | None], None]] = []
 
     @property
     def address(self) -> str:
@@ -129,6 +133,28 @@ class ValveConnection:
         """Return ``True`` if the most recent DeviceList packet identified a twin valve."""
 
         return self._device_list_is_twin_valve
+
+    @property
+    def dashboard_data(self) -> ValveDashboardData | None:
+        """Return the parsed data from the most recent Dashboard response."""
+
+        return self._dashboard_data
+
+    def add_dashboard_listener(
+        self, listener: Callable[[ValveDashboardData | None], None]
+    ) -> CALLBACK_TYPE:
+        """Register a callback for Dashboard data updates."""
+
+        self._dashboard_listeners.append(listener)
+
+        if self._dashboard_data is not None:
+            self._hass.loop.call_soon(listener, self._dashboard_data)
+
+        def _remove_listener() -> None:
+            with contextlib.suppress(ValueError):
+                self._dashboard_listeners.remove(listener)
+
+        return _remove_listener
 
     def update_from_advertisement(self, advertisement: ValveAdvertisement) -> None:
         """Record the most recent Bluetooth advertisement for the valve."""
@@ -320,6 +346,27 @@ class ValveConnection:
         else:
             _LOGGER.debug(
                 "Valve %s did not provide a DeviceList response during this poll",
+                self._address,
+            )
+
+        dashboard_request_sent, dashboard_response_received = (
+            await self._async_request_dashboard(client)
+        )
+        if not dashboard_request_sent:
+            _LOGGER.debug(
+                "Unable to send Dashboard request to valve %s; will retry on next poll",
+                self._address,
+            )
+            return
+
+        if dashboard_response_received:
+            _LOGGER.debug(
+                "Retrieved Dashboard response from valve %s during diagnostic poll",
+                self._address,
+            )
+        else:
+            _LOGGER.debug(
+                "Valve %s did not provide a Dashboard response during this poll",
                 self._address,
             )
 
@@ -577,6 +624,83 @@ class ValveConnection:
         finally:
             await self._async_unsubscribe_notifications(client, subscriptions)
 
+    async def _async_request_dashboard(
+        self, client: BaseBleakClient
+    ) -> tuple[bool, bool]:
+        """Send a Dashboard request and wait for the full multi-packet response."""
+
+        loop = asyncio.get_running_loop()
+        response_future: asyncio.Future[list[bytes]] = loop.create_future()
+        packets: dict[int, bytes] = {}
+
+        def _notification_handler(_: int | str, data: bytearray) -> None:
+            if response_future.done():
+                return
+
+            packet = bytes(data)
+            index = self._get_dashboard_packet_index(packet)
+            if index is None:
+                return
+
+            packets[index] = packet
+            if len(packets) == _DASHBOARD_PACKET_COUNT:
+                try:
+                    ordered = [packets[i] for i in range(_DASHBOARD_PACKET_COUNT)]
+                except KeyError:
+                    return
+                response_future.set_result(ordered)
+
+        subscriptions = await self._async_subscribe_to_notifications(
+            client, _notification_handler
+        )
+
+        try:
+            request_sent = await self._async_send_request(
+                client, ValveRequestCommand.DASHBOARD
+            )
+            if not request_sent:
+                if not response_future.done():
+                    response_future.cancel()
+                return False, False
+
+            if not subscriptions:
+                if not response_future.done():
+                    response_future.cancel()
+                _LOGGER.debug(
+                    "Valve %s does not expose a notifying characteristic for Dashboard responses",
+                    self._address,
+                )
+                return True, False
+
+            try:
+                async with asyncio.timeout(
+                    _DASHBOARD_RESPONSE_TIMEOUT_SECONDS
+                ):
+                    packets_list = await response_future
+            except asyncio.TimeoutError:
+                if not response_future.done():
+                    response_future.cancel()
+                _LOGGER.debug(
+                    "Timed out waiting for Dashboard response from valve %s",
+                    self._address,
+                )
+                return True, False
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if not response_future.done():
+                    response_future.cancel()
+                _LOGGER.exception(
+                    "Unexpected error while waiting for Dashboard response from valve %s",
+                    self._address,
+                )
+                return True, False
+
+            self._handle_dashboard_packets(packets_list)
+            return True, True
+        finally:
+            await self._async_unsubscribe_notifications(client, subscriptions)
+
     async def _async_subscribe_to_notifications(
         self,
         client: BaseBleakClient,
@@ -774,6 +898,180 @@ class ValveConnection:
 
         return True
 
+    def _get_dashboard_packet_index(self, packet: bytes) -> int | None:
+        """Return the packet index if the payload matches the Dashboard format."""
+
+        length = len(packet)
+        if length not in (6, 20):
+            return None
+
+        opcode = int(ValveRequestCommand.DASHBOARD)
+        if packet[0] != opcode or packet[1] != opcode:
+            return None
+
+        index = packet[2]
+        if not 0 <= index < _DASHBOARD_PACKET_COUNT:
+            return None
+
+        if index == 0 and packet[-1] != 57:
+            return None
+
+        if index == 1 and packet[-1] != 58:
+            return None
+
+        if index == _DASHBOARD_PACKET_COUNT - 1:
+            if length != 6 or packet[-1] != 58:
+                return None
+        elif length != 20:
+            return None
+
+        return index
+
+    def _handle_dashboard_packets(self, packets: list[bytes]) -> None:
+        """Parse and store the most recent Dashboard response from the valve."""
+
+        if len(packets) != _DASHBOARD_PACKET_COUNT:
+            _LOGGER.debug(
+                "Valve %s provided incomplete Dashboard response (%d of %d packets)",
+                self._address,
+                len(packets),
+                _DASHBOARD_PACKET_COUNT,
+            )
+            return
+
+        first, second, third, fourth, fifth, sixth = packets
+
+        if not (
+            len(first) >= 19
+            and len(second) >= 19
+            and len(third) >= 20
+            and len(fourth) >= 20
+            and len(fifth) >= 20
+            and len(sixth) >= 5
+        ):
+            _LOGGER.debug(
+                "Valve %s provided malformed Dashboard packet lengths", self._address
+            )
+            return
+
+        try:
+            time_hour = first[3]
+            time_minute = first[4]
+            is_pm = first[5] != 0
+            battery_capacity = self._calculate_battery_capacity(first[6])
+            present_flow = self._decode_flow_value(first, 7)
+            water_remaining = self._read_uint16_be(first, 9)
+            water_usage = self._read_uint16_be(first, 11)
+            peak_flow = self._decode_flow_value(first, 13)
+            water_hardness = first[15]
+            regeneration_time_hour = first[16]
+            regeneration_time_is_pm = first[17] == 1
+
+            flags = first[18]
+            shutoff_setting_enabled = bool(flags & 0x01)
+            bypass_setting_enabled = bool(flags & 0x02)
+            shutoff_active = bool(flags & 0x04)
+            bypass_active = bool(flags & 0x08)
+            display_off = bool(flags & 0x10)
+
+            filter_backwash = second[3]
+            air_recharge = second[4]
+            pos_time = second[5]
+            pos_option_seconds = second[6]
+            regen_cycle_position = second[7]
+            regen_active = second[8]
+            prefill_soak_mode = bool(second[10] & 0x08)
+            soak_timer = second[11]
+            is_in_aeration = not bool(second[12] & 0x01)
+            tank_in_service = second[18]
+
+            graph_values = (
+                list(third[3:20])
+                + list(fourth[0:20])
+                + list(fifth[0:20])
+                + list(sixth[0:5])
+            )
+
+            dashboard = ValveDashboardData(
+                time_hour=time_hour,
+                time_minute=time_minute,
+                is_pm=is_pm,
+                battery_capacity=battery_capacity,
+                present_flow=present_flow,
+                water_remaining_until_regeneration=water_remaining,
+                water_usage=water_usage,
+                peak_flow=peak_flow,
+                water_hardness=water_hardness,
+                regeneration_time_hour=regeneration_time_hour,
+                regeneration_time_is_pm=regeneration_time_is_pm,
+                shutoff_setting_enabled=shutoff_setting_enabled,
+                bypass_setting_enabled=bypass_setting_enabled,
+                shutoff_active=shutoff_active,
+                bypass_active=bypass_active,
+                display_off=display_off,
+                filter_backwash=filter_backwash,
+                air_recharge=air_recharge,
+                pos_time=pos_time,
+                pos_option_seconds=pos_option_seconds,
+                regen_cycle_position=regen_cycle_position,
+                regen_active=regen_active,
+                prefill_soak_mode=prefill_soak_mode,
+                soak_timer=soak_timer,
+                is_in_aeration=is_in_aeration,
+                tank_in_service=tank_in_service,
+                graph_usage_ten_gallons=tuple(graph_values),
+            )
+        except Exception:  # pragma: no cover - parsing errors should be rare
+            _LOGGER.exception(
+                "Error while parsing Dashboard response from valve %s", self._address
+            )
+            return
+
+        self._dashboard_data = dashboard
+        self._notify_dashboard_listeners(dashboard)
+
+    def _notify_dashboard_listeners(
+        self, dashboard: ValveDashboardData | None
+    ) -> None:
+        """Notify registered callbacks about a Dashboard data update."""
+
+        for listener in list(self._dashboard_listeners):
+            try:
+                listener(dashboard)
+            except Exception:  # pragma: no cover - listener failures are logged
+                _LOGGER.exception(
+                    "Unexpected error in Dashboard listener for valve %s", self._address
+                )
+
+    @staticmethod
+    def _read_uint16_be(packet: bytes, index: int) -> int:
+        """Return the unsigned 16-bit integer stored at ``packet[index]``."""
+
+        return (packet[index] << 8) | packet[index + 1]
+
+    @staticmethod
+    def _decode_flow_value(packet: bytes, index: int) -> float:
+        """Return the flow value encoded in hundredths of a unit."""
+
+        return ValveConnection._read_uint16_be(packet, index) / 100
+
+    @staticmethod
+    def _calculate_battery_capacity(raw_value: int) -> int:
+        """Convert a raw Dashboard battery value into a capacity percentage."""
+
+        int_value = raw_value * 4 * 0.002 * 11
+        if int_value >= 9.5:
+            return 100
+        if int_value >= 8.91:
+            return int(100 - ((9.5 - int_value) * 8.78))
+        if int_value >= 8.48:
+            return int(94.78 - ((8.91 - int_value) * 30.26))
+        if int_value >= 7.43:
+            return int(81.84 - ((8.48 - int_value) * 60.47))
+        if int_value < 6.5:
+            return 0
+        return int(18.68 - ((7.43 - int_value) * 20.02))
+
     def _handle_device_list_packet(self, packet: bytes) -> None:
         """Update internal state from a DeviceList response packet."""
 
@@ -913,3 +1211,8 @@ class ValveConnectionManager:
         """Return an iterable over the tracked valve connections."""
 
         return self._connections.values()
+
+    def get_connection(self, address: str) -> ValveConnection | None:
+        """Return the connection for a specific valve address, if available."""
+
+        return self._connections.get(address)
