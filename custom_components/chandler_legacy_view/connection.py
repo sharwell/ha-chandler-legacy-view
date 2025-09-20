@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import IntEnum
@@ -638,7 +638,7 @@ class ValveConnection:
                 return
 
             packet = bytes(data)
-            index = self._get_dashboard_packet_index(packet)
+            index = self._get_dashboard_packet_index(packet, packets)
             if index is None:
                 return
 
@@ -898,34 +898,59 @@ class ValveConnection:
 
         return True
 
-    def _get_dashboard_packet_index(self, packet: bytes) -> int | None:
-        """Return the packet index if the payload matches the Dashboard format."""
+    def _get_dashboard_packet_index(
+        self, packet: bytes, existing_packets: Mapping[int, bytes]
+    ) -> int | None:
+        """Return the packet index for a Dashboard payload.
+
+        ``existing_packets`` contains the indexes that have already been
+        collected for the in-progress Dashboard response.  Chandler valves only
+        embed packet indexes in the first three packets; the remaining packets
+        are inferred using the partial ordering observed in the Android
+        implementation.
+        """
 
         length = len(packet)
-        if length not in (6, 20):
+        if length < 5 or length > 20:
             return None
 
         opcode = int(ValveRequestCommand.DASHBOARD)
-        if packet[0] != opcode or packet[1] != opcode:
-            return None
+        has_signature = length >= 3 and packet[0] == opcode and packet[1] == opcode
 
-        index = packet[2]
-        if not 0 <= index < _DASHBOARD_PACKET_COUNT:
-            return None
-
-        if index == 0 and packet[-1] != 57:
-            return None
-
-        if index == 1 and packet[-1] != 58:
-            return None
-
-        if index == _DASHBOARD_PACKET_COUNT - 1:
-            if length != 6 or packet[-1] != 58:
+        if has_signature:
+            index = packet[2]
+            if index not in (0, 1, 2) or index in existing_packets:
                 return None
-        elif length != 20:
+
+            if index == 0:
+                if length < 19 or packet[-1] != 57:
+                    return None
+            elif index == 1:
+                if length < 19 or packet[-1] != 58:
+                    return None
+            else:  # index == 2
+                if length < 20:
+                    return None
+
+            return index
+
+        if 2 not in existing_packets:
             return None
 
-        return index
+        for candidate in range(3, _DASHBOARD_PACKET_COUNT):
+            if candidate in existing_packets:
+                continue
+
+            if candidate in (3, 4) and length < 20:
+                return None
+
+            if candidate == _DASHBOARD_PACKET_COUNT - 1:
+                if packet[-1] != 58:
+                    return None
+
+            return candidate
+
+        return None
 
     def _handle_dashboard_packets(self, packets: list[bytes]) -> None:
         """Parse and store the most recent Dashboard response from the valve."""
