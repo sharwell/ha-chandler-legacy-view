@@ -178,6 +178,14 @@ class ValveDecodedPassword:
     passcode: str
 
 
+@dataclass(slots=True)
+class ValvePasscodeConfiguration:
+    """Configured passcode information for a valve."""
+
+    value: str | None
+    is_override: bool
+
+
 class ValveConnection:
     """Handle an active Bluetooth data poll for a valve."""
 
@@ -185,7 +193,7 @@ class ValveConnection:
         self,
         hass: HomeAssistant,
         address: str,
-        passcode_getter: Callable[[str], str | None] | None = None,
+        passcode_getter: Callable[[str], ValvePasscodeConfiguration] | None = None,
     ) -> None:
         """Initialize the valve connection handler."""
 
@@ -250,13 +258,26 @@ class ValveConnection:
 
         return self._dashboard_data
 
+    def _get_passcode_configuration(self) -> ValvePasscodeConfiguration:
+        """Return the stored passcode configuration for this valve."""
+
+        if self._passcode_getter is None:
+            return ValvePasscodeConfiguration(value=None, is_override=False)
+
+        return self._passcode_getter(self._address)
+
     def get_configured_passcode(self) -> str | None:
         """Return the configured passcode for this valve, if available."""
 
-        if self._passcode_getter is None:
-            return None
+        configuration = self._get_passcode_configuration()
+        passcode = configuration.value
 
-        return self._passcode_getter(self._address)
+        if not configuration.is_override and self._device_list_decoded_password is not None:
+            decoded_passcode = self._device_list_decoded_password.passcode
+            if decoded_passcode == "0000":
+                return "0000"
+
+        return passcode
 
     def add_dashboard_listener(
         self, listener: Callable[[ValveDashboardData | None], None]
@@ -1811,13 +1832,18 @@ class ValveConnectionManager:
 
         return self._connections.get(address)
 
-    def get_passcode(self, address: str | None = None) -> str | None:
-        """Return the configured passcode for a valve address."""
+    def get_passcode(
+        self, address: str | None = None
+    ) -> ValvePasscodeConfiguration:
+        """Return the configured passcode details for a valve address."""
 
         overrides = self._config_entry.options.get(CONF_DEVICE_PASSCODES, {})
         if address is not None:
             override = overrides.get(address)
             if override is not None:
-                return override
+                return ValvePasscodeConfiguration(value=override, is_override=True)
 
-        return self._config_entry.data.get(CONF_DEFAULT_PASSCODE)
+        return ValvePasscodeConfiguration(
+            value=self._config_entry.data.get(CONF_DEFAULT_PASSCODE),
+            is_override=False,
+        )
