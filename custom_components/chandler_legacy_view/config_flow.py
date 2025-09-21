@@ -37,9 +37,6 @@ PASSCODE_PATTERN = re.compile(r"^\d{4}$")
 PASSCODE_SELECTOR = TextSelector(
     TextSelectorConfig(
         type=TextSelectorType.PASSWORD,
-        min=4,
-        max=4,
-        pattern=r"\\d*",
     )
 )
 
