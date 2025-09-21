@@ -11,6 +11,8 @@ from homeassistant.helpers.device_registry import DeviceEntryType
 from homeassistant.helpers.typing import ConfigType
 
 from .const import (
+    CONF_DEFAULT_PASSCODE,
+    CONF_DEVICE_PASSCODES,
     DATA_CONNECTION_MANAGER,
     DATA_DISCOVERY_MANAGER,
     DEFAULT_MANUFACTURER,
@@ -51,7 +53,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     discovery_manager = ValveDiscoveryManager(hass)
     await discovery_manager.async_setup()
 
-    connection_manager = ValveConnectionManager(hass, discovery_manager)
+    connection_manager = ValveConnectionManager(hass, entry, discovery_manager)
     await connection_manager.async_setup()
 
     hass.data[DOMAIN][entry.entry_id] = {
@@ -64,6 +66,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))
     _LOGGER.debug("Chandler Legacy View setup complete for entry %s", entry.entry_id)
     return True
+
+
+def get_configured_passcode(entry: ConfigEntry, address: str | None = None) -> str | None:
+    """Return the configured passcode for a valve address."""
+
+    overrides = entry.options.get(CONF_DEVICE_PASSCODES, {})
+    if address is not None:
+        override_passcode = overrides.get(address)
+        if override_passcode is not None:
+            return override_passcode
+
+    return entry.data.get(CONF_DEFAULT_PASSCODE)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
