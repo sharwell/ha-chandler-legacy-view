@@ -87,7 +87,11 @@ _DEFAULT_SERIAL_NUMBER = "FFFFFFFF"
 
 
 _CRC_RANDOM = SystemRandom()
-_CRC_ALLOWED_POLYNOMIALS: tuple[int, ...] = tuple(range(1, 256))
+_CRC_ALLOWED_POLYNOMIALS: tuple[int, ...] = tuple(
+    polynomial
+    for polynomial in range(1, 256)
+    if 4 <= int.bit_count(polynomial) <= 5
+)
 
 
 class _ChandlerCrc8:
@@ -108,13 +112,30 @@ class _ChandlerCrc8:
     def compute(self, value: int) -> int:
         """Return the CRC8 value for ``value`` using the configured options."""
 
-        crc = self._seed ^ (value & 0xFF)
+        crc = (self._seed ^ (value & 0xFF)) & 0xFF
         for _ in range(8):
             if crc & 0x80:
                 crc = ((crc << 1) ^ self._polynomial) & 0xFF
             else:
                 crc = (crc << 1) & 0xFF
+        self._seed = crc
         return crc
+
+    def compute_legacy(self, value: int) -> int:
+        """Return the legacy CRC8 value for ``value`` using the configured options."""
+
+        data = value & 0xFF
+        seed = self._seed & 0xFF
+        for _ in range(8):
+            seed_has_high_bit = seed & 0x80
+            seed = (seed << 1) & 0xFF
+            if data & 0x80:
+                seed = (seed | 0x01) & 0xFF
+            data = (data << 1) & 0xFF
+            if seed_has_high_bit:
+                seed ^= self._polynomial
+        self._seed = seed & 0xFF
+        return self._seed
 
 
 class ValveAuthenticationState(IntEnum):
@@ -985,17 +1006,17 @@ class ValveConnection:
         random_seed = _CRC_RANDOM.randint(1, 255)
         self._crc8.set_options(polynomial, random_seed)
         random_xor = _CRC_RANDOM.randint(1, 255) ^ random_seed
-        intermediate = counter ^ self._crc8.compute(random_xor)
+        intermediate = counter ^ self._crc8.compute_legacy(random_xor)
 
         buffer[2] = 80
         buffer[3] = 65
         buffer[4] = polynomial & 0xFF
         buffer[5] = random_seed & 0xFF
         buffer[6] = random_xor & 0xFF
-        buffer[7] = (self._crc8.compute(intermediate) ^ digits[3]) & 0xFF
-        buffer[8] = (digits[2] ^ self._crc8.compute(buffer[7])) & 0xFF
-        buffer[9] = (digits[1] ^ self._crc8.compute(buffer[8])) & 0xFF
-        buffer[10] = (digits[0] ^ self._crc8.compute(buffer[9])) & 0xFF
+        buffer[7] = (self._crc8.compute_legacy(intermediate) ^ digits[3]) & 0xFF
+        buffer[8] = (digits[2] ^ self._crc8.compute_legacy(buffer[7])) & 0xFF
+        buffer[9] = (digits[1] ^ self._crc8.compute_legacy(buffer[8])) & 0xFF
+        buffer[10] = (digits[0] ^ self._crc8.compute_legacy(buffer[9])) & 0xFF
 
         for index in range(11, _EVB019_REQUEST_PACKET_LENGTH):
             buffer[index] = _CRC_RANDOM.randint(1, 255)
