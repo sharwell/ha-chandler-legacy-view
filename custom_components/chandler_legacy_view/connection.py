@@ -10,6 +10,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, IntEnum
+from random import SystemRandom
 
 from bleak.backends.client import BaseBleakClient
 from bleak_retry_connector import (
@@ -85,6 +86,58 @@ _DASHBOARD_PACKET_COUNT = 6
 _DEFAULT_SERIAL_NUMBER = "FFFFFFFF"
 
 
+_CRC_RANDOM = SystemRandom()
+_CRC_ALLOWED_POLYNOMIALS: tuple[int, ...] = tuple(
+    polynomial
+    for polynomial in range(1, 256)
+    if 4 <= int.bit_count(polynomial) <= 5
+)
+
+
+class _ChandlerCrc8:
+    """Reproduce the CRC8 helper used by the mobile application."""
+
+    def __init__(self) -> None:
+        """Initialize the CRC helper with a default configuration."""
+
+        self._polynomial = 0
+        self._seed = 0
+
+    def set_options(self, polynomial: int, seed: int) -> None:
+        """Configure the CRC calculation parameters."""
+
+        self._polynomial = polynomial & 0xFF
+        self._seed = seed & 0xFF
+
+    def compute(self, value: int) -> int:
+        """Return the CRC8 value for ``value`` using the configured options."""
+
+        crc = (self._seed ^ (value & 0xFF)) & 0xFF
+        for _ in range(8):
+            if crc & 0x80:
+                crc = ((crc << 1) ^ self._polynomial) & 0xFF
+            else:
+                crc = (crc << 1) & 0xFF
+        self._seed = crc
+        return crc
+
+    def compute_legacy(self, value: int) -> int:
+        """Return the legacy CRC8 value for ``value`` using the configured options."""
+
+        data = value & 0xFF
+        seed = self._seed & 0xFF
+        for _ in range(8):
+            seed_has_high_bit = seed & 0x80
+            seed = (seed << 1) & 0xFF
+            if data & 0x80:
+                seed = (seed | 0x01) & 0xFF
+            data = (data << 1) & 0xFF
+            if seed_has_high_bit:
+                seed ^= self._polynomial
+        self._seed = seed & 0xFF
+        return self._seed
+
+
 class ValveAuthenticationState(IntEnum):
     """Authentication result associated with a decoded passcode."""
 
@@ -154,9 +207,12 @@ class ValveConnection:
         self._device_list_password_retries = 0
         self._device_list_authentication_state = ValveAuthenticationState.UNKNOWN
         self._device_list_connection_counter: int | None = None
+        self._authentication_failed = False
+        self._authentication_failed_passcode: str | None = None
         self._dashboard_data: ValveDashboardData | None = None
         self._dashboard_listeners: list[Callable[[ValveDashboardData | None], None]] = []
         self._passcode_getter = passcode_getter
+        self._crc8 = _ChandlerCrc8()
 
     @property
     def address(self) -> str:
@@ -411,18 +467,52 @@ class ValveConnection:
                 self._address,
             )
 
-        if self._advertisement.authentication_required:
+        authenticated = (
+            self._device_list_authentication_state
+            == ValveAuthenticationState.AUTHENTICATED
+        )
+
+        if self._advertisement.authentication_required and not authenticated:
             passcode = self.get_configured_passcode()
+            if passcode is not None:
+                passcode = passcode.strip()
+            self._reset_authentication_failure_if_needed(passcode)
+
             if passcode is None:
                 _LOGGER.debug(
                     "Skipping Dashboard request to valve %s; authentication is required and no passcode is configured",
                     self._address,
                 )
-            else:
+                return
+
+            if self._authentication_failed and (
+                passcode == self._authentication_failed_passcode
+            ):
                 _LOGGER.debug(
-                    "Skipping Dashboard request to valve %s; authentication requires additional implementation",
+                    "Skipping Dashboard request to valve %s; authentication was previously attempted and failed",
                     self._address,
                 )
+                return
+
+            if self._parse_passcode(passcode) is None:
+                _LOGGER.debug(
+                    "Skipping Dashboard request to valve %s; configured passcode %r is not numeric",
+                    self._address,
+                    passcode,
+                )
+                return
+
+            if self._device_list_password_state == ValvePasswordDecodeState.AUTH_NEEDED:
+                _LOGGER.debug(
+                    "Skipping Dashboard request to valve %s; valve still reports that authentication is required",
+                    self._address,
+                )
+                return
+
+            _LOGGER.debug(
+                "Skipping Dashboard request to valve %s; authentication has not been confirmed",
+                self._address,
+            )
             return
 
         dashboard_request_sent, dashboard_response_received = (
@@ -570,32 +660,23 @@ class ValveConnection:
             )
         return None
 
-    async def _async_send_request(
+    async def _async_send_payload(
         self,
         client: BaseBleakClient,
-        request: ValveRequestCommand | int,
+        payload: bytes,
         *,
+        command_name: str,
         characteristic_uuid: str | None = None,
         response: bool | None = None,
     ) -> bool:
-        """Send an EVB019 request packet to the connected valve."""
-
-        command_value = int(request)
-        payload = self._create_request_payload(command_value)
-
-        try:
-            command_name = (
-                ValveRequestCommand(command_value).name.title().replace("_", "")
-            )
-        except ValueError:
-            command_name = f"value {command_value}"
+        """Send a raw EVB019 payload to the connected valve."""
 
         resolved = await self._async_resolve_request_characteristic(
             client, characteristic_uuid
         )
         if resolved is None:
             _LOGGER.debug(
-                "Cannot send %s request to valve %s; request characteristic not found",
+                "Cannot send %s to valve %s; request characteristic not found",
                 command_name,
                 self._address,
             )
@@ -616,7 +697,7 @@ class ValveConnection:
             )
         except BLEAK_RETRY_EXCEPTIONS as exc:
             _LOGGER.debug(
-                "Failed to send %s request to valve %s via %s: %s",
+                "Failed to send %s to valve %s via %s: %s",
                 command_name,
                 self._address,
                 char_uuid,
@@ -625,7 +706,7 @@ class ValveConnection:
             return False
         except Exception:  # pragma: no cover - unexpected Bluetooth errors are logged
             _LOGGER.exception(
-                "Unexpected error while sending %s request to valve %s",
+                "Unexpected error while sending %s to valve %s",
                 command_name,
                 self._address,
             )
@@ -633,21 +714,52 @@ class ValveConnection:
 
         return True
 
+    async def _async_send_request(
+        self,
+        client: BaseBleakClient,
+        request: ValveRequestCommand | int,
+        *,
+        characteristic_uuid: str | None = None,
+        response: bool | None = None,
+    ) -> bool:
+        """Send an EVB019 request packet to the connected valve."""
+
+        command_value = int(request)
+        payload = self._create_request_payload(command_value)
+
+        try:
+            command_name = (
+                ValveRequestCommand(command_value).name.title().replace("_", "")
+            )
+        except ValueError:
+            command_name = f"value {command_value}"
+
+        return await self._async_send_payload(
+            client,
+            payload,
+            command_name=f"{command_name} request",
+            characteristic_uuid=characteristic_uuid,
+            response=response,
+        )
+
     async def _async_request_device_list(
         self, client: BaseBleakClient
     ) -> tuple[bool, bool]:
         """Send a DeviceList request and wait for a matching response packet."""
 
         loop = asyncio.get_running_loop()
-        response_future: asyncio.Future[bytes] = loop.create_future()
+        response_future: asyncio.Future[bytes] | None = loop.create_future()
 
         def _notification_handler(_: int | str, data: bytearray) -> None:
-            if response_future.done():
+            nonlocal response_future
+
+            future = response_future
+            if future is None or future.done():
                 return
 
             packet = bytes(data)
             if self._is_device_list_packet(packet):
-                response_future.set_result(packet)
+                future.set_result(packet)
 
         subscriptions = await self._async_subscribe_to_notifications(
             client, _notification_handler
@@ -658,12 +770,12 @@ class ValveConnection:
                 client, ValveRequestCommand.DEVICE_LIST
             )
             if not request_sent:
-                if not response_future.done():
+                if response_future is not None and not response_future.done():
                     response_future.cancel()
                 return False, False
 
             if not subscriptions:
-                if not response_future.done():
+                if response_future is not None and not response_future.done():
                     response_future.cancel()
                 _LOGGER.debug(
                     "Valve %s does not expose a notifying characteristic for DeviceList responses",
@@ -675,9 +787,10 @@ class ValveConnection:
                 async with asyncio.timeout(
                     _DEVICE_LIST_RESPONSE_TIMEOUT_SECONDS
                 ):
+                    assert response_future is not None
                     packet = await response_future
             except asyncio.TimeoutError:
-                if not response_future.done():
+                if response_future is not None and not response_future.done():
                     response_future.cancel()
                 _LOGGER.debug(
                     "Timed out waiting for DeviceList response from valve %s",
@@ -687,7 +800,7 @@ class ValveConnection:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                if not response_future.done():
+                if response_future is not None and not response_future.done():
                     response_future.cancel()
                 _LOGGER.exception(
                     "Unexpected error while waiting for DeviceList response from valve %s",
@@ -695,10 +808,230 @@ class ValveConnection:
                 )
                 return True, False
 
+            response_future = None
             self._handle_device_list_packet(packet)
-            return True, True
+            response_received = True
+
+            passcode = self.get_configured_passcode()
+            if passcode is not None:
+                passcode = passcode.strip()
+
+            self._reset_authentication_failure_if_needed(passcode)
+
+            passcode_value = self._parse_passcode(passcode)
+            if passcode is not None and passcode_value is None:
+                _LOGGER.debug(
+                    "Skipping authentication for valve %s; configured passcode %r is not numeric",
+                    self._address,
+                    passcode,
+                )
+
+            if self._should_attempt_authentication(passcode, passcode_value):
+                connection_counter = self._device_list_connection_counter
+                if connection_counter is None:
+                    _LOGGER.debug(
+                        "Skipping authentication for valve %s; DeviceList response did not include a connection counter",
+                        self._address,
+                    )
+                else:
+                    response_future = loop.create_future()
+                    sent, authenticated = await self._async_authenticate(
+                        client,
+                        connection_counter,
+                        passcode_value,
+                        response_future,
+                    )
+                    if sent and not authenticated:
+                        self._record_authentication_failure(passcode)
+                    response_future = None
+
+            return True, response_received
         finally:
+            if response_future is not None and not response_future.done():
+                response_future.cancel()
             await self._async_unsubscribe_notifications(client, subscriptions)
+
+    def _reset_authentication_failure_if_needed(self, passcode: str | None) -> None:
+        """Clear stored failures if the configured passcode has changed."""
+
+        if not self._authentication_failed:
+            return
+
+        if passcode is None:
+            return
+
+        if self._authentication_failed_passcode is None:
+            return
+
+        if passcode == self._authentication_failed_passcode:
+            return
+
+        _LOGGER.debug(
+            "Configured passcode for valve %s changed; resetting authentication failure state",
+            self._address,
+        )
+        self._authentication_failed = False
+        self._authentication_failed_passcode = None
+
+    def _record_authentication_failure(self, passcode: str | None) -> None:
+        """Record that authentication failed for the provided passcode."""
+
+        self._authentication_failed = True
+        self._authentication_failed_passcode = passcode
+        _LOGGER.debug(
+            "Authentication attempt for valve %s failed; future attempts will be skipped until Home Assistant restarts or the passcode changes",
+            self._address,
+        )
+
+    def _should_attempt_authentication(
+        self, passcode: str | None, passcode_value: int | None
+    ) -> bool:
+        """Return ``True`` if authentication should be attempted."""
+
+        if self._device_list_password_state != ValvePasswordDecodeState.AUTH_NEEDED:
+            return False
+
+        if passcode is None:
+            _LOGGER.debug(
+                "Skipping authentication for valve %s; authentication is required and no passcode is configured",
+                self._address,
+            )
+            return False
+
+        if self._device_list_authentication_state == ValveAuthenticationState.AUTHENTICATED:
+            return False
+
+        if passcode_value is None:
+            return False
+
+        if self._authentication_failed and (
+            passcode == self._authentication_failed_passcode
+        ):
+            _LOGGER.debug(
+                "Skipping authentication for valve %s; previous attempt failed for the configured passcode",
+                self._address,
+            )
+            return False
+
+        return True
+
+    async def _async_authenticate(
+        self,
+        client: BaseBleakClient,
+        connection_counter: int,
+        passcode_value: int,
+        response_future: asyncio.Future[bytes],
+    ) -> tuple[bool, bool]:
+        """Send the authentication payload and wait for a DeviceList response."""
+
+        payload = self._create_password_buffer(connection_counter, passcode_value)
+        _LOGGER.debug(
+            "Attempting authentication with valve %s using connection counter %s",
+            self._address,
+            connection_counter,
+        )
+
+        sent = await self._async_send_payload(
+            client,
+            payload,
+            command_name="DeviceList authentication packet",
+        )
+        if not sent:
+            if not response_future.done():
+                response_future.cancel()
+            return False, False
+
+        try:
+            async with asyncio.timeout(_DEVICE_LIST_RESPONSE_TIMEOUT_SECONDS):
+                packet = await response_future
+        except asyncio.TimeoutError:
+            if not response_future.done():
+                response_future.cancel()
+            _LOGGER.debug(
+                "Timed out waiting for authentication response from valve %s",
+                self._address,
+            )
+            return True, False
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if not response_future.done():
+                response_future.cancel()
+            _LOGGER.exception(
+                "Unexpected error while waiting for authentication response from valve %s",
+                self._address,
+            )
+            return True, False
+
+        self._handle_device_list_packet(packet)
+
+        authenticated = (
+            self._device_list_authentication_state
+            == ValveAuthenticationState.AUTHENTICATED
+        )
+        if authenticated:
+            _LOGGER.debug("Valve %s authentication succeeded", self._address)
+            return True, True
+
+        _LOGGER.debug(
+            "Valve %s authentication response did not confirm access; state=%s auth_state=%s",
+            self._address,
+            self._device_list_password_state.name,
+            self._device_list_authentication_state.name,
+        )
+        return True, False
+
+    def _parse_passcode(self, passcode: str | None) -> int | None:
+        """Return the integer value for a configured passcode string."""
+
+        if passcode is None:
+            return None
+
+        normalized = passcode.strip()
+        if not normalized.isdigit():
+            return None
+
+        try:
+            return max(0, min(9999, int(normalized)))
+        except ValueError:
+            return None
+
+    def _create_password_buffer(self, connection_counter: int, passcode: int) -> bytes:
+        """Return the authentication payload for the provided parameters."""
+
+        counter = connection_counter & 0xFF
+        polynomial = _CRC_RANDOM.choice(_CRC_ALLOWED_POLYNOMIALS)
+        buffer = bytearray(self._create_request_payload(ValveRequestCommand.DEVICE_LIST))
+        digits = self._get_password_digits(passcode)
+        random_seed = _CRC_RANDOM.randint(1, 255)
+        self._crc8.set_options(polynomial, random_seed)
+        random_xor = _CRC_RANDOM.randint(1, 255) ^ random_seed
+        intermediate = counter ^ self._crc8.compute_legacy(random_xor)
+
+        buffer[2] = 80
+        buffer[3] = 65
+        buffer[4] = polynomial & 0xFF
+        buffer[5] = random_seed & 0xFF
+        buffer[6] = random_xor & 0xFF
+        buffer[7] = (self._crc8.compute_legacy(intermediate) ^ digits[3]) & 0xFF
+        buffer[8] = (digits[2] ^ self._crc8.compute_legacy(buffer[7])) & 0xFF
+        buffer[9] = (digits[1] ^ self._crc8.compute_legacy(buffer[8])) & 0xFF
+        buffer[10] = (digits[0] ^ self._crc8.compute_legacy(buffer[9])) & 0xFF
+
+        for index in range(11, _EVB019_REQUEST_PACKET_LENGTH):
+            buffer[index] = _CRC_RANDOM.randint(1, 255)
+
+        return bytes(buffer)
+
+    @staticmethod
+    def _get_password_digits(passcode: int) -> tuple[int, int, int, int]:
+        """Return the individual digits for a four digit passcode."""
+
+        constrained = max(0, min(9999, passcode))
+        thousands, remainder = divmod(constrained, 1000)
+        hundreds, remainder = divmod(remainder, 100)
+        tens, ones = divmod(remainder, 10)
+        return ones, tens, hundreds, thousands
 
     async def _async_request_dashboard(
         self, client: BaseBleakClient
@@ -1200,6 +1533,19 @@ class ValveConnection:
                 decoded_password.authentication_required,
                 decoded_password.passcode if decoded_password.passcode else "<empty>",
             )
+            if (
+                decoded_password.authentication_state
+                == ValveAuthenticationState.AUTHENTICATED
+                or not decoded_password.authentication_required
+            ):
+                if self._authentication_failed:
+                    _LOGGER.debug(
+                        "Valve %s reported authenticated state; clearing previous "
+                        "authentication failure",
+                        self._address,
+                    )
+                self._authentication_failed = False
+                self._authentication_failed_passcode = None
 
         serial_number = self._extract_serial_number(packet)
         if serial_number is None:
