@@ -9,7 +9,7 @@ import logging
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from enum import IntEnum
+from enum import Enum, IntEnum
 
 from bleak.backends.client import BaseBleakClient
 from bleak_retry_connector import (
@@ -85,6 +85,46 @@ _DASHBOARD_PACKET_COUNT = 6
 _DEFAULT_SERIAL_NUMBER = "FFFFFFFF"
 
 
+class ValveAuthenticationState(IntEnum):
+    """Authentication result associated with a decoded passcode."""
+
+    UNKNOWN = -1
+    NOT_AUTHENTICATED = 0
+    AUTHENTICATED = 128
+
+    @classmethod
+    def from_status(cls, value: int) -> "ValveAuthenticationState":
+        """Return the authentication state encoded in the status byte."""
+
+        if value == cls.NOT_AUTHENTICATED:
+            return cls.NOT_AUTHENTICATED
+        if value == cls.AUTHENTICATED:
+            return cls.AUTHENTICATED
+        return cls.UNKNOWN
+
+
+class ValvePasswordDecodeState(Enum):
+    """State machine describing the result of a passcode decode attempt."""
+
+    CLASSIC = "classic"
+    VALID = "valid"
+    INVALID = "invalid"
+    RETRY = "retry"
+    RECOVERED = "recovered"
+    RECOVERY_FAILED = "recovery_failed"
+    AUTH_NEEDED = "auth_needed"
+
+
+@dataclass(slots=True)
+class ValveDecodedPassword:
+    """Decoded passcode information reported by a DeviceList packet."""
+
+    state: ValvePasswordDecodeState
+    authentication_state: ValveAuthenticationState
+    authentication_required: bool
+    passcode: str
+
+
 class ValveConnection:
     """Handle an active Bluetooth data poll for a valve."""
 
@@ -109,6 +149,11 @@ class ValveConnection:
         self._request_characteristic: tuple[str, set[str]] | None = None
         self._serial_number: str | None = None
         self._device_list_is_twin_valve: bool | None = None
+        self._device_list_decoded_password: ValveDecodedPassword | None = None
+        self._device_list_password_state = ValvePasswordDecodeState.CLASSIC
+        self._device_list_password_retries = 0
+        self._device_list_authentication_state = ValveAuthenticationState.UNKNOWN
+        self._device_list_connection_counter: int | None = None
         self._dashboard_data: ValveDashboardData | None = None
         self._dashboard_listeners: list[Callable[[ValveDashboardData | None], None]] = []
         self._passcode_getter = passcode_getter
@@ -1144,6 +1189,18 @@ class ValveConnection:
 
         self._device_list_is_twin_valve = bool(packet[2])
 
+        decoded_password = self._decode_device_list_password(packet)
+        self._device_list_decoded_password = decoded_password
+        if decoded_password is not None:
+            _LOGGER.debug(
+                "Valve %s DeviceList passcode decode -> state=%s auth=%s requires_auth=%s passcode=%s",
+                self._address,
+                decoded_password.state.name,
+                decoded_password.authentication_state.name,
+                decoded_password.authentication_required,
+                decoded_password.passcode if decoded_password.passcode else "<empty>",
+            )
+
         serial_number = self._extract_serial_number(packet)
         if serial_number is None:
             if self._serial_number is not None:
@@ -1193,6 +1250,124 @@ class ValveConnection:
             return False
 
         return packet[2] in (0, 1)
+
+    def _decode_device_list_password(
+        self, packet: bytes
+    ) -> ValveDecodedPassword | None:
+        """Return the decoded passcode reported within a DeviceList payload."""
+
+        if len(packet) <= 7:
+            return None
+
+        status = packet[7]
+        advertisement = self._advertisement
+        firmware_version = advertisement.firmware_version if advertisement else None
+        has_connection_counter = (
+            advertisement.has_connection_counter if advertisement else False
+        )
+        is_twin_valve = bool(self._device_list_is_twin_valve)
+
+        use_classic_decode = False
+        if not is_twin_valve:
+            if firmware_version is not None:
+                use_classic_decode = firmware_version < 420 and firmware_version != 419
+            else:
+                use_classic_decode = not has_connection_counter
+
+        if use_classic_decode:
+            if len(packet) <= 11:
+                return None
+            return self._decode_classic_password(
+                status, packet[8], packet[9], packet[10], packet[11]
+            )
+
+        connection_counter: int | None = None
+        if len(packet) > 11:
+            connection_counter = packet[11] & 0xFF
+        elif advertisement and advertisement.connection_counter is not None:
+            connection_counter = advertisement.connection_counter
+
+        self._device_list_connection_counter = connection_counter
+        return self._decode_auth_needed_password(status, connection_counter)
+
+    def _decode_classic_password(
+        self, status: int, byte_a: int, byte_b: int, byte_c: int, byte_d: int
+    ) -> ValveDecodedPassword:
+        """Decode the four-digit passcode embedded in legacy DeviceList packets."""
+
+        self._device_list_connection_counter = None
+        b = self._to_signed_byte(status - 112)
+        b2 = self._to_signed_byte((byte_d // 4) - b)
+        b3 = self._to_signed_byte((byte_c // 3) - b2 - b)
+        b4 = self._to_signed_byte((byte_b // 2) - b3 - b2 - b)
+        b5 = self._to_signed_byte(byte_a - b4 - b3 - b2 - b)
+
+        digits = [b5, b4, b3, b2]
+        valid = all(0 <= digit < 10 for digit in digits)
+
+        if valid:
+            passcode = "".join(str(digit) for digit in digits)
+            self._device_list_password_retries = 0
+            state = ValvePasswordDecodeState.VALID
+        else:
+            self._device_list_password_retries += 1
+            if self._device_list_password_retries >= 3:
+                state = ValvePasswordDecodeState.INVALID
+            else:
+                state = ValvePasswordDecodeState.RETRY
+            passcode = ""
+
+        previous_state = self._device_list_password_state
+        if (
+            previous_state == ValvePasswordDecodeState.INVALID
+            and state == ValvePasswordDecodeState.VALID
+        ):
+            state = ValvePasswordDecodeState.RECOVERED
+        elif (
+            previous_state == ValvePasswordDecodeState.INVALID
+            and state == ValvePasswordDecodeState.INVALID
+        ):
+            state = ValvePasswordDecodeState.RECOVERY_FAILED
+
+        self._device_list_password_state = state
+        self._device_list_authentication_state = ValveAuthenticationState.UNKNOWN
+
+        return ValveDecodedPassword(
+            state=state,
+            authentication_state=ValveAuthenticationState.UNKNOWN,
+            authentication_required=False,
+            passcode=passcode,
+        )
+
+    def _decode_auth_needed_password(
+        self, status: int, connection_counter: int | None
+    ) -> ValveDecodedPassword:
+        """Return the placeholder response for passcodes requiring authentication."""
+
+        if connection_counter is not None:
+            self._device_list_connection_counter = connection_counter
+
+        self._device_list_password_retries = 0
+        state = ValvePasswordDecodeState.AUTH_NEEDED
+        authentication_state = ValveAuthenticationState.from_status(status & 0xFF)
+        self._device_list_authentication_state = authentication_state
+        self._device_list_password_state = state
+
+        return ValveDecodedPassword(
+            state=state,
+            authentication_state=authentication_state,
+            authentication_required=True,
+            passcode="0000",
+        )
+
+    @staticmethod
+    def _to_signed_byte(value: int) -> int:
+        """Return the provided value constrained to an 8-bit signed range."""
+
+        value &= 0xFF
+        if value >= 0x80:
+            return value - 0x100
+        return value
 
 
 class ValveConnectionManager:
