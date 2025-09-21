@@ -110,7 +110,7 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
     def __init__(self, config_entry: ConfigEntry) -> None:
         """Initialize the options flow handler."""
 
-        self.config_entry = config_entry
+        self._config_entry = config_entry
 
     async def async_step_init(
         self, user_input: dict[str, object] | None = None
@@ -120,14 +120,14 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
         errors: dict[str, str] = {}
         hass = self.hass
         existing_overrides = dict(
-            self.config_entry.options.get(CONF_DEVICE_PASSCODES, {})
+            self._config_entry.options.get(CONF_DEVICE_PASSCODES, {})
         )
         updated_overrides = dict(existing_overrides)
         overrides_changed = False
 
         discovery_manager = (
             hass.data.get(DOMAIN, {})
-            .get(self.config_entry.entry_id, {})
+            .get(self._config_entry.entry_id, {})
             .get(DATA_DISCOVERY_MANAGER)
         )
 
@@ -151,7 +151,7 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
             device_options.append({"value": address, "label": address})
 
         if user_input is not None:
-            updated_options = dict(self.config_entry.options)
+            updated_options = dict(self._config_entry.options)
 
             default_passcode_input = _coerce_passcode(
                 user_input.get(CONF_DEFAULT_PASSCODE)
@@ -161,12 +161,12 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
                     errors[CONF_DEFAULT_PASSCODE] = "invalid_passcode"
                 elif (
                     default_passcode_input
-                    != self.config_entry.data.get(CONF_DEFAULT_PASSCODE)
+                    != self._config_entry.data.get(CONF_DEFAULT_PASSCODE)
                 ):
                     hass.config_entries.async_update_entry(
-                        self.config_entry,
+                        self._config_entry,
                         data={
-                            **self.config_entry.data,
+                            **self._config_entry.data,
                             CONF_DEFAULT_PASSCODE: default_passcode_input,
                         },
                     )

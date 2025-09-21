@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -496,7 +497,8 @@ class ValveDiscoveryManager:
         self._listeners.append(listener)
 
         def _remove_listener() -> None:
-            self._listeners.remove(listener)
+            with contextlib.suppress(ValueError):
+                self._listeners.remove(listener)
 
         return _remove_listener
 
