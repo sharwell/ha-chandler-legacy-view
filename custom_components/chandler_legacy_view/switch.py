@@ -20,6 +20,62 @@ from .models import ValveAdvertisement
 _LOGGER = logging.getLogger(__name__)
 
 
+class ValvePersistentConnectionSwitch(ChandlerValveEntity, SwitchEntity):
+    """Allow the user to request a persistent BLE connection to a valve."""
+
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(
+        self, advertisement: ValveAdvertisement, connection: ValveConnection
+    ) -> None:
+        super().__init__(advertisement)
+        self._connection = connection
+        self._attr_unique_id = f"{advertisement.address}_persistent_connection"
+        self._attr_name = f"{self._attr_name} Persistent Connection"
+        self._attr_available = True
+        self._attr_is_on = connection.persistent_connection_enabled
+
+    @callback
+    def async_handle_bluetooth_update(
+        self, advertisement: ValveAdvertisement, change: BluetoothChange
+    ) -> None:
+        """Handle Bluetooth discovery updates for the valve."""
+
+        if change in BLUETOOTH_LOST_CHANGES:
+            self._attr_available = False
+        else:
+            self.async_update_from_advertisement(advertisement)
+            self._attr_available = True
+
+        self._attr_is_on = self._connection.persistent_connection_enabled
+        if self.hass is not None:
+            self.async_write_ha_state()
+
+    def async_update_from_advertisement(
+        self, advertisement: ValveAdvertisement
+    ) -> None:
+        """Store the latest advertisement details for the valve."""
+
+        super().async_update_from_advertisement(advertisement)
+        self._attr_name = f"{self._attr_name} Persistent Connection"
+
+    async def async_turn_on(self, **kwargs) -> None:
+        """Enable the persistent connection preference."""
+
+        await self._connection.async_set_persistent_connection_enabled(True)
+        self._attr_is_on = self._connection.persistent_connection_enabled
+        if self.hass is not None:
+            self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs) -> None:
+        """Disable the persistent connection preference."""
+
+        await self._connection.async_set_persistent_connection_enabled(False)
+        self._attr_is_on = self._connection.persistent_connection_enabled
+        if self.hass is not None:
+            self.async_write_ha_state()
+
+
 class ValveAuthenticationLockoutSwitch(ChandlerValveEntity, SwitchEntity):
     """Represent the authentication lockout state for a valve."""
 
@@ -99,20 +155,44 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up authentication lockout switches for Chandler valves."""
+    """Set up configuration switches for Chandler valves."""
 
     entry_data = hass.data[DOMAIN][entry.entry_id]
     discovery_manager: ValveDiscoveryManager = entry_data[DATA_DISCOVERY_MANAGER]
     connection_manager: ValveConnectionManager = entry_data[DATA_CONNECTION_MANAGER]
 
-    entities: dict[str, ValveAuthenticationLockoutSwitch] = {}
+    persistent_entities: dict[str, ValvePersistentConnectionSwitch] = {}
+    auth_entities: dict[str, ValveAuthenticationLockoutSwitch] = {}
 
-    def _ensure_entity(
+    def _ensure_persistent_entity(
         advertisement: ValveAdvertisement,
-    ) -> tuple[ValveAuthenticationLockoutSwitch | None, list[ValveAuthenticationLockoutSwitch]]:
-        """Return existing and newly created entities for an advertisement."""
+    ) -> tuple[
+        ValvePersistentConnectionSwitch | None, list[ValvePersistentConnectionSwitch]
+    ]:
+        entity = persistent_entities.get(advertisement.address)
+        new_entities: list[ValvePersistentConnectionSwitch] = []
 
-        entity = entities.get(advertisement.address)
+        if entity is None:
+            connection = connection_manager.get_connection(advertisement.address)
+            if connection is None:
+                _LOGGER.debug(
+                    "Delaying persistent connection entity creation for %s; connection not ready",
+                    advertisement.address,
+                )
+                return None, new_entities
+
+            entity = ValvePersistentConnectionSwitch(advertisement, connection)
+            persistent_entities[advertisement.address] = entity
+            new_entities.append(entity)
+
+        return entity, new_entities
+
+    def _ensure_auth_entity(
+        advertisement: ValveAdvertisement,
+    ) -> tuple[
+        ValveAuthenticationLockoutSwitch | None, list[ValveAuthenticationLockoutSwitch]
+    ]:
+        entity = auth_entities.get(advertisement.address)
         new_entities: list[ValveAuthenticationLockoutSwitch] = []
 
         if entity is None:
@@ -128,15 +208,17 @@ async def async_setup_entry(
                 return None, new_entities
 
             entity = ValveAuthenticationLockoutSwitch(advertisement, connection)
-            entities[advertisement.address] = entity
+            auth_entities[advertisement.address] = entity
             new_entities.append(entity)
 
         return entity, new_entities
 
-    initial_entities: list[ValveAuthenticationLockoutSwitch] = []
+    initial_entities: list[SwitchEntity] = []
     for advertisement in discovery_manager.devices.values():
-        _, new_entities = _ensure_entity(advertisement)
-        initial_entities.extend(new_entities)
+        _, new_persistent = _ensure_persistent_entity(advertisement)
+        initial_entities.extend(new_persistent)
+        _, new_auth = _ensure_auth_entity(advertisement)
+        initial_entities.extend(new_auth)
 
     if initial_entities:
         async_add_entities(initial_entities)
@@ -146,19 +228,27 @@ async def async_setup_entry(
         advertisement: ValveAdvertisement, change: BluetoothChange
     ) -> None:
         if change in BLUETOOTH_LOST_CHANGES:
-            entity = entities.get(advertisement.address)
-            if entity is not None:
-                entity.async_handle_bluetooth_update(advertisement, change)
+            persistent_entity = persistent_entities.get(advertisement.address)
+            if persistent_entity is not None:
+                persistent_entity.async_handle_bluetooth_update(advertisement, change)
+            auth_entity = auth_entities.get(advertisement.address)
+            if auth_entity is not None:
+                auth_entity.async_handle_bluetooth_update(advertisement, change)
             return
 
-        entity, new_entities = _ensure_entity(advertisement)
-        if entity is None:
-            return
+        new_entities: list[SwitchEntity] = []
+        persistent_entity, new_persistent = _ensure_persistent_entity(advertisement)
+        new_entities.extend(new_persistent)
+        auth_entity, new_auth = _ensure_auth_entity(advertisement)
+        new_entities.extend(new_auth)
 
         if new_entities:
             async_add_entities(new_entities)
 
-        entity.async_handle_bluetooth_update(advertisement, change)
+        if persistent_entity is not None:
+            persistent_entity.async_handle_bluetooth_update(advertisement, change)
+        if auth_entity is not None:
+            auth_entity.async_handle_bluetooth_update(advertisement, change)
 
     remove_listener = discovery_manager.async_add_listener(_handle_discovery)
     entry.async_on_unload(remove_listener)

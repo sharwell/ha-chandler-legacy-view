@@ -19,9 +19,15 @@ DEFAULT_VALVE_PASSCODE: Final = "1234"
 DOMAIN: Final = "chandler_legacy_view"
 PLATFORMS: Final[list[Platform]] = [
     Platform.BINARY_SENSOR,
+    Platform.NUMBER,
     Platform.SENSOR,
     Platform.SWITCH,
 ]
+
+# Persistent connection configuration
+DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS: Final = 10.0
+MIN_PERSISTENT_POLL_INTERVAL_SECONDS: Final = 5.0
+MAX_PERSISTENT_POLL_INTERVAL_SECONDS: Final = 300.0
 
 # Storage keys used inside ``hass.data``
 DATA_DISCOVERY_MANAGER: Final = "discovery_manager"
