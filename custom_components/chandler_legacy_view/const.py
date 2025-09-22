@@ -17,7 +17,11 @@ CONF_REMOVE_OVERRIDE: Final = "remove_override"
 DEFAULT_VALVE_PASSCODE: Final = "1234"
 
 DOMAIN: Final = "chandler_legacy_view"
-PLATFORMS: Final[list[Platform]] = [Platform.BINARY_SENSOR, Platform.SENSOR]
+PLATFORMS: Final[list[Platform]] = [
+    Platform.BINARY_SENSOR,
+    Platform.SENSOR,
+    Platform.SWITCH,
+]
 
 # Storage keys used inside ``hass.data``
 DATA_DISCOVERY_MANAGER: Final = "discovery_manager"
