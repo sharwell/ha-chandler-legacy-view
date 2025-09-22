@@ -270,6 +270,17 @@ def _extract_raw_manufacturer_segments(
                 payload_start,
                 segment_payload.hex(),
             )
+        else:
+            other_manufacturer = int.from_bytes(
+                segment_payload[:2], "little", signed=False
+            )
+            _LOGGER.debug(
+                "Skipping manufacturer segment at index %s for manufacturer %s (expected %s): %s",
+                payload_start,
+                other_manufacturer,
+                CSI_MANUFACTURER_ID,
+                segment_payload.hex(),
+            )
 
     if index < total_length:
         _LOGGER.debug(
@@ -554,9 +565,43 @@ class ValveDiscoveryManager:
                 )
                 return
 
+            raw_advertisement = getattr(service_info, "raw", None)
+            raw_for_classification = raw_advertisement
+            if raw_advertisement is None:
+                _LOGGER.debug(
+                    "Valve-like advertisement from %s with name %r had no raw payload",
+                    service_info.address,
+                    service_info.name,
+                )
+            else:
+                try:
+                    raw_bytes = bytes(raw_advertisement)
+                except (TypeError, ValueError):
+                    _LOGGER.debug(
+                        "Valve-like advertisement from %s with name %r provided raw payload of unexpected type %s",
+                        service_info.address,
+                        service_info.name,
+                        type(raw_advertisement).__name__,
+                    )
+                else:
+                    raw_for_classification = raw_bytes
+                    if raw_bytes:
+                        _LOGGER.debug(
+                            "Valve-like advertisement from %s with name %r had raw payload: %s",
+                            service_info.address,
+                            service_info.name,
+                            raw_bytes.hex(),
+                        )
+                    else:
+                        _LOGGER.debug(
+                            "Valve-like advertisement from %s with name %r had an empty raw payload",
+                            service_info.address,
+                            service_info.name,
+                        )
+
             classification = _classify_manufacturer_data(
                 service_info.manufacturer_data,
-                getattr(service_info, "raw", None),
+                raw_for_classification,
             )
 
             if classification.ignore_advertisement:
