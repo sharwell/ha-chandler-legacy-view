@@ -270,6 +270,17 @@ def _extract_raw_manufacturer_segments(
                 payload_start,
                 segment_payload.hex(),
             )
+        else:
+            other_manufacturer = int.from_bytes(
+                segment_payload[:2], "little", signed=False
+            )
+            _LOGGER.debug(
+                "Skipping manufacturer segment at index %s for manufacturer %s (expected %s): %s",
+                payload_start,
+                other_manufacturer,
+                CSI_MANUFACTURER_ID,
+                segment_payload.hex(),
+            )
 
     if index < total_length:
         _LOGGER.debug(
