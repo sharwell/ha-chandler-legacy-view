@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, Mapping
 
 from homeassistant.components.bluetooth import (
@@ -24,6 +24,24 @@ from .models import ValveAdvertisement
 _LOGGER = logging.getLogger(__name__)
 
 ValveListener = Callable[[ValveAdvertisement, BluetoothChange], None]
+
+
+def _merge_incomplete_advertisement(
+    previous: ValveAdvertisement, current: ValveAdvertisement
+) -> ValveAdvertisement:
+    """Merge a newly received incomplete advertisement with previous data."""
+
+    return replace(
+        previous,
+        address=current.address,
+        name=current.name,
+        rssi=current.rssi,
+        manufacturer_data=current.manufacturer_data,
+        service_data=current.service_data,
+        manufacturer_data_complete=current.manufacturer_data_complete,
+        valve_data_parsed=current.valve_data_parsed,
+    )
+
 
 _VALVE_NAME_PREFIXES_CASEFOLD = tuple(
     prefix.casefold() for prefix in VALVE_NAME_PREFIXES
@@ -680,6 +698,14 @@ class ValveDiscoveryManager:
                 bootloader_version=classification.bootloader_version,
                 radio_protocol_version=classification.radio_protocol_version,
             )
+            previous_advertisement = self._devices.get(service_info.address)
+            if (
+                previous_advertisement is not None
+                and not advertisement.manufacturer_data_complete
+            ):
+                advertisement = _merge_incomplete_advertisement(
+                    previous_advertisement, advertisement
+                )
             async_update_device_sw_version(
                 self._hass,
                 advertisement.address,
