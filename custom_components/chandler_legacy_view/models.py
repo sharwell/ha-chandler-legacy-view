@@ -5,6 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
+_METERED_SOFTENER_VALVE_TYPES = {
+    "MeteredSoftener",
+    "CommercialMeteredSoftener",
+}
+
 
 @dataclass(slots=True)
 class ValveAdvertisement:
@@ -38,6 +43,19 @@ class ValveAdvertisement:
     bootloader_version: int | None = None
     radio_protocol_version: int | None = None
     authentication_required: bool = False
+
+    @property
+    def is_metered_softener(self) -> bool:
+        """Return ``True`` if the advertisement describes a metered softener valve."""
+
+        if self.is_twin_valve:
+            return True
+
+        valve_type = self.valve_type
+        if valve_type is None:
+            return False
+
+        return valve_type in _METERED_SOFTENER_VALVE_TYPES
 
 
 @dataclass(slots=True)

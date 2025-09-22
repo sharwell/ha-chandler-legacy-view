@@ -7,7 +7,7 @@ import logging
 from homeassistant.components.bluetooth import BluetoothChange
 from homeassistant.components.sensor import SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfVolumeFlowRate
+from homeassistant.const import UnitOfVolumeFlowRate, UnitOfWaterHardness
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -90,6 +90,76 @@ class ValvePresentFlowSensor(ChandlerValveEntity, SensorEntity):
         self._update_from_dashboard(dashboard, write_state=True)
 
 
+class ValveWaterHardnessSensor(ChandlerValveEntity, SensorEntity):
+    """Represent the configured water hardness reported by a valve."""
+
+    _attr_native_unit_of_measurement = UnitOfWaterHardness.GRAINS_PER_GALLON
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(
+        self, advertisement: ValveAdvertisement, connection: ValveConnection
+    ) -> None:
+        super().__init__(advertisement)
+        self._attr_unique_id = f"{advertisement.address}_water_hardness"
+        self._attr_name = f"{self._attr_name} Water Hardness"
+        self._attr_available = True
+        self._remove_dashboard_listener: CALLBACK_TYPE | None = None
+        self._update_from_dashboard(connection.dashboard_data, write_state=False)
+        self._remove_dashboard_listener = connection.add_dashboard_listener(
+            self._handle_dashboard_update
+        )
+
+    @callback
+    def async_handle_bluetooth_update(
+        self, advertisement: ValveAdvertisement, change: BluetoothChange
+    ) -> None:
+        """Handle Bluetooth discovery updates for this valve."""
+
+        if change in BLUETOOTH_LOST_CHANGES:
+            self._attr_available = False
+        else:
+            self.async_update_from_advertisement(advertisement)
+            self._attr_available = True
+
+        if self.hass is not None:
+            self.async_write_ha_state()
+
+    def async_update_from_advertisement(
+        self, advertisement: ValveAdvertisement
+    ) -> None:
+        """Store the most recent advertisement for the valve."""
+
+        super().async_update_from_advertisement(advertisement)
+        self._attr_name = f"{self._attr_name} Water Hardness"
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Clean up listeners when the entity is removed."""
+
+        await super().async_will_remove_from_hass()
+        if self._remove_dashboard_listener is not None:
+            self._remove_dashboard_listener()
+            self._remove_dashboard_listener = None
+
+    def _update_from_dashboard(
+        self, dashboard: ValveDashboardData | None, *, write_state: bool
+    ) -> None:
+        """Update the native value from dashboard data."""
+
+        self._attr_native_value = (
+            None if dashboard is None else dashboard.water_hardness
+        )
+        if write_state and self.hass is not None:
+            self.async_write_ha_state()
+
+    @callback
+    def _handle_dashboard_update(
+        self, dashboard: ValveDashboardData | None
+    ) -> None:
+        """Handle updates from the dashboard poller."""
+
+        self._update_from_dashboard(dashboard, write_state=True)
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -101,14 +171,15 @@ async def async_setup_entry(
     discovery_manager: ValveDiscoveryManager = entry_data[DATA_DISCOVERY_MANAGER]
     connection_manager: ValveConnectionManager = entry_data[DATA_CONNECTION_MANAGER]
 
-    entities: dict[str, ValvePresentFlowSensor] = {}
+    flow_entities: dict[str, ValvePresentFlowSensor] = {}
+    hardness_entities: dict[str, ValveWaterHardnessSensor] = {}
 
-    def _ensure_entity(
+    def _ensure_flow_entity(
         advertisement: ValveAdvertisement,
     ) -> tuple[ValvePresentFlowSensor | None, list[ValvePresentFlowSensor]]:
         """Return existing and newly created entities for an advertisement."""
 
-        entity = entities.get(advertisement.address)
+        entity = flow_entities.get(advertisement.address)
         new_entities: list[ValvePresentFlowSensor] = []
 
         if entity is None:
@@ -121,15 +192,43 @@ async def async_setup_entry(
                 return None, new_entities
 
             entity = ValvePresentFlowSensor(advertisement, connection)
-            entities[advertisement.address] = entity
+            flow_entities[advertisement.address] = entity
             new_entities.append(entity)
 
         return entity, new_entities
 
-    initial_entities: list[ValvePresentFlowSensor] = []
+    def _ensure_hardness_entity(
+        advertisement: ValveAdvertisement,
+    ) -> tuple[ValveWaterHardnessSensor | None, list[ValveWaterHardnessSensor]]:
+        """Return water hardness entities for the provided advertisement."""
+
+        entity = hardness_entities.get(advertisement.address)
+        new_entities: list[ValveWaterHardnessSensor] = []
+
+        if entity is None:
+            if not advertisement.is_metered_softener:
+                return None, new_entities
+
+            connection = connection_manager.get_connection(advertisement.address)
+            if connection is None:
+                _LOGGER.debug(
+                    "Delaying water hardness sensor creation for %s; connection not ready",
+                    advertisement.address,
+                )
+                return None, new_entities
+
+            entity = ValveWaterHardnessSensor(advertisement, connection)
+            hardness_entities[advertisement.address] = entity
+            new_entities.append(entity)
+
+        return entity, new_entities
+
+    initial_entities: list[SensorEntity] = []
     for advertisement in discovery_manager.devices.values():
-        _, new_entities = _ensure_entity(advertisement)
-        initial_entities.extend(new_entities)
+        _, new_flow_entities = _ensure_flow_entity(advertisement)
+        _, new_hardness_entities = _ensure_hardness_entity(advertisement)
+        initial_entities.extend(new_flow_entities)
+        initial_entities.extend(new_hardness_entities)
 
     if initial_entities:
         async_add_entities(initial_entities)
@@ -139,19 +238,30 @@ async def async_setup_entry(
         advertisement: ValveAdvertisement, change: BluetoothChange
     ) -> None:
         if change in BLUETOOTH_LOST_CHANGES:
-            entity = entities.get(advertisement.address)
-            if entity is not None:
-                entity.async_handle_bluetooth_update(advertisement, change)
+            flow_entity = flow_entities.get(advertisement.address)
+            if flow_entity is not None:
+                flow_entity.async_handle_bluetooth_update(advertisement, change)
+
+            hardness_entity = hardness_entities.get(advertisement.address)
+            if hardness_entity is not None:
+                hardness_entity.async_handle_bluetooth_update(advertisement, change)
             return
 
-        entity, new_entities = _ensure_entity(advertisement)
-        if entity is None:
-            return
+        flow_entity, new_flow_entities = _ensure_flow_entity(advertisement)
+        hardness_entity, new_hardness_entities = _ensure_hardness_entity(advertisement)
+
+        new_entities: list[SensorEntity] = []
+        new_entities.extend(new_flow_entities)
+        new_entities.extend(new_hardness_entities)
 
         if new_entities:
             async_add_entities(new_entities)
 
-        entity.async_handle_bluetooth_update(advertisement, change)
+        if flow_entity is not None:
+            flow_entity.async_handle_bluetooth_update(advertisement, change)
+
+        if hardness_entity is not None:
+            hardness_entity.async_handle_bluetooth_update(advertisement, change)
 
     remove_listener = discovery_manager.async_add_listener(_handle_discovery)
     entry.async_on_unload(remove_listener)
