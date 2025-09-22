@@ -450,6 +450,8 @@ class ValveConnection:
                 self._last_success = dt_util.utcnow()
             finally:
                 with contextlib.suppress(Exception):
+                    await self._async_send_reset_buffer_packet(client)
+                with contextlib.suppress(Exception):
                     await client.disconnect()
         finally:
             if connection_attempted:
@@ -765,6 +767,28 @@ class ValveConnection:
             characteristic_uuid=characteristic_uuid,
             response=response,
         )
+
+    async def _async_send_reset_buffer_packet(self, client: BaseBleakClient) -> None:
+        """Send the EVB019 reset buffer packet before disconnecting."""
+
+        advertisement = self._advertisement
+        if advertisement is None or advertisement.model != "Evb019":
+            return
+
+        sent = await self._async_send_request(
+            client,
+            ValveRequestCommand.RESET,
+        )
+        if sent:
+            _LOGGER.debug(
+                "Sent reset buffer request to valve %s prior to disconnect",
+                self._address,
+            )
+        else:
+            _LOGGER.debug(
+                "Unable to send reset buffer request to valve %s prior to disconnect",
+                self._address,
+            )
 
     async def _async_request_device_list(
         self, client: BaseBleakClient
