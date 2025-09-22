@@ -217,10 +217,16 @@ def _extract_raw_manufacturer_segments(
     """Return raw Chandler manufacturer segments from a Bluetooth advertisement."""
 
     if not raw_advertisement:
+        _LOGGER.debug(
+            "No raw advertisement provided while extracting manufacturer segments"
+        )
         return []
 
     data = bytes(raw_advertisement)
     if not data:
+        _LOGGER.debug(
+            "Empty raw advertisement provided while extracting manufacturer segments"
+        )
         return []
 
     index = 0
@@ -232,15 +238,26 @@ def _extract_raw_manufacturer_segments(
         segment_length = data[index]
         index += 1
         if segment_length == 0:
+            _LOGGER.debug(
+                "Encountered zero-length segment at index %s while extracting manufacturer segments",
+                index - 1,
+            )
             break
 
         if index + segment_length > total_length:
+            _LOGGER.debug(
+                "Segment starting at index %s with length %s exceeds advertisement size %s",
+                index - 1,
+                segment_length,
+                total_length,
+            )
             break
 
         ad_type = data[index]
         index += 1
         payload_length = segment_length - 1
-        segment_payload = data[index : index + payload_length]
+        payload_start = index
+        segment_payload = data[payload_start : payload_start + payload_length]
         index += payload_length
 
         if ad_type != 0xFF or payload_length < 2:
@@ -248,6 +265,18 @@ def _extract_raw_manufacturer_segments(
 
         if segment_payload.startswith(prefix_le):
             segments.append(bytes(segment_payload))
+            _LOGGER.debug(
+                "Found Chandler manufacturer segment at index %s: %s",
+                payload_start,
+                segment_payload.hex(),
+            )
+
+    if index < total_length:
+        _LOGGER.debug(
+            "Manufacturer segment extraction stopped at index %s before processing all %s bytes",
+            index,
+            total_length,
+        )
 
     return segments
 

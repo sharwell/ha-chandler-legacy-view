@@ -1788,6 +1788,16 @@ class ValveConnection:
         connection_counter: int | None = None
         if len(packet) > 11:
             connection_counter = packet[11] & 0xFF
+            if advertisement is not None:
+                previous_counter = advertisement.connection_counter
+                if previous_counter != connection_counter:
+                    _LOGGER.debug(
+                        "Valve %s DeviceList connection counter updated from %s to %s",
+                        self._address,
+                        previous_counter,
+                        connection_counter,
+                    )
+                advertisement.connection_counter = connection_counter
         elif advertisement and advertisement.connection_counter is not None:
             connection_counter = advertisement.connection_counter
 
