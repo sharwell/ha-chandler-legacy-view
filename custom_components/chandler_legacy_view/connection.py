@@ -31,6 +31,7 @@ from .const import (
     CONNECTION_MIN_RETRY_INTERVAL,
     CONNECTION_POLL_INTERVAL,
     CONNECTION_TIMEOUT_SECONDS,
+    DEFAULT_VALVE_PASSCODE,
 )
 from .device_registry import async_update_device_serial_number
 from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
@@ -84,6 +85,7 @@ _DEVICE_LIST_RESPONSE_TIMEOUT_SECONDS = 5
 _DASHBOARD_RESPONSE_TIMEOUT_SECONDS = 5
 _DASHBOARD_PACKET_COUNT = 6
 _DEFAULT_SERIAL_NUMBER = "FFFFFFFF"
+_MAX_AUTHENTICATION_ATTEMPTS = 4
 
 
 _CRC_RANDOM = SystemRandom()
@@ -219,6 +221,7 @@ class ValveConnection:
         self._authentication_failed_passcode: str | None = None
         self._dashboard_data: ValveDashboardData | None = None
         self._dashboard_listeners: list[Callable[[ValveDashboardData | None], None]] = []
+        self._authentication_listeners: list[Callable[[bool], None]] = []
         self._passcode_getter = passcode_getter
         self._crc8 = _ChandlerCrc8()
 
@@ -258,6 +261,52 @@ class ValveConnection:
 
         return self._dashboard_data
 
+    @property
+    def authentication_lockout(self) -> bool:
+        """Return ``True`` if authentication attempts are currently locked out."""
+
+        return self._authentication_failed
+
+    def add_authentication_listener(
+        self, listener: Callable[[bool], None]
+    ) -> CALLBACK_TYPE:
+        """Register a callback for authentication lockout updates."""
+
+        self._authentication_listeners.append(listener)
+
+        if self._hass is not None:
+            self._hass.loop.call_soon(listener, self._authentication_failed)
+
+        def _remove_listener() -> None:
+            with contextlib.suppress(ValueError):
+                self._authentication_listeners.remove(listener)
+
+        return _remove_listener
+
+    def set_authentication_lockout(self, locked: bool) -> None:
+        """Update the authentication lockout state."""
+
+        if locked:
+            passcode = self.get_configured_passcode()
+            _LOGGER.debug(
+                "Valve %s authentication lockout manually enabled", self._address
+            )
+            self._set_authentication_failed(True, passcode)
+            return
+
+        self.clear_authentication_lockout()
+
+    def clear_authentication_lockout(self) -> None:
+        """Allow the next connection attempt to retry authentication."""
+
+        if not self._authentication_failed and self._authentication_failed_passcode is None:
+            return
+
+        _LOGGER.debug(
+            "Valve %s authentication lockout manually cleared", self._address
+        )
+        self._set_authentication_failed(False)
+
     def _get_passcode_configuration(self) -> ValvePasscodeConfiguration:
         """Return the stored passcode configuration for this valve."""
 
@@ -272,12 +321,14 @@ class ValveConnection:
         configuration = self._get_passcode_configuration()
         passcode = configuration.value
 
-        if not configuration.is_override and self._device_list_decoded_password is not None:
-            decoded_passcode = self._device_list_decoded_password.passcode
-            if decoded_passcode == "0000":
-                return "0000"
+        if passcode is None:
+            return DEFAULT_VALVE_PASSCODE
 
-        return passcode
+        normalized = str(passcode).strip()
+        if not normalized:
+            return DEFAULT_VALVE_PASSCODE
+
+        return normalized
 
     def add_dashboard_listener(
         self, listener: Callable[[ValveDashboardData | None], None]
@@ -446,6 +497,8 @@ class ValveConnection:
             else:
                 self._last_success = dt_util.utcnow()
             finally:
+                with contextlib.suppress(Exception):
+                    await self._async_send_reset_buffer_packet(client)
                 with contextlib.suppress(Exception):
                     await client.disconnect()
         finally:
@@ -763,6 +816,28 @@ class ValveConnection:
             response=response,
         )
 
+    async def _async_send_reset_buffer_packet(self, client: BaseBleakClient) -> None:
+        """Send the EVB019 reset buffer packet before disconnecting."""
+
+        advertisement = self._advertisement
+        if advertisement is None or advertisement.model != "Evb019":
+            return
+
+        sent = await self._async_send_request(
+            client,
+            ValveRequestCommand.RESET,
+        )
+        if sent:
+            _LOGGER.debug(
+                "Sent reset buffer request to valve %s prior to disconnect",
+                self._address,
+            )
+        else:
+            _LOGGER.debug(
+                "Unable to send reset buffer request to valve %s prior to disconnect",
+                self._address,
+            )
+
     async def _async_request_device_list(
         self, client: BaseBleakClient
     ) -> tuple[bool, bool]:
@@ -855,22 +930,62 @@ class ValveConnection:
                         self._address,
                     )
                 else:
-                    response_future = loop.create_future()
-                    sent, authenticated = await self._async_authenticate(
-                        client,
-                        connection_counter,
-                        passcode_value,
-                        response_future,
-                    )
-                    if sent and not authenticated:
+                    authenticated = False
+                    sent_attempts = 0
+                    for attempt in range(1, _MAX_AUTHENTICATION_ATTEMPTS + 1):
+                        response_future = loop.create_future()
+                        sent, authenticated = await self._async_authenticate(
+                            client,
+                            connection_counter,
+                            passcode_value,
+                            response_future,
+                        )
+                        response_future = None
+                        if not sent:
+                            break
+                        sent_attempts = attempt
+                        if authenticated:
+                            break
+                        if attempt < _MAX_AUTHENTICATION_ATTEMPTS:
+                            _LOGGER.debug(
+                                "Valve %s authentication attempt %d/%d failed; retrying",
+                                self._address,
+                                attempt,
+                                _MAX_AUTHENTICATION_ATTEMPTS,
+                            )
+                            next_counter = self._device_list_connection_counter
+                            if next_counter is not None:
+                                connection_counter = next_counter
+
+                    if not authenticated and sent_attempts >= _MAX_AUTHENTICATION_ATTEMPTS:
                         self._record_authentication_failure(passcode)
-                    response_future = None
 
             return True, response_received
         finally:
             if response_future is not None and not response_future.done():
                 response_future.cancel()
             await self._async_unsubscribe_notifications(client, subscriptions)
+
+    def _set_authentication_failed(
+        self, failed: bool, passcode: str | None = None
+    ) -> None:
+        """Update the stored authentication failure state."""
+
+        if failed:
+            changed = not self._authentication_failed or (
+                self._authentication_failed_passcode != passcode
+            )
+            self._authentication_failed = True
+            self._authentication_failed_passcode = passcode
+        else:
+            changed = self._authentication_failed or (
+                self._authentication_failed_passcode is not None
+            )
+            self._authentication_failed = False
+            self._authentication_failed_passcode = None
+
+        if changed:
+            self._notify_authentication_listeners()
 
     def _reset_authentication_failure_if_needed(self, passcode: str | None) -> None:
         """Clear stored failures if the configured passcode has changed."""
@@ -891,14 +1006,12 @@ class ValveConnection:
             "Configured passcode for valve %s changed; resetting authentication failure state",
             self._address,
         )
-        self._authentication_failed = False
-        self._authentication_failed_passcode = None
+        self._set_authentication_failed(False)
 
     def _record_authentication_failure(self, passcode: str | None) -> None:
         """Record that authentication failed for the provided passcode."""
 
-        self._authentication_failed = True
-        self._authentication_failed_passcode = passcode
+        self._set_authentication_failed(True, passcode)
         _LOGGER.debug(
             "Authentication attempt for valve %s failed; future attempts will be skipped until Home Assistant restarts or the passcode changes",
             self._address,
@@ -1042,7 +1155,19 @@ class ValveConnection:
         for index in range(11, _EVB019_REQUEST_PACKET_LENGTH):
             buffer[index] = _CRC_RANDOM.randint(1, 255)
 
-        return bytes(buffer)
+        payload = bytes(buffer)
+        _LOGGER.debug(
+            "Valve %s authentication payload -> counter=%s digits=%s polynomial=%s seed=%s xor=%s intermediate=%s payload=%s",
+            self._address,
+            counter,
+            digits,
+            polynomial,
+            random_seed,
+            random_xor,
+            intermediate,
+            payload.hex(),
+        )
+        return payload
 
     @staticmethod
     def _get_password_digits(passcode: int) -> tuple[int, int, int, int]:
@@ -1509,6 +1634,19 @@ class ValveConnection:
                     "Unexpected error in Dashboard listener for valve %s", self._address
                 )
 
+    def _notify_authentication_listeners(self) -> None:
+        """Notify registered callbacks about authentication lockout changes."""
+
+        locked = self._authentication_failed
+        for listener in list(self._authentication_listeners):
+            try:
+                listener(locked)
+            except Exception:  # pragma: no cover - listener failures are logged
+                _LOGGER.exception(
+                    "Unexpected error in authentication listener for valve %s",
+                    self._address,
+                )
+
     @staticmethod
     def _read_uint16_be(packet: bytes, index: int) -> int:
         """Return the unsigned 16-bit integer stored at ``packet[index]``."""
@@ -1565,8 +1703,7 @@ class ValveConnection:
                         "authentication failure",
                         self._address,
                     )
-                self._authentication_failed = False
-                self._authentication_failed_passcode = None
+                self._set_authentication_failed(False)
 
         serial_number = self._extract_serial_number(packet)
         if serial_number is None:
@@ -1841,9 +1978,21 @@ class ValveConnectionManager:
         if address is not None:
             override = overrides.get(address)
             if override is not None:
-                return ValvePasscodeConfiguration(value=override, is_override=True)
+                normalized_override = str(override).strip()
+                if normalized_override and normalized_override != "0000":
+                    return ValvePasscodeConfiguration(
+                        value=normalized_override,
+                        is_override=True,
+                    )
+
+        default_passcode = self._config_entry.data.get(
+            CONF_DEFAULT_PASSCODE, DEFAULT_VALVE_PASSCODE
+        )
+        normalized_default = str(default_passcode).strip()
+        if not normalized_default or normalized_default == "0000":
+            normalized_default = DEFAULT_VALVE_PASSCODE
 
         return ValvePasscodeConfiguration(
-            value=self._config_entry.data.get(CONF_DEFAULT_PASSCODE),
+            value=normalized_default,
             is_override=False,
         )

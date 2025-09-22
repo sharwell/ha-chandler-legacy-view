@@ -16,6 +16,7 @@ from .const import (
     DATA_CONNECTION_MANAGER,
     DATA_DISCOVERY_MANAGER,
     DEFAULT_MANUFACTURER,
+    DEFAULT_VALVE_PASSCODE,
     DISCOVERY_DEVICE_MODEL,
     DISCOVERY_DEVICE_NAME,
     DISCOVERY_VIA_DEVICE_ID,
@@ -39,6 +40,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Chandler Legacy View from a config entry."""
 
     hass.data.setdefault(DOMAIN, {})
+
+    stored_default = entry.data.get(CONF_DEFAULT_PASSCODE)
+    if stored_default in (None, "", "0000"):
+        hass.config_entries.async_update_entry(
+            entry,
+            data={
+                **entry.data,
+                CONF_DEFAULT_PASSCODE: DEFAULT_VALVE_PASSCODE,
+            },
+        )
 
     device_registry = dr.async_get(hass)
     device_registry.async_get_or_create(
@@ -75,9 +86,19 @@ def get_configured_passcode(entry: ConfigEntry, address: str | None = None) -> s
     if address is not None:
         override_passcode = overrides.get(address)
         if override_passcode is not None:
-            return override_passcode
+            normalized_override = str(override_passcode).strip()
+            if normalized_override and normalized_override != "0000":
+                return normalized_override
 
-    return entry.data.get(CONF_DEFAULT_PASSCODE)
+    default_passcode = entry.data.get(CONF_DEFAULT_PASSCODE)
+    if default_passcode is None:
+        return DEFAULT_VALVE_PASSCODE
+
+    normalized_default = str(default_passcode).strip()
+    if not normalized_default or normalized_default == "0000":
+        return DEFAULT_VALVE_PASSCODE
+
+    return normalized_default
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
