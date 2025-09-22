@@ -31,6 +31,7 @@ from .const import (
     CONNECTION_MIN_RETRY_INTERVAL,
     CONNECTION_POLL_INTERVAL,
     CONNECTION_TIMEOUT_SECONDS,
+    DEFAULT_VALVE_PASSCODE,
 )
 from .device_registry import async_update_device_serial_number
 from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
@@ -272,12 +273,14 @@ class ValveConnection:
         configuration = self._get_passcode_configuration()
         passcode = configuration.value
 
-        if not configuration.is_override and self._device_list_decoded_password is not None:
-            decoded_passcode = self._device_list_decoded_password.passcode
-            if decoded_passcode == "0000":
-                return "0000"
+        if passcode is None:
+            return DEFAULT_VALVE_PASSCODE
 
-        return passcode
+        normalized = str(passcode).strip()
+        if not normalized:
+            return DEFAULT_VALVE_PASSCODE
+
+        return normalized
 
     def add_dashboard_listener(
         self, listener: Callable[[ValveDashboardData | None], None]
@@ -1841,9 +1844,21 @@ class ValveConnectionManager:
         if address is not None:
             override = overrides.get(address)
             if override is not None:
-                return ValvePasscodeConfiguration(value=override, is_override=True)
+                normalized_override = str(override).strip()
+                if normalized_override and normalized_override != "0000":
+                    return ValvePasscodeConfiguration(
+                        value=normalized_override,
+                        is_override=True,
+                    )
+
+        default_passcode = self._config_entry.data.get(
+            CONF_DEFAULT_PASSCODE, DEFAULT_VALVE_PASSCODE
+        )
+        normalized_default = str(default_passcode).strip()
+        if not normalized_default or normalized_default == "0000":
+            normalized_default = DEFAULT_VALVE_PASSCODE
 
         return ValvePasscodeConfiguration(
-            value=self._config_entry.data.get(CONF_DEFAULT_PASSCODE),
+            value=normalized_default,
             is_override=False,
         )

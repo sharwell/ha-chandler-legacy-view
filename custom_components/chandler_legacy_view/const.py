@@ -14,6 +14,8 @@ CONF_DEVICE_PASSCODE: Final = "device_passcode"
 CONF_DEVICE_PASSCODES: Final = "device_passcodes"
 CONF_REMOVE_OVERRIDE: Final = "remove_override"
 
+DEFAULT_VALVE_PASSCODE: Final = "1234"
+
 DOMAIN: Final = "chandler_legacy_view"
 PLATFORMS: Final[list[Platform]] = [Platform.BINARY_SENSOR, Platform.SENSOR]
 

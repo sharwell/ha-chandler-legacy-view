@@ -27,6 +27,7 @@ from .const import (
     CONF_DEVICE_PASSCODES,
     CONF_REMOVE_OVERRIDE,
     DATA_DISCOVERY_MANAGER,
+    DEFAULT_VALVE_PASSCODE,
     DOMAIN,
 )
 from .entity import friendly_name_from_advertised_name
@@ -76,22 +77,9 @@ class ChandlerLegacyViewConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if self._async_current_entries():
             return self.async_abort(reason="single_instance_allowed")
 
-        errors: dict[str, str] = {}
-
-        if user_input is not None:
-            passcode = _coerce_passcode(user_input.get(CONF_DEFAULT_PASSCODE))
-            if passcode is None or not _is_valid_passcode(passcode):
-                errors[CONF_DEFAULT_PASSCODE] = "invalid_passcode"
-            else:
-                return self.async_create_entry(
-                    title="Chandler Legacy View",
-                    data={CONF_DEFAULT_PASSCODE: passcode},
-                )
-
-        return self.async_show_form(
-            step_id="user",
-            data_schema=vol.Schema({vol.Required(CONF_DEFAULT_PASSCODE): PASSCODE_SELECTOR}),
-            errors=errors,
+        return self.async_create_entry(
+            title="Chandler Legacy View",
+            data={CONF_DEFAULT_PASSCODE: DEFAULT_VALVE_PASSCODE},
         )
 
     @staticmethod
@@ -161,7 +149,9 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
                     errors[CONF_DEFAULT_PASSCODE] = "invalid_passcode"
                 elif (
                     default_passcode_input
-                    != self._config_entry.data.get(CONF_DEFAULT_PASSCODE)
+                    != self._config_entry.data.get(
+                        CONF_DEFAULT_PASSCODE, DEFAULT_VALVE_PASSCODE
+                    )
                 ):
                     hass.config_entries.async_update_entry(
                         self._config_entry,
@@ -209,7 +199,12 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
                 return self.async_create_entry(title="", data=updated_options)
 
         schema_dict: dict[vol.Marker, object] = {
-            vol.Optional(CONF_DEFAULT_PASSCODE): PASSCODE_SELECTOR,
+            vol.Optional(
+                CONF_DEFAULT_PASSCODE,
+                default=self._config_entry.data.get(
+                    CONF_DEFAULT_PASSCODE, DEFAULT_VALVE_PASSCODE
+                ),
+            ): PASSCODE_SELECTOR,
         }
 
         if device_options:

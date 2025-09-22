@@ -34,7 +34,9 @@ configuration options will follow as device details become available.
 3. In Home Assistant, navigate to **Settings → Devices & Services → Add
    Integration** and search for "Chandler Legacy View".
 4. Complete the configuration flow to enable Bluetooth-based discovery of
-   Chandler valves. Only one instance of the integration is required.
+   Chandler valves. The integration uses the factory default valve passcode
+   (`1234`) automatically; per-valve overrides can be configured later from the
+   integration options. Only one instance of the integration is required.
 
 ## Development
 
