@@ -31,7 +31,10 @@ from .const import (
     CONNECTION_MIN_RETRY_INTERVAL,
     CONNECTION_POLL_INTERVAL,
     CONNECTION_TIMEOUT_SECONDS,
+    DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS,
     DEFAULT_VALVE_PASSCODE,
+    MAX_PERSISTENT_POLL_INTERVAL_SECONDS,
+    MIN_PERSISTENT_POLL_INTERVAL_SECONDS,
 )
 from .device_registry import async_update_device_serial_number
 from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
@@ -224,6 +227,9 @@ class ValveConnection:
         self._authentication_listeners: list[Callable[[bool], None]] = []
         self._passcode_getter = passcode_getter
         self._crc8 = _ChandlerCrc8()
+        self._persistent_connection_enabled = False
+        self._persistent_poll_interval = DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS
+        self._persistent_task: asyncio.Task[None] | None = None
 
     @property
     def address(self) -> str:
@@ -267,6 +273,18 @@ class ValveConnection:
 
         return self._authentication_failed
 
+    @property
+    def persistent_connection_enabled(self) -> bool:
+        """Return ``True`` if persistent connections are currently requested."""
+
+        return self._persistent_connection_enabled
+
+    @property
+    def persistent_poll_interval(self) -> float:
+        """Return the configured persistent poll interval in seconds."""
+
+        return self._persistent_poll_interval
+
     def add_authentication_listener(
         self, listener: Callable[[bool], None]
     ) -> CALLBACK_TYPE:
@@ -306,6 +324,53 @@ class ValveConnection:
             "Valve %s authentication lockout manually cleared", self._address
         )
         self._set_authentication_failed(False)
+
+    async def async_set_persistent_connection_enabled(self, enabled: bool) -> None:
+        """Enable or disable persistent connections for this valve."""
+
+        if enabled:
+            if self._persistent_connection_enabled:
+                return
+            _LOGGER.debug(
+                "Persistent connection requested for valve %s", self._address
+            )
+            self._persistent_connection_enabled = True
+            self._cancel_cooldown()
+            self._next_connection_time = None
+            self.schedule_poll()
+            return
+
+        if not self._persistent_connection_enabled:
+            return
+
+        _LOGGER.debug(
+            "Persistent connection disabled for valve %s", self._address
+        )
+        self._persistent_connection_enabled = False
+        await self._async_stop_persistent_session()
+
+    async def async_set_persistent_poll_interval(self, seconds: float) -> None:
+        """Update the poll interval used during persistent connections."""
+
+        try:
+            value = float(seconds)
+        except (TypeError, ValueError):
+            value = DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS
+
+        value = max(
+            MIN_PERSISTENT_POLL_INTERVAL_SECONDS,
+            min(value, MAX_PERSISTENT_POLL_INTERVAL_SECONDS),
+        )
+
+        if self._persistent_poll_interval == value:
+            return
+
+        _LOGGER.debug(
+            "Persistent poll interval for valve %s updated to %.1f seconds",
+            self._address,
+            value,
+        )
+        self._persistent_poll_interval = value
 
     def _get_passcode_configuration(self) -> ValvePasscodeConfiguration:
         """Return the stored passcode configuration for this valve."""
@@ -399,11 +464,155 @@ class ValveConnection:
         if self.available:
             self.schedule_poll()
 
+    def _persistent_task_active(self) -> bool:
+        """Return ``True`` if a persistent session is currently running."""
+
+        task = self._persistent_task
+        if task is None:
+            return False
+        if task.done():
+            with contextlib.suppress(Exception):
+                task.result()
+            self._persistent_task = None
+            return False
+        return True
+
+    async def _async_stop_persistent_session(self) -> None:
+        """Cancel the persistent polling session if one is active."""
+
+        task = self._persistent_task
+        if task is None:
+            return
+
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        self._persistent_task = None
+
+    def _can_start_persistent_session(self) -> bool:
+        """Return ``True`` if a persistent session may be started."""
+
+        if not self._persistent_connection_enabled or self._unloaded:
+            return False
+
+        if self._persistent_task_active():
+            return False
+
+        advertisement = self._advertisement
+        if advertisement is not None and not advertisement.authentication_required:
+            return True
+
+        return (
+            self._device_list_authentication_state
+            == ValveAuthenticationState.AUTHENTICATED
+        )
+
+    def _try_begin_persistent_session(self, client: BaseBleakClient) -> bool:
+        """Start a persistent polling session if conditions allow."""
+
+        if not self._can_start_persistent_session():
+            return False
+
+        _LOGGER.debug(
+            "Maintaining persistent connection to valve %s", self._address
+        )
+        self._persistent_task = self._hass.loop.create_task(
+            self._async_persistent_keepalive_loop(client)
+        )
+        return True
+
+    async def _async_persistent_keepalive_loop(
+        self, client: BaseBleakClient
+    ) -> None:
+        """Keep the BLE connection alive and poll on a frequent schedule."""
+
+        try:
+            while True:
+                if (
+                    not self._persistent_connection_enabled
+                    or self._unloaded
+                    or not getattr(client, "is_connected", False)
+                ):
+                    break
+
+                interval = max(
+                    MIN_PERSISTENT_POLL_INTERVAL_SECONDS,
+                    min(
+                        self._persistent_poll_interval,
+                        MAX_PERSISTENT_POLL_INTERVAL_SECONDS,
+                    ),
+                )
+
+                try:
+                    await asyncio.sleep(interval)
+                except asyncio.CancelledError:
+                    raise
+
+                if (
+                    not self._persistent_connection_enabled
+                    or self._unloaded
+                    or not getattr(client, "is_connected", False)
+                ):
+                    break
+
+                try:
+                    request_sent, response_received = (
+                        await self._async_request_dashboard(client)
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # pragma: no cover - unexpected protocol errors
+                    _LOGGER.exception(
+                        "Unexpected error while refreshing dashboard data for valve %s",
+                        self._address,
+                    )
+                    break
+
+                if not request_sent:
+                    _LOGGER.debug(
+                        "Stopping persistent polling for valve %s; unable to send Dashboard request",
+                        self._address,
+                    )
+                    break
+
+                if response_received:
+                    self._last_success = dt_util.utcnow()
+                else:
+                    _LOGGER.debug(
+                        "Valve %s did not provide a Dashboard response during persistent polling",
+                        self._address,
+                    )
+                    break
+        except asyncio.CancelledError:
+            _LOGGER.debug(
+                "Persistent polling task for valve %s was cancelled", self._address
+            )
+            raise
+        finally:
+            reset_packet_sent = False
+            with contextlib.suppress(Exception):
+                reset_packet_sent = await self._async_send_reset_buffer_packet(client)
+            if reset_packet_sent:
+                await asyncio.sleep(0.1)
+            with contextlib.suppress(Exception):
+                await client.disconnect()
+
+            self._persistent_task = None
+
+            if (
+                self._persistent_connection_enabled
+                and not self._unloaded
+            ):
+                self._set_connection_cooldown()
+                self.schedule_poll()
+
     async def async_unload(self) -> None:
         """Prevent future polls and wait for any active poll to finish."""
 
         self._unloaded = True
+        self._persistent_connection_enabled = False
         self._cancel_cooldown()
+        await self._async_stop_persistent_session()
         async with self._lock:
             return
 
@@ -411,6 +620,14 @@ class ValveConnection:
         """Attempt to connect to the valve and fetch additional data."""
 
         if not self.available:
+            return
+
+        task_active = self._persistent_task_active()
+        if self._persistent_connection_enabled and task_active:
+            _LOGGER.debug(
+                "Skipping poll for %s; persistent session is already active",
+                self._address,
+            )
             return
 
         if self._lock.locked():
@@ -438,6 +655,7 @@ class ValveConnection:
             return
 
         connection_attempted = False
+        cleanup_client: BaseBleakClient | None = None
 
         try:
             advertisement = self._advertisement
@@ -488,6 +706,8 @@ class ValveConnection:
                 )
                 return
 
+            cleanup_client = client
+
             try:
                 await self._async_fetch_device_information(client)
             except Exception:  # pragma: no cover - future protocol work may raise
@@ -496,11 +716,19 @@ class ValveConnection:
                 )
             else:
                 self._last_success = dt_util.utcnow()
+                if self._try_begin_persistent_session(client):
+                    cleanup_client = None
             finally:
-                with contextlib.suppress(Exception):
-                    await self._async_send_reset_buffer_packet(client)
-                with contextlib.suppress(Exception):
-                    await client.disconnect()
+                if cleanup_client is not None:
+                    reset_packet_sent = False
+                    with contextlib.suppress(Exception):
+                        reset_packet_sent = await self._async_send_reset_buffer_packet(
+                            cleanup_client
+                        )
+                    if reset_packet_sent:
+                        await asyncio.sleep(0.1)
+                    with contextlib.suppress(Exception):
+                        await cleanup_client.disconnect()
         finally:
             if connection_attempted:
                 self._set_connection_cooldown()
@@ -510,17 +738,26 @@ class ValveConnection:
     ) -> None:
         """Retrieve extended diagnostic information from the valve."""
 
-        if self._advertisement is None:
+        advertisement = self._advertisement
+        if advertisement is None:
             return
 
-        model = self._advertisement.model
-        if model != "Evb019":
+        model = advertisement.model
+        manufacturer_data_complete = advertisement.manufacturer_data_complete
+
+        if model not in (None, "Evb019"):
             _LOGGER.debug(
                 "Connected to valve %s (%s); requests are only defined for Evb019 valves",
                 self._address,
                 model or "unknown model",
             )
             return
+
+        if model is None and not manufacturer_data_complete:
+            _LOGGER.debug(
+                "Valve %s advertisement was incomplete; attempting DeviceList probe",
+                self._address,
+            )
 
         request_sent, response_received = await self._async_request_device_list(client)
         if not request_sent:
@@ -816,12 +1053,15 @@ class ValveConnection:
             response=response,
         )
 
-    async def _async_send_reset_buffer_packet(self, client: BaseBleakClient) -> None:
-        """Send the EVB019 reset buffer packet before disconnecting."""
+    async def _async_send_reset_buffer_packet(self, client: BaseBleakClient) -> bool:
+        """Send the EVB019 reset buffer packet before disconnecting.
+
+        Returns True if the reset packet was successfully sent.
+        """
 
         advertisement = self._advertisement
         if advertisement is None or advertisement.model != "Evb019":
-            return
+            return False
 
         sent = await self._async_send_request(
             client,
@@ -837,6 +1077,8 @@ class ValveConnection:
                 "Unable to send reset buffer request to valve %s prior to disconnect",
                 self._address,
             )
+
+        return sent
 
     async def _async_request_device_list(
         self, client: BaseBleakClient

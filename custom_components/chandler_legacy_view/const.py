@@ -19,9 +19,15 @@ DEFAULT_VALVE_PASSCODE: Final = "1234"
 DOMAIN: Final = "chandler_legacy_view"
 PLATFORMS: Final[list[Platform]] = [
     Platform.BINARY_SENSOR,
+    Platform.NUMBER,
     Platform.SENSOR,
     Platform.SWITCH,
 ]
+
+# Persistent connection configuration
+DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS: Final = 10.0
+MIN_PERSISTENT_POLL_INTERVAL_SECONDS: Final = 5.0
+MAX_PERSISTENT_POLL_INTERVAL_SECONDS: Final = 300.0
 
 # Storage keys used inside ``hass.data``
 DATA_DISCOVERY_MANAGER: Final = "discovery_manager"
@@ -29,7 +35,7 @@ DATA_CONNECTION_MANAGER: Final = "connection_manager"
 
 # Polling configuration for on-demand Bluetooth connections
 CONNECTION_POLL_INTERVAL: Final = timedelta(minutes=15)
-CONNECTION_MIN_RETRY_INTERVAL: Final = timedelta(seconds=15)
+CONNECTION_MIN_RETRY_INTERVAL: Final = timedelta(seconds=30)
 CONNECTION_TIMEOUT_SECONDS: Final = 20
 
 # Default presentation details for discovered devices
