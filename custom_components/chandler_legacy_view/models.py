@@ -23,6 +23,7 @@ class ValveAdvertisement:
     is_400_series: bool = False
     has_connection_counter: bool = False
     valve_data_parsed: bool = False
+    manufacturer_data_complete: bool = True
     valve_status: int | None = None
     salt_sensor_status: int | None = None
     water_status: int | None = None

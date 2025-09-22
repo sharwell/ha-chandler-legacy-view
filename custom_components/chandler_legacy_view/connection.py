@@ -513,17 +513,26 @@ class ValveConnection:
     ) -> None:
         """Retrieve extended diagnostic information from the valve."""
 
-        if self._advertisement is None:
+        advertisement = self._advertisement
+        if advertisement is None:
             return
 
-        model = self._advertisement.model
-        if model != "Evb019":
+        model = advertisement.model
+        manufacturer_data_complete = advertisement.manufacturer_data_complete
+
+        if model not in (None, "Evb019"):
             _LOGGER.debug(
                 "Connected to valve %s (%s); requests are only defined for Evb019 valves",
                 self._address,
                 model or "unknown model",
             )
             return
+
+        if model is None and not manufacturer_data_complete:
+            _LOGGER.debug(
+                "Valve %s advertisement was incomplete; attempting DeviceList probe",
+                self._address,
+            )
 
         request_sent, response_received = await self._async_request_device_list(client)
         if not request_sent:

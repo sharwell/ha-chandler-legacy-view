@@ -170,6 +170,7 @@ class _ManufacturerClassification:
     is_400_series: bool = False
     has_connection_counter: bool = False
     valve_data_parsed: bool = False
+    manufacturer_data_complete: bool = True
     valve_status: int | None = None
     salt_sensor_status: int | None = None
     water_status: int | None = None
@@ -329,7 +330,12 @@ def _classify_manufacturer_data(
 
     raw_payload = manufacturer_data.get(CSI_MANUFACTURER_ID)
     if raw_payload is None or not _has_manufacturer_data_values(raw_payload):
-        return _ManufacturerClassification(False)
+        _LOGGER.debug(
+            "Manufacturer data for Chandler valve (id %s) was missing or empty: %s",
+            CSI_MANUFACTURER_ID,
+            raw_payload,
+        )
+        return _ManufacturerClassification(True, manufacturer_data_complete=False)
 
     payload = _get_full_manufacturer_payload(raw_payload, raw_advertisement)
     if payload is None:
@@ -338,7 +344,7 @@ def _classify_manufacturer_data(
             CSI_MANUFACTURER_ID,
             raw_payload,
         )
-        return _ManufacturerClassification(True, ignore_advertisement=True)
+        return _ManufacturerClassification(True, manufacturer_data_complete=False)
 
     prefix_le = CSI_MANUFACTURER_ID.to_bytes(2, "little")
     if not payload.startswith(prefix_le):
@@ -418,10 +424,12 @@ def _parse_evb034_payload(
     """Parse an Evb034 advertisement payload."""
 
     if len(payload) < 10:
+        classification.manufacturer_data_complete = False
         return
 
     prefix_le = CSI_MANUFACTURER_ID.to_bytes(2, "little")
     if payload[0:2] != prefix_le:
+        classification.manufacturer_data_complete = False
         return
 
     classification.valve_data_parsed = True
@@ -440,10 +448,12 @@ def _parse_evb019_payload(
     """Parse an Evb019 advertisement payload."""
 
     if len(payload) < 6:
+        classification.manufacturer_data_complete = False
         return
 
     prefix_le = CSI_MANUFACTURER_ID.to_bytes(2, "little")
     if payload[0:2] != prefix_le:
+        classification.manufacturer_data_complete = False
         return
 
     has_connection_counter = classification.has_connection_counter
@@ -456,6 +466,7 @@ def _parse_evb019_payload(
     parsed = has_minimum_payload and has_required_length and twin_valve_valid
     if not parsed:
         classification.valve_data_parsed = False
+        classification.manufacturer_data_complete = False
         return
 
     classification.valve_data_parsed = True
@@ -627,13 +638,12 @@ class ValveDiscoveryManager:
                 or classification.is_twin_valve
             ) and not classification.valve_data_parsed:
                 _LOGGER.debug(
-                    "Ignoring Bluetooth advertisement from %s; firmware %s requires parsed valve data",
+                    "Bluetooth advertisement from %s had incomplete manufacturer data for firmware %s",
                     service_info.address,
                     classification.firmware_version
                     if classification.firmware_version is not None
                     else "unknown",
                 )
-                return
 
             is_clack_valve = _is_clack_valve(service_info.name)
             classification.valve_type = _map_valve_type(
@@ -654,6 +664,7 @@ class ValveDiscoveryManager:
                 is_400_series=classification.is_400_series,
                 has_connection_counter=classification.has_connection_counter,
                 valve_data_parsed=classification.valve_data_parsed,
+                manufacturer_data_complete=classification.manufacturer_data_complete,
                 valve_status=classification.valve_status,
                 salt_sensor_status=classification.salt_sensor_status,
                 water_status=classification.water_status,
