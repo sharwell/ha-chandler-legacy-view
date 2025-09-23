@@ -17,8 +17,11 @@ from homeassistant.const import (
     UnitOfTime,
     UnitOfVolume,
     UnitOfVolumeFlowRate,
-    UnitOfWaterHardness,
 )
+
+# Home Assistant does not currently expose a dedicated water hardness unit
+# constant, so we keep using the unit string Chandler devices report.
+WATER_HARDNESS_GRAINS_PER_GALLON = "grains_per_gallon"
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
@@ -153,7 +156,7 @@ class ValvePresentFlowSensor(ValveDashboardSensor):
 class ValveWaterHardnessSensor(ValveDashboardSensor):
     """Represent the configured water hardness reported by a valve."""
 
-    _attr_native_unit_of_measurement = UnitOfWaterHardness.GRAINS_PER_GALLON
+    _attr_native_unit_of_measurement = WATER_HARDNESS_GRAINS_PER_GALLON
     _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(
