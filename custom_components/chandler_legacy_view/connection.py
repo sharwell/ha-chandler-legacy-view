@@ -21,7 +21,8 @@ from bleak_retry_connector import (
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import BluetoothChange
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
+from homeassistant.core import CALLBACK_TYPE, CoreState, HomeAssistant, callback
 from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.util import dt as dt_util
 
@@ -425,6 +426,13 @@ class ValveConnection:
 
     def schedule_poll(self) -> None:
         """Schedule a background poll of the valve."""
+
+        if self._hass.state != CoreState.running:
+            _LOGGER.debug(
+                "Skipping poll for valve %s; Home Assistant not fully started",
+                self._address,
+            )
+            return
 
         if not self.available:
             return
@@ -2143,13 +2151,15 @@ class ValveConnectionManager:
         self._connections: dict[str, ValveConnection] = {}
         self._remove_listener: CALLBACK_TYPE | None = None
         self._cancel_interval: CALLBACK_TYPE | None = None
+        self._startup_unsub: CALLBACK_TYPE | None = None
 
     async def async_setup(self) -> None:
         """Begin tracking valves for periodic polling."""
 
         for advertisement in self._discovery_manager.devices.values():
             connection = self._ensure_connection(advertisement)
-            connection.schedule_poll()
+            if self._hass.state == CoreState.running:
+                connection.schedule_poll()
 
         self._remove_listener = self._discovery_manager.async_add_listener(
             self._handle_discovery_event
@@ -2157,6 +2167,11 @@ class ValveConnectionManager:
         self._cancel_interval = async_track_time_interval(
             self._hass, self._handle_poll_interval, CONNECTION_POLL_INTERVAL
         )
+
+        if self._hass.state != CoreState.running:
+            self._startup_unsub = self._hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STARTED, self._handle_home_assistant_started
+            )
 
     async def async_unload(self) -> None:
         """Cancel scheduled work and disconnect listeners."""
@@ -2169,6 +2184,10 @@ class ValveConnectionManager:
             self._cancel_interval()
             self._cancel_interval = None
 
+        if self._startup_unsub is not None:
+            self._startup_unsub()
+            self._startup_unsub = None
+
         await asyncio.gather(
             *(connection.async_unload() for connection in self._connections.values()),
             return_exceptions=True,
@@ -2179,6 +2198,13 @@ class ValveConnectionManager:
     def _handle_poll_interval(self, _: datetime) -> None:
         """Poll each known valve on a fixed schedule."""
 
+        for connection in self._connections.values():
+            connection.schedule_poll()
+
+    async def _handle_home_assistant_started(self, _: object) -> None:
+        """Trigger an initial poll once Home Assistant startup completes."""
+
+        self._startup_unsub = None
         for connection in self._connections.values():
             connection.schedule_poll()
 
