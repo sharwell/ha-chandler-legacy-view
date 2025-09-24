@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import functools
+import logging
 import re
+from collections.abc import Mapping
+from typing import Any, Awaitable, Callable, ParamSpec, TypeVar
 
 import voluptuous as vol
 
@@ -31,6 +35,62 @@ from .const import (
     DOMAIN,
 )
 from .entity import friendly_name_from_advertised_name
+
+
+_LOGGER = logging.getLogger(__name__)
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+_SENSITIVE_USER_INPUT_KEYS = frozenset({
+    CONF_DEFAULT_PASSCODE,
+    CONF_DEVICE_PASSCODE,
+})
+
+
+def _redact_user_input(user_input: object | None) -> object | None:
+    """Redact sensitive data from configuration flow logging."""
+
+    if not isinstance(user_input, Mapping):
+        return user_input
+
+    redacted: dict[Any, Any] = {}
+    for key, value in user_input.items():
+        if key in _SENSITIVE_USER_INPUT_KEYS:
+            redacted[key] = "***REDACTED***"
+        else:
+            redacted[key] = value
+    return redacted
+
+
+def _log_config_flow_exceptions(
+    step_id: str,
+) -> Callable[[Callable[_P, Awaitable[_R]]], Callable[_P, Awaitable[_R]]]:
+    """Return a decorator that logs unexpected exceptions for a flow step."""
+
+    def decorator(function: Callable[_P, Awaitable[_R]]) -> Callable[_P, Awaitable[_R]]:
+        @functools.wraps(function)
+        async def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+            user_input: object | None = None
+
+            if len(args) >= 2:
+                user_input = args[1]
+            if "user_input" in kwargs:
+                user_input = kwargs["user_input"]
+
+            try:
+                return await function(*args, **kwargs)
+            except Exception:  # pragma: no cover - defensive logging
+                _LOGGER.exception(
+                    "Unexpected error during config flow step '%s' with input %s",
+                    step_id,
+                    _redact_user_input(user_input),
+                )
+                raise
+
+        return wrapper
+
+    return decorator
 
 
 PASSCODE_PATTERN = re.compile(r"^\d{4}$")
@@ -69,6 +129,7 @@ class ChandlerLegacyViewConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
+    @_log_config_flow_exceptions("user")
     async def async_step_user(
         self, user_input: dict[str, object] | None = None
     ) -> FlowResult:
@@ -100,10 +161,18 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
 
         self._config_entry = config_entry
 
+    @_log_config_flow_exceptions("init")
     async def async_step_init(
         self, user_input: dict[str, object] | None = None
     ) -> FlowResult:
         """Handle the default options step."""
+
+        return await self._async_step_init_impl(user_input)
+
+    async def _async_step_init_impl(
+        self, user_input: dict[str, object] | None = None
+    ) -> FlowResult:
+        """Handle the default options step implementation."""
 
         errors: dict[str, str] = {}
         hass = self.hass
@@ -224,3 +293,27 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
             data_schema=vol.Schema(schema_dict),
             errors=errors,
         )
+
+    @_log_config_flow_exceptions("select_shade")
+    async def async_step_select_shade(
+        self, user_input: dict[str, object] | None = None
+    ) -> FlowResult:
+        """Handle a request to select a shade to edit."""
+
+        _LOGGER.debug(
+            "Handling select_shade step using init fallback with input: %s",
+            _redact_user_input(user_input),
+        )
+        return await self._async_step_init_impl(user_input)
+
+    @_log_config_flow_exceptions("edit_shade")
+    async def async_step_edit_shade(
+        self, user_input: dict[str, object] | None = None
+    ) -> FlowResult:
+        """Handle editing a shade configuration entry."""
+
+        _LOGGER.debug(
+            "Handling edit_shade step using init fallback with input: %s",
+            _redact_user_input(user_input),
+        )
+        return await self._async_step_init_impl(user_input)
