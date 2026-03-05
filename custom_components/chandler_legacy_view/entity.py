@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH
 from homeassistant.helpers.entity import DeviceInfo, Entity
 
 from .const import (
@@ -128,7 +129,11 @@ def _valve_error_display(error_code: int | None, is_clack_valve: bool) -> str | 
     if error_code is None:
         return None
     if error_code == _VALVE_ERROR_TIMEOUT_CODE:
-        return "Drive 1 motor timeout error" if is_clack_valve else "TWEDO motor timeout error"
+        return (
+            "Drive 1 motor timeout error"
+            if is_clack_valve
+            else "TWEDO motor timeout error"
+        )
     return _VALVE_ERROR_DISPLAY.get(error_code)
 
 
@@ -195,10 +200,7 @@ def format_firmware_version(advertisement: ValveAdvertisement) -> str | None:
 
     firmware_version = advertisement.firmware_version
     if firmware_version is None:
-        if (
-            advertisement.firmware_major is None
-            or advertisement.firmware_minor is None
-        ):
+        if advertisement.firmware_major is None or advertisement.firmware_minor is None:
             return None
         firmware_version = (
             advertisement.firmware_major * 100 + advertisement.firmware_minor
@@ -232,13 +234,16 @@ class ChandlerValveEntity(Entity):
         return DeviceInfo(
             identifiers={(DOMAIN, self._advertisement.address)},
             name=self._compute_name(self._advertisement),
+            connections={(CONNECTION_BLUETOOTH, self._advertisement.address)},
             manufacturer=DEFAULT_MANUFACTURER,
             model=self._advertisement.model,
             via_device=(DOMAIN, DISCOVERY_VIA_DEVICE_ID),
             sw_version=format_firmware_version(self._advertisement),
         )
 
-    def async_update_from_advertisement(self, advertisement: ValveAdvertisement) -> None:
+    def async_update_from_advertisement(
+        self, advertisement: ValveAdvertisement
+    ) -> None:
         """Store the most recent advertisement seen for this valve."""
 
         self._advertisement = advertisement
@@ -248,4 +253,3 @@ class ChandlerValveEntity(Entity):
         """Generate a user-friendly name for the valve entity."""
 
         return friendly_name_from_advertised_name(advertisement.name)
-
