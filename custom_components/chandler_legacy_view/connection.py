@@ -231,6 +231,7 @@ class ValveConnection:
         self._persistent_connection_enabled = False
         self._persistent_poll_interval = DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS
         self._persistent_task: asyncio.Task[None] | None = None
+        self._pending_persistent_client: BaseBleakClient | None = None
 
     @property
     def address(self) -> str:
@@ -492,10 +493,21 @@ class ValveConnection:
         if task is None:
             return
 
+        # A task cancelled before its first step never enters its finally block.
+        # Claim any client it has not taken ownership of before cancelling it.
+        pending_client = self._pending_persistent_client
+        self._pending_persistent_client = None
         task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-        self._persistent_task = None
+        try:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        finally:
+            try:
+                if pending_client is not None:
+                    await self._async_disconnect_client(pending_client)
+            finally:
+                if self._persistent_task is task:
+                    self._persistent_task = None
 
     def _can_start_persistent_session(self) -> bool:
         """Return ``True`` if a persistent session may be started."""
@@ -524,9 +536,14 @@ class ValveConnection:
         _LOGGER.debug(
             "Maintaining persistent connection to valve %s", self._address
         )
-        self._persistent_task = self._hass.loop.create_task(
-            self._async_persistent_keepalive_loop(client)
-        )
+        self._pending_persistent_client = client
+        keepalive = self._async_persistent_keepalive_loop(client)
+        try:
+            self._persistent_task = self._hass.loop.create_task(keepalive)
+        except Exception:
+            self._pending_persistent_client = None
+            keepalive.close()
+            raise
         return True
 
     async def _async_persistent_keepalive_loop(
@@ -535,6 +552,8 @@ class ValveConnection:
         """Keep the BLE connection alive and poll on a frequent schedule."""
 
         try:
+            # From this point, this coroutine's finally block owns cleanup.
+            self._pending_persistent_client = None
             while True:
                 if (
                     not self._persistent_connection_enabled
