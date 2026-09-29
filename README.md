@@ -22,6 +22,16 @@ Home Assistant as entities that can participate in automations or dashboards.
   as an Evb019 (firmware < 600) or Evb034 (firmware ≥ 600) and exposes the model
   via device information and entity state attributes.
 
+Availability follows Home Assistant's connectable Bluetooth scanners, including
+ESP32 proxies. A valve remains available if another proxy can still reach it.
+After a valve or proxy goes offline, Home Assistant's advertisement expiry can
+take up to five minutes to report the loss; see the
+[Bluetooth availability documentation](https://developers.home-assistant.io/docs/core/bluetooth/api/#subscribing-to-unavailable-callbacks).
+A live Bluetooth data session also keeps the valve available if it stops
+advertising while connected. If that session ends after advertisements have
+expired, its entities become unavailable. A new advertisement restores them
+and allows polling to resume.
+
 This repository currently focuses on the scaffolding required for discovery and
 entity creation. Additional device metadata, richer entities, diagnostics, and
 configuration options will follow as device details become available.

@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 
-from homeassistant.components.bluetooth import BluetoothChange
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
@@ -28,7 +27,7 @@ from homeassistant.util import dt as dt_util
 
 from .const import DATA_CONNECTION_MANAGER, DATA_DISCOVERY_MANAGER, DOMAIN
 from .connection import ValveConnection, ValveConnectionManager
-from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
+from .discovery import ValveDiscoveryChange, ValveDiscoveryManager
 from .entity import ChandlerValveEntity, _is_clack_valve
 from .models import ValveAdvertisement, ValveDashboardData
 
@@ -74,11 +73,11 @@ class ValveDashboardSensor(ChandlerValveEntity, SensorEntity):
 
     @callback
     def async_handle_bluetooth_update(
-        self, advertisement: ValveAdvertisement, change: BluetoothChange
+        self, advertisement: ValveAdvertisement, change: ValveDiscoveryChange
     ) -> None:
         """Handle Bluetooth discovery updates for this valve."""
 
-        if change in BLUETOOTH_LOST_CHANGES:
+        if change is ValveDiscoveryChange.UNAVAILABLE:
             self._attr_available = False
         else:
             self.async_update_from_advertisement(advertisement)
@@ -514,9 +513,9 @@ async def async_setup_entry(
 
     @callback
     def _handle_discovery(
-        advertisement: ValveAdvertisement, change: BluetoothChange
+        advertisement: ValveAdvertisement, change: ValveDiscoveryChange
     ) -> None:
-        if change in BLUETOOTH_LOST_CHANGES:
+        if change is ValveDiscoveryChange.UNAVAILABLE:
             for entity_map in entity_maps:
                 entity = entity_map.get(advertisement.address)
                 if entity is not None:

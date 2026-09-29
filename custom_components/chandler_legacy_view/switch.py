@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 
-from homeassistant.components.bluetooth import BluetoothChange
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
@@ -13,7 +12,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DATA_CONNECTION_MANAGER, DATA_DISCOVERY_MANAGER, DOMAIN
 from .connection import ValveConnection, ValveConnectionManager
-from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
+from .discovery import ValveDiscoveryChange, ValveDiscoveryManager
 from .entity import ChandlerValveEntity
 from .models import ValveAdvertisement
 
@@ -37,11 +36,11 @@ class ValvePersistentConnectionSwitch(ChandlerValveEntity, SwitchEntity):
 
     @callback
     def async_handle_bluetooth_update(
-        self, advertisement: ValveAdvertisement, change: BluetoothChange
+        self, advertisement: ValveAdvertisement, change: ValveDiscoveryChange
     ) -> None:
         """Handle Bluetooth discovery updates for the valve."""
 
-        if change in BLUETOOTH_LOST_CHANGES:
+        if change is ValveDiscoveryChange.UNAVAILABLE:
             self._attr_available = False
         else:
             self.async_update_from_advertisement(advertisement)
@@ -96,11 +95,11 @@ class ValveAuthenticationLockoutSwitch(ChandlerValveEntity, SwitchEntity):
 
     @callback
     def async_handle_bluetooth_update(
-        self, advertisement: ValveAdvertisement, change: BluetoothChange
+        self, advertisement: ValveAdvertisement, change: ValveDiscoveryChange
     ) -> None:
         """Handle Bluetooth discovery updates for the valve."""
 
-        if change in BLUETOOTH_LOST_CHANGES:
+        if change is ValveDiscoveryChange.UNAVAILABLE:
             self._attr_available = False
         else:
             self.async_update_from_advertisement(advertisement)
@@ -225,9 +224,9 @@ async def async_setup_entry(
 
     @callback
     def _handle_discovery(
-        advertisement: ValveAdvertisement, change: BluetoothChange
+        advertisement: ValveAdvertisement, change: ValveDiscoveryChange
     ) -> None:
-        if change in BLUETOOTH_LOST_CHANGES:
+        if change is ValveDiscoveryChange.UNAVAILABLE:
             persistent_entity = persistent_entities.get(advertisement.address)
             if persistent_entity is not None:
                 persistent_entity.async_handle_bluetooth_update(advertisement, change)

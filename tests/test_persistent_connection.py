@@ -9,11 +9,12 @@ from __future__ import annotations
 import asyncio
 import importlib
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 
 def _load_connection_module():
@@ -74,7 +75,7 @@ def _load_connection_module():
     module(f"{package}.device_registry", async_update_device_serial_number=Mock())
     module(
         f"{package}.discovery",
-        BLUETOOTH_LOST_CHANGES=set(),
+        ValveDiscoveryChange=Enum("ValveDiscoveryChange", "AVAILABLE UNAVAILABLE"),
         ValveDiscoveryManager=object,
     )
     with patch.dict(sys.modules, modules):
@@ -92,7 +93,10 @@ class PersistentConnectionTests(unittest.IsolatedAsyncioTestCase):
             loop=asyncio.get_running_loop(),
             state=connection_module.CoreState.running,
         )
-        self.connection = connection_module.ValveConnection(self.hass, "test-valve")
+        self.connection_state = Mock()
+        self.connection = connection_module.ValveConnection(
+            self.hass, "test-valve", connection_state_callback=self.connection_state
+        )
         self.connection.update_from_advertisement(
             connection_module.ValveAdvertisement(
                 address="test-valve", name="Test valve", rssi=-50,
@@ -123,6 +127,7 @@ class PersistentConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.client.disconnect.assert_awaited_once()
         self.assertFalse(self.client.is_connected)
         self.assertIsNone(self.connection._persistent_task)
+        self.connection_state.assert_called_with("test-valve", False)
 
     async def wait_for_event(self, event: asyncio.Event) -> None:
         """Fail promptly if the expected asynchronous step never happens."""
@@ -151,9 +156,34 @@ class PersistentConnectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_unload_before_persistent_task_starts(self) -> None:
         # The mocked I/O completes synchronously, leaving keepalive queued.
         await self.connection.async_poll()
+        self.connection_state.assert_called_once_with("test-valve", True)
         await self.connection.async_unload()
 
         self.assert_disconnected_once()
+
+    async def test_connection_state_spans_persistent_handoff(self) -> None:
+        await self.connection.async_poll()
+        await asyncio.sleep(0)
+        self.assertIsNone(self.connection._pending_persistent_client)
+        self.connection_state.assert_called_once_with("test-valve", True)
+
+        await self.connection.async_set_persistent_connection_enabled(False)
+
+        self.assert_disconnected_once()
+        self.assertEqual(
+            self.connection_state.call_args_list,
+            [call("test-valve", True), call("test-valve", False)],
+        )
+
+    async def test_one_shot_poll_reports_connection_state(self) -> None:
+        self.connection._persistent_connection_enabled = False
+        await self.connection.async_poll()
+
+        self.assert_disconnected_once()
+        self.assertEqual(
+            self.connection_state.call_args_list,
+            [call("test-valve", True), call("test-valve", False)],
+        )
 
     async def test_disable_before_persistent_task_starts(self) -> None:
         await self.connection.async_poll()
@@ -189,6 +219,7 @@ class PersistentConnectionTests(unittest.IsolatedAsyncioTestCase):
                 await disconnect_started.wait()
             self.assertFalse(unload.done())
             self.assertTrue(self.client.is_connected)
+            self.connection_state.assert_called_once_with("test-valve", True)
         finally:
             release_disconnect.set()
             await unload
@@ -517,6 +548,7 @@ class PersistentConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(disconnect_cancelled.is_set())
         self.assertTrue(any("disconnect" in message.lower() for message in logs.output))
         self.assertTrue(any("test-valve" in message for message in logs.output))
+        self.connection_state.assert_called_once_with("test-valve", False)
 
     async def test_reset_failure_still_attempts_disconnect(self) -> None:
         self.connection._async_send_reset_buffer_packet.side_effect = OSError(

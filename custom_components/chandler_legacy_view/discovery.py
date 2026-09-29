@@ -6,6 +6,7 @@ import contextlib
 import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
+from enum import Enum
 from typing import Any, Dict, Mapping
 
 from homeassistant.components.bluetooth import (
@@ -13,6 +14,7 @@ from homeassistant.components.bluetooth import (
     BluetoothScanningMode,
     BluetoothServiceInfoBleak,
     async_register_callback,
+    async_track_unavailable,
 )
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant
 
@@ -23,7 +25,15 @@ from .models import ValveAdvertisement
 
 _LOGGER = logging.getLogger(__name__)
 
-ValveListener = Callable[[ValveAdvertisement, BluetoothChange], None]
+
+class ValveDiscoveryChange(Enum):
+    """Availability updates from advertisements or an active data session."""
+
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+
+
+ValveListener = Callable[[ValveAdvertisement, ValveDiscoveryChange], None]
 
 
 def _merge_incomplete_advertisement(
@@ -100,16 +110,6 @@ def _map_valve_type(value: int | None, is_clack_valve: bool) -> str | None:
 
     return _STANDARD_VALVE_TYPE_MAP.get(value, "Unknown")
 
-
-BLUETOOTH_LOST_CHANGES: tuple[BluetoothChange, ...] = tuple(
-    getattr(BluetoothChange, change_name)
-    for change_name in ("LOST", "UNAVAILABLE", "DISCONNECTED")
-    if hasattr(BluetoothChange, change_name)
-)
-
-_BLUETOOTH_ADVERTISEMENT_CHANGE: BluetoothChange | None = getattr(
-    BluetoothChange, "ADVERTISEMENT", None
-)
 
 _EVB019_VALVE_ERROR_MAP: dict[int, int] = {
     1: 2,
@@ -527,8 +527,13 @@ class ValveDiscoveryManager:
 
         self._hass = hass
         self._callbacks: list[CALLBACK_TYPE] = []
+        self._unavailable_callbacks: dict[str, CALLBACK_TYPE] = {}
         self._listeners: list[ValveListener] = []
+        # Keep metadata through absence so partial advertisements can recover it.
         self._devices: Dict[str, ValveAdvertisement] = {}
+        self._unavailable_addresses: set[str] = set()
+        self._connected_addresses: set[str] = set()
+        self._unloaded = False
 
     async def async_setup(self) -> None:
         """Start listening for Bluetooth advertisements."""
@@ -548,20 +553,88 @@ class ValveDiscoveryManager:
         """Cancel Bluetooth callbacks and clear tracked devices."""
 
         _LOGGER.debug("Unloading Bluetooth discovery for Chandler valves")
+        self._unloaded = True
         while self._callbacks:
             remove = self._callbacks.pop()
             remove()
+        while self._unavailable_callbacks:
+            _, remove = self._unavailable_callbacks.popitem()
+            remove()
         self._listeners.clear()
         self._devices.clear()
+        self._unavailable_addresses.clear()
+        self._connected_addresses.clear()
 
     @property
     def devices(self) -> Dict[str, ValveAdvertisement]:
-        """Return a snapshot of the tracked devices."""
+        """Return a snapshot of the currently reachable devices."""
 
-        return dict(self._devices)
+        return {
+            address: advertisement
+            for address, advertisement in self._devices.items()
+            if self._is_available(address)
+        }
+
+    def _is_available(self, address: str) -> bool:
+        """Combine scanner reachability with the active data session."""
+
+        return address in self._devices and (
+            address not in self._unavailable_addresses
+            or address in self._connected_addresses
+        )
+
+    def async_set_connection_state(self, address: str, connected: bool) -> None:
+        """Keep a live session available even when the valve stops advertising."""
+
+        if self._unloaded or address not in self._devices:
+            return
+
+        was_available = self._is_available(address)
+        if connected:
+            self._connected_addresses.add(address)
+        else:
+            self._connected_addresses.discard(address)
+
+        available = self._is_available(address)
+        if available != was_available:
+            self._notify_listeners(
+                self._devices[address],
+                ValveDiscoveryChange.AVAILABLE
+                if available
+                else ValveDiscoveryChange.UNAVAILABLE,
+            )
+
+    def _async_handle_unavailable(self, service_info: BluetoothServiceInfoBleak) -> None:
+        """Handle loss across all connectable Bluetooth controllers."""
+
+        address = service_info.address
+        if self._unloaded or address not in self._devices:
+            return
+
+        was_available = self._is_available(address)
+        self._unavailable_addresses.add(address)
+        if was_available and not self._is_available(address):
+            self._notify_listeners(
+                self._devices[address], ValveDiscoveryChange.UNAVAILABLE
+            )
+
+    def _notify_listeners(
+        self, advertisement: ValveAdvertisement, change: ValveDiscoveryChange
+    ) -> None:
+        """Publish the latest metadata and effective availability."""
+
+        for listener in list(self._listeners):
+            try:
+                listener(advertisement, change)
+            except Exception:
+                _LOGGER.exception(
+                    "Error publishing valve %s availability change %s",
+                    advertisement.address,
+                    change.value,
+                )
 
     def async_add_listener(self, listener: ValveListener) -> CALLBACK_TYPE:
-        """Register a listener that is notified when a valve advertisement is seen."""
+        """Register a listener for valve metadata and availability changes."""
 
         self._listeners.append(listener)
 
@@ -576,16 +649,10 @@ class ValveDiscoveryManager:
     ) -> None:
         """Handle an incoming Bluetooth advertisement from Home Assistant."""
 
-        if change in BLUETOOTH_LOST_CHANGES:
-            advertisement = self._devices.pop(service_info.address, None)
-            if advertisement is None:
-                _LOGGER.debug(
-                    "Ignoring lost event for %s; device was not tracked as a valve",
-                    service_info.address,
-                )
-                return
-            _LOGGER.debug("Valve %s lost", service_info.address)
-        elif change is _BLUETOOTH_ADVERTISEMENT_CHANGE:
+        if self._unloaded:
+            return
+
+        if change is BluetoothChange.ADVERTISEMENT:
             if not _matches_valve_prefix(service_info.name):
                 _LOGGER.debug(
                     "Ignoring Bluetooth advertisement from %s with name %r",
@@ -712,6 +779,16 @@ class ValveDiscoveryManager:
                 format_firmware_version(advertisement),
             )
             self._devices[service_info.address] = advertisement
+            self._unavailable_addresses.discard(service_info.address)
+            if service_info.address not in self._unavailable_callbacks:
+                self._unavailable_callbacks[service_info.address] = (
+                    async_track_unavailable(
+                        self._hass,
+                        self._async_handle_unavailable,
+                        service_info.address,
+                        connectable=True,
+                    )
+                )
             if classification.firmware_version is not None:
                 _LOGGER.debug(
                     "Valve %s seen (RSSI=%s, firmware=%s)",
@@ -731,5 +808,4 @@ class ValveDiscoveryManager:
             )
             return
 
-        for listener in list(self._listeners):
-            listener(advertisement, change)
+        self._notify_listeners(advertisement, ValveDiscoveryChange.AVAILABLE)

@@ -8,13 +8,12 @@ from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
     BinarySensorEntity,
 )
-from homeassistant.components.bluetooth import BluetoothChange
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DATA_DISCOVERY_MANAGER, DOMAIN
-from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
+from .discovery import ValveDiscoveryChange, ValveDiscoveryManager
 from .entity import (
     ChandlerValveEntity,
     _VALVE_SERIES_EVB034_DISPLAY,
@@ -43,11 +42,11 @@ class ValvePresenceBinarySensor(ChandlerValveEntity, BinarySensorEntity):
 
     @callback
     def async_handle_bluetooth_update(
-        self, advertisement: ValveAdvertisement, change: BluetoothChange
+        self, advertisement: ValveAdvertisement, change: ValveDiscoveryChange
     ) -> None:
         """Handle updates from the Bluetooth discovery manager."""
 
-        if change in BLUETOOTH_LOST_CHANGES:
+        if change is ValveDiscoveryChange.UNAVAILABLE:
             self._attr_is_on = False
             self._attr_available = False
         else:
@@ -151,11 +150,11 @@ class ValveBypassBinarySensor(ChandlerValveEntity, BinarySensorEntity):
 
     @callback
     def async_handle_bluetooth_update(
-        self, advertisement: ValveAdvertisement, change: BluetoothChange
+        self, advertisement: ValveAdvertisement, change: ValveDiscoveryChange
     ) -> None:
         """Handle updates from the Bluetooth discovery manager."""
 
-        if change in BLUETOOTH_LOST_CHANGES:
+        if change is ValveDiscoveryChange.UNAVAILABLE:
             self._attr_available = False
         else:
             self.async_update_from_advertisement(advertisement)
@@ -203,11 +202,11 @@ class ValveSaltBinarySensor(ChandlerValveEntity, BinarySensorEntity):
 
     @callback
     def async_handle_bluetooth_update(
-        self, advertisement: ValveAdvertisement, change: BluetoothChange
+        self, advertisement: ValveAdvertisement, change: ValveDiscoveryChange
     ) -> None:
         """Handle updates from the Bluetooth discovery manager."""
 
-        if change in BLUETOOTH_LOST_CHANGES:
+        if change is ValveDiscoveryChange.UNAVAILABLE:
             self._attr_available = False
         else:
             self.async_update_from_advertisement(advertisement)
@@ -280,9 +279,9 @@ async def async_setup_entry(
 
     @callback
     def _handle_discovery(
-        advertisement: ValveAdvertisement, change: BluetoothChange
+        advertisement: ValveAdvertisement, change: ValveDiscoveryChange
     ) -> None:
-        if change in BLUETOOTH_LOST_CHANGES:
+        if change is ValveDiscoveryChange.UNAVAILABLE:
             device_entities = entities.get(advertisement.address)
             if device_entities is None:
                 return

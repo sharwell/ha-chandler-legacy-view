@@ -19,7 +19,6 @@ from bleak_retry_connector import (
     establish_connection,
 )
 from homeassistant.components import bluetooth
-from homeassistant.components.bluetooth import BluetoothChange
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import CALLBACK_TYPE, CoreState, HomeAssistant, callback
@@ -38,7 +37,7 @@ from .const import (
     MIN_PERSISTENT_POLL_INTERVAL_SECONDS,
 )
 from .device_registry import async_update_device_serial_number
-from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
+from .discovery import ValveDiscoveryChange, ValveDiscoveryManager
 from .models import ValveAdvertisement, ValveDashboardData
 
 _LOGGER = logging.getLogger(__name__)
@@ -220,6 +219,7 @@ class ValveConnection:
         hass: HomeAssistant,
         address: str,
         passcode_getter: Callable[[str], ValvePasscodeConfiguration] | None = None,
+        connection_state_callback: Callable[[str, bool], None] | None = None,
     ) -> None:
         """Initialize the valve connection handler."""
 
@@ -247,6 +247,7 @@ class ValveConnection:
         self._dashboard_listeners: list[Callable[[ValveDashboardData | None], None]] = []
         self._authentication_listeners: list[Callable[[bool], None]] = []
         self._passcode_getter = passcode_getter
+        self._connection_state_callback = connection_state_callback
         self._crc8 = _ChandlerCrc8()
         self._persistent_connection_enabled = False
         self._persistent_poll_interval = DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS
@@ -781,6 +782,8 @@ class ValveConnection:
             cleanup_client = client
 
             try:
+                if self._connection_state_callback is not None:
+                    self._connection_state_callback(self._address, True)
                 await self._async_fetch_device_information(client)
             except Exception:  # pragma: no cover - future protocol work may raise
                 _LOGGER.exception(
@@ -1182,7 +1185,13 @@ class ValveConnection:
                         exc_info=True,
                     )
 
-        await _async_wait_for_cleanup(asyncio.create_task(_cleanup()))
+        try:
+            await _async_wait_for_cleanup(asyncio.create_task(_cleanup()))
+        finally:
+            # Session availability must end even if cleanup failed or its
+            # caller was cancelled. A silent valve may have a deferred loss.
+            if self._connection_state_callback is not None:
+                self._connection_state_callback(self._address, False)
 
     async def _async_request_device_list(
         self, client: BaseBleakClient
@@ -2318,11 +2327,11 @@ class ValveConnectionManager:
 
     @callback
     def _handle_discovery_event(
-        self, advertisement: ValveAdvertisement, change: BluetoothChange
+        self, advertisement: ValveAdvertisement, change: ValveDiscoveryChange
     ) -> None:
         """React to Bluetooth discovery updates from the passive scanner."""
 
-        if change in BLUETOOTH_LOST_CHANGES:
+        if change is ValveDiscoveryChange.UNAVAILABLE:
             connection = self._connections.get(advertisement.address)
             if connection is not None:
                 connection.mark_unavailable()
@@ -2340,6 +2349,7 @@ class ValveConnectionManager:
                 self._hass,
                 advertisement.address,
                 self.get_passcode,
+                self._discovery_manager.async_set_connection_state,
             )
             self._connections[advertisement.address] = connection
         connection.update_from_advertisement(advertisement)
