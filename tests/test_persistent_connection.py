@@ -95,7 +95,8 @@ class PersistentConnectionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.connection_state = Mock()
         self.connection = connection_module.ValveConnection(
-            self.hass, "test-valve", connection_state_callback=self.connection_state
+            self.hass, "test-valve", "test-entry",
+            connection_state_callback=self.connection_state,
         )
         self.connection.update_from_advertisement(
             connection_module.ValveAdvertisement(

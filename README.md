@@ -38,6 +38,9 @@ configuration options will follow as device details become available.
 
 ## Installation
 
+Requires Home Assistant 2026.8.0 or later for config-entry-scoped device registry
+lookups and parent-device links by registry ID.
+
 1. Copy the `custom_components/chandler_legacy_view` directory into your Home
    Assistant `custom_components` folder.
 2. Restart Home Assistant to load the new integration.

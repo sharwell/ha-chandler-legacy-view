@@ -218,6 +218,7 @@ class ValveConnection:
         self,
         hass: HomeAssistant,
         address: str,
+        config_entry_id: str,
         passcode_getter: Callable[[str], ValvePasscodeConfiguration] | None = None,
         connection_state_callback: Callable[[str, bool], None] | None = None,
     ) -> None:
@@ -225,6 +226,7 @@ class ValveConnection:
 
         self._hass = hass
         self._address = address
+        self._config_entry_id = config_entry_id
         self._advertisement: ValveAdvertisement | None = None
         self._available = False
         self._last_seen: datetime | None = None
@@ -2068,7 +2070,9 @@ class ValveConnection:
                     self._address,
                 )
             self._serial_number = None
-            async_update_device_serial_number(self._hass, self._address, None)
+            async_update_device_serial_number(
+                self._hass, self._config_entry_id, self._address, None
+            )
             return
 
         if serial_number != self._serial_number:
@@ -2076,7 +2080,9 @@ class ValveConnection:
                 "Valve %s reported serial number %s", self._address, serial_number
             )
         self._serial_number = serial_number
-        async_update_device_serial_number(self._hass, self._address, serial_number)
+        async_update_device_serial_number(
+            self._hass, self._config_entry_id, self._address, serial_number
+        )
 
     def _extract_serial_number(self, packet: bytes) -> str | None:
         """Return the valve serial number encoded within a DeviceList packet."""
@@ -2348,6 +2354,7 @@ class ValveConnectionManager:
             connection = ValveConnection(
                 self._hass,
                 advertisement.address,
+                self._config_entry.entry_id,
                 self.get_passcode,
                 self._discovery_manager.async_set_connection_state,
             )

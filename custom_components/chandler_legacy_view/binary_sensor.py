@@ -12,7 +12,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DATA_DISCOVERY_MANAGER, DOMAIN
+from .const import DATA_DISCOVERY_DEVICE_ID, DATA_DISCOVERY_MANAGER, DOMAIN
 from .discovery import ValveDiscoveryChange, ValveDiscoveryManager
 from .entity import (
     ChandlerValveEntity,
@@ -255,6 +255,7 @@ async def async_setup_entry(
             entity = device_entities.get(key)
             if entity is None:
                 entity = factory()
+                entity.async_set_via_device_id(entry_data[DATA_DISCOVERY_DEVICE_ID])
                 device_entities[key] = entity
                 new_entities.append(entity)
             return entity

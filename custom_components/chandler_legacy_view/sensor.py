@@ -25,7 +25,12 @@ from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
-from .const import DATA_CONNECTION_MANAGER, DATA_DISCOVERY_MANAGER, DOMAIN
+from .const import (
+    DATA_CONNECTION_MANAGER,
+    DATA_DISCOVERY_DEVICE_ID,
+    DATA_DISCOVERY_MANAGER,
+    DOMAIN,
+)
 from .connection import ValveConnection, ValveConnectionManager
 from .discovery import ValveDiscoveryChange, ValveDiscoveryManager
 from .entity import ChandlerValveEntity, _is_clack_valve
@@ -386,6 +391,7 @@ async def async_setup_entry(
                 return None, new_entities
 
             entity = factory(advertisement, connection)
+            entity.async_set_via_device_id(entry_data[DATA_DISCOVERY_DEVICE_ID])
             entity_map[advertisement.address] = entity
             new_entities.append(entity)
 

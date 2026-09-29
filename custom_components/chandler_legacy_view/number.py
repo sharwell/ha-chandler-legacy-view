@@ -13,6 +13,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
     DATA_CONNECTION_MANAGER,
+    DATA_DISCOVERY_DEVICE_ID,
     DATA_DISCOVERY_MANAGER,
     DOMAIN,
     MAX_PERSISTENT_POLL_INTERVAL_SECONDS,
@@ -107,6 +108,7 @@ async def async_setup_entry(
                 return None, new_entities
 
             entity = ValvePersistentPollIntervalNumber(advertisement, connection)
+            entity.async_set_via_device_id(entry_data[DATA_DISCOVERY_DEVICE_ID])
             entities[advertisement.address] = entity
             new_entities.append(entity)
 
