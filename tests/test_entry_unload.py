@@ -6,6 +6,7 @@ manager classes are stubbed; the integration entry module and constants are real
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 from pathlib import Path
 import sys
@@ -62,7 +63,7 @@ integration = _load_integration_module()
 
 
 class EntryUnloadTests(unittest.IsolatedAsyncioTestCase):
-    """Preserve shared runtime state until platform unloading succeeds."""
+    """Preserve runtime until platforms unload, then finish all cleanup."""
 
     def setUp(self) -> None:
         self.entry = SimpleNamespace(entry_id="test-entry")
@@ -124,6 +125,75 @@ class EntryUnloadTests(unittest.IsolatedAsyncioTestCase):
         self.discovery_manager.async_unload.assert_awaited_once_with()
         other_connection.async_unload.assert_not_called()
         other_discovery.async_unload.assert_not_called()
+
+    async def test_cancelled_connection_cleanup_preserves_other_entries(self) -> None:
+        other_data = object()
+        self.domain_data["other-entry"] = other_data
+        self.connection_manager.async_unload.side_effect = asyncio.CancelledError
+
+        with self.assertRaises(asyncio.CancelledError):
+            await integration.async_unload_entry(self.hass, self.entry)
+
+        self.connection_manager.async_unload.assert_awaited_once_with()
+        self.discovery_manager.async_unload.assert_awaited_once_with()
+        self.assertIs(self.hass.data[integration.DOMAIN], self.domain_data)
+        self.assertNotIn(self.entry.entry_id, self.domain_data)
+        self.assertIs(self.domain_data["other-entry"], other_data)
+
+    async def test_connection_cleanup_error_still_unloads_discovery(self) -> None:
+        failure = RuntimeError("Connection cleanup failed")
+        self.connection_manager.async_unload.side_effect = failure
+
+        with self.assertRaises(RuntimeError) as raised:
+            await integration.async_unload_entry(self.hass, self.entry)
+
+        self.assertIs(raised.exception, failure)
+        self.discovery_manager.async_unload.assert_awaited_once_with()
+        self.assertNotIn(integration.DOMAIN, self.hass.data)
+
+    async def test_cancelled_platform_unload_preserves_runtime(self) -> None:
+        self.hass.config_entries.async_unload_platforms.side_effect = (
+            asyncio.CancelledError
+        )
+
+        with self.assertRaises(asyncio.CancelledError):
+            await integration.async_unload_entry(self.hass, self.entry)
+
+        self.assertIs(self.hass.data[integration.DOMAIN], self.domain_data)
+        self.assertIs(self.domain_data[self.entry.entry_id], self.entry_data)
+        self.connection_manager.async_unload.assert_not_called()
+        self.discovery_manager.async_unload.assert_not_called()
+
+    async def test_concurrent_unload_does_not_mask_cancellation(self) -> None:
+        connection_cleanup_started = asyncio.Event()
+
+        async def wait_for_cancellation() -> None:
+            connection_cleanup_started.set()
+            await asyncio.Future()
+
+        self.connection_manager.async_unload.side_effect = wait_for_cancellation
+        other_entry = SimpleNamespace(entry_id="other-entry")
+        other_discovery = SimpleNamespace(async_unload=AsyncMock())
+        self.domain_data[other_entry.entry_id] = {
+            integration.DATA_CONNECTION_MANAGER: SimpleNamespace(async_unload=AsyncMock()),
+            integration.DATA_DISCOVERY_MANAGER: other_discovery,
+        }
+        first_unload = asyncio.create_task(
+            integration.async_unload_entry(self.hass, self.entry)
+        )
+        try:
+            async with asyncio.timeout(1):
+                await connection_cleanup_started.wait()
+            self.assertTrue(await integration.async_unload_entry(self.hass, other_entry))
+            self.assertNotIn(integration.DOMAIN, self.hass.data)
+        finally:
+            first_unload.cancel()
+            results = await asyncio.gather(first_unload, return_exceptions=True)
+
+        self.assertIsInstance(results[0], asyncio.CancelledError)
+        self.discovery_manager.async_unload.assert_awaited_once_with()
+        other_discovery.async_unload.assert_awaited_once_with()
+        self.assertNotIn(integration.DOMAIN, self.hass.data)
 
 
 if __name__ == "__main__":
