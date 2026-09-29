@@ -495,8 +495,10 @@ class ValveConnection:
             self.schedule_poll()
 
     def _persistent_task_active(self) -> bool:
-        """Return ``True`` if a persistent session is currently running."""
+        """Return ``True`` while a persistent session or its cleanup is active."""
 
+        if self._persistent_stop_task is not None:
+            return True
         task = self._persistent_task
         if task is None:
             return False
@@ -530,6 +532,10 @@ class ValveConnection:
         finally:
             if self._persistent_stop_task is stop_task:
                 self._persistent_stop_task = None
+                if self._persistent_connection_enabled and not self._unloaded:
+                    # Re-enabling during teardown may have scheduled a poll
+                    # that was skipped while this stop worker still owned cleanup.
+                    self.schedule_poll()
 
     async def _async_finish_persistent_stop(
         self,
@@ -689,10 +695,9 @@ class ValveConnection:
         if not self.available:
             return
 
-        task_active = self._persistent_task_active()
-        if self._persistent_connection_enabled and task_active:
+        if self._persistent_task_active():
             _LOGGER.debug(
-                "Skipping poll for %s; persistent session is already active",
+                "Skipping poll for %s; persistent session or cleanup is still active",
                 self._address,
             )
             return

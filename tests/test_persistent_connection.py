@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
@@ -211,6 +211,132 @@ class PersistentConnectionTests(unittest.IsolatedAsyncioTestCase):
             await self.connection.async_set_persistent_connection_enabled(False)
 
         self.assert_disconnected_once()
+
+    async def assert_poll_waits_for_persistent_stop(self, *, started: bool) -> None:
+        """Keep new connections blocked until either cleanup path finishes."""
+        disconnect_started, release_disconnect = self.gate_disconnect()
+        disable = None
+        try:
+            if started:
+                await self.connection.async_poll()
+                await asyncio.sleep(0)
+                self.assertIsNone(self.connection._pending_persistent_client)
+                disable = asyncio.create_task(
+                    self.connection.async_set_persistent_connection_enabled(False)
+                )
+            else:
+                # Queue switch-off before the first step of the keepalive task.
+                disable = asyncio.create_task(
+                    self.connection.async_set_persistent_connection_enabled(False)
+                )
+                await self.connection.async_poll()
+
+            persistent = self.connection._persistent_task
+            await self.wait_for_event(disconnect_started)
+            self.assertFalse(self.connection.persistent_connection_enabled)
+            self.assertEqual(persistent.done(), not started)
+            if not started:
+                self.assertTrue(persistent.cancelled())
+            self.assertTrue(self.client.is_connected)
+
+            # Cooldown must not hide an overlapping connection attempt.
+            self.connection._next_connection_time = (
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            )
+            replacement = SimpleNamespace(is_connected=True, disconnect=AsyncMock())
+            connection_module.establish_connection.return_value = replacement
+            await self.connection.async_poll()
+            connection_module.establish_connection.assert_awaited_once()
+            self.assertFalse(disable.done())
+        finally:
+            release_disconnect.set()
+            if disable is not None:
+                results = await self.collect_tasks(disable)
+
+        self.assertEqual(results, [None])
+        self.assert_disconnected_once()
+
+        # Once cleanup finishes, ordinary polling can acquire a fresh client.
+        await self.connection.async_poll()
+        self.assertEqual(connection_module.establish_connection.await_count, 2)
+        replacement.disconnect.assert_awaited_once()
+
+    async def test_poll_waits_for_started_session_disconnect(self) -> None:
+        await self.assert_poll_waits_for_persistent_stop(started=True)
+
+    async def test_poll_waits_for_unstarted_session_disconnect(self) -> None:
+        await self.assert_poll_waits_for_persistent_stop(started=False)
+
+    async def assert_reenable_retries_after_persistent_stop(
+        self, *, started: bool
+    ) -> None:
+        """Re-enabling during cleanup must preserve the next connection attempt."""
+        disconnect_started, release_disconnect = self.gate_disconnect()
+        reconnected = asyncio.Event()
+        scheduled_polls = []
+        replacement = SimpleNamespace(is_connected=True, disconnect=AsyncMock())
+        disable = None
+
+        def schedule_poll() -> None:
+            scheduled_polls.append(asyncio.create_task(self.connection.async_poll()))
+
+        async def reconnect(*args, **kwargs):
+            self.assertFalse(self.client.is_connected)
+            reconnected.set()
+            return replacement
+
+        with patch.object(
+            connection_module, "CONNECTION_MIN_RETRY_INTERVAL", timedelta(0)
+        ):
+            try:
+                if started:
+                    await self.connection.async_poll()
+                    await asyncio.sleep(0)
+                    self.assertIsNone(self.connection._pending_persistent_client)
+                    disable = asyncio.create_task(
+                        self.connection.async_set_persistent_connection_enabled(False)
+                    )
+                else:
+                    disable = asyncio.create_task(
+                        self.connection.async_set_persistent_connection_enabled(False)
+                    )
+                    await self.connection.async_poll()
+
+                persistent = self.connection._persistent_task
+                await self.wait_for_event(disconnect_started)
+                self.assertEqual(persistent.done(), not started)
+                connection_module.establish_connection.side_effect = reconnect
+                self.connection.schedule_poll.side_effect = schedule_poll
+
+                await self.connection.async_set_persistent_connection_enabled(True)
+                self.assertEqual(await self.collect_tasks(*scheduled_polls), [None])
+                connection_module.establish_connection.assert_awaited_once()
+                self.assertTrue(self.client.is_connected)
+
+                release_disconnect.set()
+                self.assertEqual(await self.collect_tasks(disable), [None])
+                await self.wait_for_event(reconnected)
+                results = await self.collect_tasks(*scheduled_polls)
+                self.assertTrue(all(result is None for result in results))
+                self.assertEqual(connection_module.establish_connection.await_count, 2)
+                self.client.disconnect.assert_awaited_once()
+                self.assertFalse(self.client.is_connected)
+                self.assertTrue(self.connection.persistent_connection_enabled)
+                self.assertIsNotNone(self.connection._persistent_task)
+            finally:
+                release_disconnect.set()
+                if disable is not None:
+                    await self.collect_tasks(disable)
+                await self.connection.async_set_persistent_connection_enabled(False)
+                await self.collect_tasks(*scheduled_polls)
+
+        replacement.disconnect.assert_awaited_once()
+
+    async def test_reenable_retries_after_started_session_disconnect(self) -> None:
+        await self.assert_reenable_retries_after_persistent_stop(started=True)
+
+    async def test_reenable_retries_after_unstarted_session_disconnect(self) -> None:
+        await self.assert_reenable_retries_after_persistent_stop(started=False)
 
     async def test_normal_persistent_exit_disconnects_once(self) -> None:
         self.connection._async_request_dashboard = AsyncMock(return_value=(False, False))
