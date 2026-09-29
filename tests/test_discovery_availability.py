@@ -70,7 +70,7 @@ class DiscoveryAvailabilityTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self) -> None:
         self.hass = object()
-        self.manager = discovery_module.ValveDiscoveryManager(self.hass)
+        self.manager = discovery_module.ValveDiscoveryManager(self.hass, "test-entry")
         self.events: list[tuple[object, object]] = []
         self.remove_listener = self.manager.async_add_listener(
             lambda advertisement, change: self.events.append((advertisement, change))
@@ -138,6 +138,12 @@ class DiscoveryAvailabilityTests(unittest.IsolatedAsyncioTestCase):
     @property
     def changes(self):
         return [change for _, change in self.events]
+
+    async def test_firmware_update_uses_owning_config_entry(self):
+        with patch.object(discovery_module, "async_update_device_sw_version") as update:
+            self.advertise()
+
+        update.assert_called_once_with(self.hass, "test-entry", "valve-a", "412")
 
     async def test_registers_passive_discovery_with_advertisement_only_api(self):
         self.assertEqual(

@@ -522,10 +522,11 @@ def _parse_evb019_payload(
 class ValveDiscoveryManager:
     """Track Bluetooth advertisements originating from known valves."""
 
-    def __init__(self, hass: HomeAssistant) -> None:
+    def __init__(self, hass: HomeAssistant, config_entry_id: str) -> None:
         """Initialize the manager."""
 
         self._hass = hass
+        self._config_entry_id = config_entry_id
         self._callbacks: list[CALLBACK_TYPE] = []
         self._unavailable_callbacks: dict[str, CALLBACK_TYPE] = {}
         self._listeners: list[ValveListener] = []
@@ -775,6 +776,7 @@ class ValveDiscoveryManager:
                 )
             async_update_device_sw_version(
                 self._hass,
+                self._config_entry_id,
                 advertisement.address,
                 format_firmware_version(advertisement),
             )

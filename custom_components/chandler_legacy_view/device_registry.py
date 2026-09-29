@@ -8,12 +8,17 @@ from .const import DOMAIN
 
 
 def async_update_device_serial_number(
-    hass: HomeAssistant, address: str, serial_number: str | None
+    hass: HomeAssistant,
+    config_entry_id: str,
+    address: str,
+    serial_number: str | None,
 ) -> None:
     """Update the stored serial number for a valve if it has changed."""
 
     device_registry = dr.async_get(hass)
-    device_entry = device_registry.async_get_device(identifiers={(DOMAIN, address)})
+    device_entry = device_registry.async_get_device_by_identifier(
+        (DOMAIN, address), config_entry_id
+    )
     if device_entry is None:
         return
 
@@ -24,12 +29,14 @@ def async_update_device_serial_number(
 
 
 def async_update_device_sw_version(
-    hass: HomeAssistant, address: str, sw_version: str | None
+    hass: HomeAssistant, config_entry_id: str, address: str, sw_version: str | None
 ) -> None:
     """Update the stored firmware version for a valve if it has changed."""
 
     device_registry = dr.async_get(hass)
-    device_entry = device_registry.async_get_device(identifiers={(DOMAIN, address)})
+    device_entry = device_registry.async_get_device_by_identifier(
+        (DOMAIN, address), config_entry_id
+    )
     if device_entry is None:
         return
 

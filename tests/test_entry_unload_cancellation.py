@@ -25,7 +25,7 @@ class EntryUnloadCancellationTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         entry = SimpleNamespace(entry_id="test-entry", data={}, options={})
-        discovery = production.discovery.ValveDiscoveryManager(hass)
+        discovery = production.discovery.ValveDiscoveryManager(hass, entry.entry_id)
         manager = production.connection.ValveConnectionManager(hass, entry, discovery)
         hass.data = {
             integration.DOMAIN: {

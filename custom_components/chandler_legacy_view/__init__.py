@@ -15,6 +15,7 @@ from .const import (
     CONF_DEFAULT_PASSCODE,
     CONF_DEVICE_PASSCODES,
     DATA_CONNECTION_MANAGER,
+    DATA_DISCOVERY_DEVICE_ID,
     DATA_DISCOVERY_MANAGER,
     DEFAULT_MANUFACTURER,
     DEFAULT_VALVE_PASSCODE,
@@ -53,7 +54,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
     device_registry = dr.async_get(hass)
-    device_registry.async_get_or_create(
+    discovery_device = device_registry.async_get_or_create(
         config_entry_id=entry.entry_id,
         identifiers={(DOMAIN, DISCOVERY_VIA_DEVICE_ID)},
         manufacturer=DEFAULT_MANUFACTURER,
@@ -62,13 +63,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry_type=DeviceEntryType.SERVICE,
     )
 
-    discovery_manager = ValveDiscoveryManager(hass)
+    discovery_manager = ValveDiscoveryManager(hass, entry.entry_id)
     await discovery_manager.async_setup()
 
     connection_manager = ValveConnectionManager(hass, entry, discovery_manager)
     await connection_manager.async_setup()
 
     hass.data[DOMAIN][entry.entry_id] = {
+        DATA_DISCOVERY_DEVICE_ID: discovery_device.id,
         DATA_DISCOVERY_MANAGER: discovery_manager,
         DATA_CONNECTION_MANAGER: connection_manager,
     }

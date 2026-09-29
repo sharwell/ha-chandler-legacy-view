@@ -9,7 +9,6 @@ from homeassistant.helpers.entity import DeviceInfo, Entity
 from .const import (
     DEFAULT_FRIENDLY_NAME,
     DEFAULT_MANUFACTURER,
-    DISCOVERY_VIA_DEVICE_ID,
     DOMAIN,
     FRIENDLY_NAME_OVERRIDES,
 )
@@ -222,6 +221,7 @@ class ChandlerValveEntity(Entity):
         """Initialize the entity."""
 
         self._advertisement = advertisement
+        self._via_device_id: str | None = None
         self._attr_unique_id = advertisement.address
         self._attr_name = self._compute_name(advertisement)
 
@@ -229,14 +229,21 @@ class ChandlerValveEntity(Entity):
     def device_info(self) -> DeviceInfo:
         """Return metadata for the device registry."""
 
-        return DeviceInfo(
+        info = DeviceInfo(
             identifiers={(DOMAIN, self._advertisement.address)},
             name=self._compute_name(self._advertisement),
             manufacturer=DEFAULT_MANUFACTURER,
             model=self._advertisement.model,
-            via_device=(DOMAIN, DISCOVERY_VIA_DEVICE_ID),
             sw_version=format_firmware_version(self._advertisement),
         )
+        if self._via_device_id is not None:
+            info["via_device_id"] = self._via_device_id
+        return info
+
+    def async_set_via_device_id(self, device_id: str) -> None:
+        """Set the registered parent device before adding the entity to HA."""
+
+        self._via_device_id = device_id
 
     def async_update_from_advertisement(self, advertisement: ValveAdvertisement) -> None:
         """Store the most recent advertisement seen for this valve."""

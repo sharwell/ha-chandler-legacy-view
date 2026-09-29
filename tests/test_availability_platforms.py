@@ -31,6 +31,12 @@ def _load_platform_modules() -> SimpleNamespace:
     class Entity:
         hass = None
 
+        async def async_added_to_hass(self) -> None:
+            pass
+
+        async def async_will_remove_from_hass(self) -> None:
+            pass
+
         def async_write_ha_state(self) -> None:
             self.state_writes = getattr(self, "state_writes", 0) + 1
 
@@ -184,6 +190,7 @@ class AvailabilityPlatformTests(unittest.IsolatedAsyncioTestCase):
                 entry.entry_id: {
                     constants.DATA_DISCOVERY_MANAGER: discovery,
                     constants.DATA_CONNECTION_MANAGER: manager,
+                    constants.DATA_DISCOVERY_DEVICE_ID: "registered-parent-id",
                 }
             }
         }
@@ -194,6 +201,16 @@ class AvailabilityPlatformTests(unittest.IsolatedAsyncioTestCase):
 
             def add_entities(created, entities=entities) -> None:
                 for entity in created:
+                    # HA reads device_info while adding entities, before they
+                    # are attached. Initial and later discoveries need the ID.
+                    self.assertEqual(
+                        entity.device_info["via_device_id"], "registered-parent-id"
+                    )
+                    self.assertNotIn("via_device", entity.device_info)
+                    self.assertEqual(
+                        entity.device_info["identifiers"],
+                        {(constants.DOMAIN, entity._advertisement.address)},
+                    )
                     entity.hass = hass
                 entities.extend(created)
 
@@ -261,6 +278,9 @@ class AvailabilityPlatformTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(presence._attr_is_on)
         self.assertTrue(all(entity._attr_available for entity in all_entities))
         self.assertTrue(all(entity._advertisement is recovered for entity in softener_entities))
+        for entity in all_entities:
+            self.assertEqual(entity.device_info["via_device_id"], "registered-parent-id")
+            self.assertNotIn("via_device", entity.device_info)
         self.assertEqual(hass.async_create_task.call_count, 4)
         self.assertEqual(
             tuple(id(entity) for entities in entities_by_platform.values() for entity in entities),
@@ -283,8 +303,8 @@ class AvailabilityPlatformTests(unittest.IsolatedAsyncioTestCase):
             state=production.connection.CoreState.running,
             async_create_task=Mock(side_effect=lambda coroutine: coroutine.close()),
         )
-        entry = SimpleNamespace(options={}, data={})
-        discovery = production.discovery.ValveDiscoveryManager(hass)
+        entry = SimpleNamespace(entry_id="test-entry", options={}, data={})
+        discovery = production.discovery.ValveDiscoveryManager(hass, entry.entry_id)
         manager = production.connection.ValveConnectionManager(hass, entry, discovery)
         self.addAsyncCleanup(discovery.async_unload)
         self.addAsyncCleanup(manager.async_unload)

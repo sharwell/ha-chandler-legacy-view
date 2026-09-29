@@ -32,6 +32,7 @@ MAX_PERSISTENT_POLL_INTERVAL_SECONDS: Final = 300.0
 # Storage keys used inside ``hass.data``
 DATA_DISCOVERY_MANAGER: Final = "discovery_manager"
 DATA_CONNECTION_MANAGER: Final = "connection_manager"
+DATA_DISCOVERY_DEVICE_ID: Final = "discovery_device_id"
 
 # Polling configuration for on-demand Bluetooth connections
 CONNECTION_POLL_INTERVAL: Final = timedelta(minutes=15)

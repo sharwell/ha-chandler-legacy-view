@@ -32,11 +32,21 @@ advertising while connected. If that session ends after advertisements have
 expired, its entities become unavailable. A new advertisement restores them
 and allows polling to resume.
 
+The **Time of Day** sensor is disabled by default when first registered to avoid
+frequent clock updates in Activity and history. Enable it in the entity settings
+if you want to display the valve's clock. Existing entities keep their current
+enabled or disabled setting; disable an existing Time of Day sensor manually
+to stop its updates. The integration still reads the valve clock during normal
+dashboard polling when this sensor is disabled.
+
 This repository currently focuses on the scaffolding required for discovery and
 entity creation. Additional device metadata, richer entities, diagnostics, and
 configuration options will follow as device details become available.
 
 ## Installation
+
+Requires Home Assistant 2026.8.0 or later for config-entry-scoped device registry
+lookups and parent-device links by registry ID.
 
 1. Copy the `custom_components/chandler_legacy_view` directory into your Home
    Assistant `custom_components` folder.
