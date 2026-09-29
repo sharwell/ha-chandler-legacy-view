@@ -112,6 +112,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a Chandler Legacy View config entry."""
 
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if not unload_ok:
+        return False
 
     data = hass.data[DOMAIN].pop(entry.entry_id, None)
     if data is not None:
