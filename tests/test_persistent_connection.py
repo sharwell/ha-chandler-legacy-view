@@ -124,6 +124,30 @@ class PersistentConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.client.is_connected)
         self.assertIsNone(self.connection._persistent_task)
 
+    async def wait_for_event(self, event: asyncio.Event) -> None:
+        """Fail promptly if the expected asynchronous step never happens."""
+        async with asyncio.timeout(1):
+            await event.wait()
+
+    async def collect_tasks(self, *tasks: asyncio.Task) -> list:
+        """Drain test tasks while preserving cancellation results for assertions."""
+        async with asyncio.timeout(1):
+            return await asyncio.gather(*tasks, return_exceptions=True)
+
+    def gate_disconnect(self) -> tuple[asyncio.Event, asyncio.Event]:
+        """Hold a disconnect open until the test releases it."""
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def disconnect() -> None:
+            started.set()
+            await release.wait()
+            self.client.is_connected = False
+            self.disconnected.set()
+
+        self.client.disconnect.side_effect = disconnect
+        return started, release
+
     async def test_unload_before_persistent_task_starts(self) -> None:
         # The mocked I/O completes synchronously, leaving keepalive queued.
         await self.connection.async_poll()
@@ -207,6 +231,221 @@ class PersistentConnectionTests(unittest.IsolatedAsyncioTestCase):
             await self.connection.async_poll()
         await self.connection.async_unload()
 
+        self.assert_disconnected_once()
+
+    async def test_cancelled_poll_holds_lock_until_disconnect_finishes(self) -> None:
+        self.connection._persistent_connection_enabled = False
+        disconnect_started, release_disconnect = self.gate_disconnect()
+        poll = asyncio.create_task(self.connection.async_poll())
+        unload = None
+        try:
+            await self.wait_for_event(disconnect_started)
+            poll.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(poll.done())
+            self.assertTrue(self.connection._lock.locked())
+
+            unload = asyncio.create_task(self.connection.async_unload())
+            await asyncio.sleep(0)
+            self.assertFalse(unload.done())
+            self.assertTrue(self.client.is_connected)
+        finally:
+            release_disconnect.set()
+            tasks = [poll] if unload is None else [poll, unload]
+            results = await self.collect_tasks(*tasks)
+            await self.wait_for_event(self.disconnected)
+
+        self.assertIsInstance(results[0], asyncio.CancelledError)
+        self.assertIsNone(results[1])
+        self.assertFalse(self.connection._lock.locked())
+        self.assert_disconnected_once()
+
+    async def test_repeated_cancellation_drains_reset_and_disconnect(self) -> None:
+        reset_started = asyncio.Event()
+        release_reset = asyncio.Event()
+        disconnect_started, release_disconnect = self.gate_disconnect()
+
+        async def reset(client) -> bool:
+            reset_started.set()
+            await release_reset.wait()
+            return False
+
+        self.connection._async_send_reset_buffer_packet.side_effect = reset
+        cleanup = asyncio.create_task(
+            self.connection._async_disconnect_client(self.client)
+        )
+        try:
+            await self.wait_for_event(reset_started)
+            for _ in range(2):
+                cleanup.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(cleanup.done())
+                self.client.disconnect.assert_not_awaited()
+
+            release_reset.set()
+            await self.wait_for_event(disconnect_started)
+            for _ in range(2):
+                cleanup.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(cleanup.done())
+                self.assertTrue(self.client.is_connected)
+        finally:
+            release_reset.set()
+            release_disconnect.set()
+            results = await self.collect_tasks(cleanup)
+            await self.wait_for_event(self.disconnected)
+
+        self.assertIsInstance(results[0], asyncio.CancelledError)
+        self.connection._async_send_reset_buffer_packet.assert_awaited_once()
+        self.assert_disconnected_once()
+
+    async def test_cancel_during_normal_persistent_teardown(self) -> None:
+        self.connection._async_request_dashboard = AsyncMock(return_value=(False, False))
+        self.connection._persistent_poll_interval = 0
+        disconnect_started, release_disconnect = self.gate_disconnect()
+        with patch.object(connection_module, "MIN_PERSISTENT_POLL_INTERVAL_SECONDS", 0):
+            await self.connection.async_poll()
+            persistent = self.connection._persistent_task
+            try:
+                await self.wait_for_event(disconnect_started)
+                persistent.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(persistent.done())
+                self.assertTrue(self.client.is_connected)
+            finally:
+                release_disconnect.set()
+                results = await self.collect_tasks(persistent)
+                await self.wait_for_event(self.disconnected)
+
+        # A bare raise outside the except block used to replace cancellation
+        # during normal teardown with RuntimeError("No active exception ...").
+        self.assertIsInstance(results[0], asyncio.CancelledError)
+        self.assert_disconnected_once()
+
+    async def test_concurrent_pending_stops_share_disconnect_until_complete(self) -> None:
+        disconnect_started, release_disconnect = self.gate_disconnect()
+        # Queue both stoppers ahead of the persistent task's first step.
+        disable = asyncio.create_task(
+            self.connection.async_set_persistent_connection_enabled(False)
+        )
+        unload = asyncio.create_task(self.connection.async_unload())
+        await self.connection.async_poll()
+        try:
+            await self.wait_for_event(disconnect_started)
+            self.assertFalse(disable.done())
+            self.assertFalse(unload.done())
+            disable.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(disable.done())
+            self.assertFalse(unload.done())
+            self.assertTrue(self.client.is_connected)
+        finally:
+            release_disconnect.set()
+            results = await self.collect_tasks(disable, unload)
+            await self.wait_for_event(self.disconnected)
+
+        self.assertIsInstance(results[0], asyncio.CancelledError)
+        self.assertIsNone(results[1])
+        self.assert_disconnected_once()
+
+    async def test_reset_timeout_still_disconnects(self) -> None:
+        reset_cancelled = asyncio.Event()
+
+        async def reset(client) -> bool:
+            try:
+                await asyncio.Future()
+            finally:
+                reset_cancelled.set()
+
+        self.connection._async_send_reset_buffer_packet.side_effect = reset
+        with (
+            patch.object(connection_module, "_RESET_BUFFER_TIMEOUT_SECONDS", 0.001),
+            self.assertLogs(connection_module._LOGGER, level="WARNING") as logs,
+        ):
+            async with asyncio.timeout(1):
+                await self.connection._async_disconnect_client(self.client)
+
+        self.assertTrue(reset_cancelled.is_set())
+        self.assertTrue(any("reset" in message.lower() for message in logs.output))
+        self.assertTrue(any("test-valve" in message for message in logs.output))
+        self.assert_disconnected_once()
+
+    async def test_disconnect_timeout_finishes_and_logs(self) -> None:
+        disconnect_cancelled = asyncio.Event()
+
+        async def disconnect() -> None:
+            try:
+                await asyncio.Future()
+            finally:
+                disconnect_cancelled.set()
+
+        self.client.disconnect.side_effect = disconnect
+        with (
+            patch.object(connection_module, "_DISCONNECT_TIMEOUT_SECONDS", 0.001),
+            self.assertLogs(connection_module._LOGGER, level="WARNING") as logs,
+        ):
+            async with asyncio.timeout(1):
+                await self.connection._async_disconnect_client(self.client)
+
+        self.client.disconnect.assert_awaited_once()
+        self.assertTrue(disconnect_cancelled.is_set())
+        self.assertTrue(any("disconnect" in message.lower() for message in logs.output))
+        self.assertTrue(any("test-valve" in message for message in logs.output))
+
+    async def test_reset_failure_still_attempts_disconnect(self) -> None:
+        self.connection._async_send_reset_buffer_packet.side_effect = OSError(
+            "Proxy unavailable during reset"
+        )
+        async with asyncio.timeout(1):
+            await self.connection._async_disconnect_client(self.client)
+
+        self.assert_disconnected_once()
+
+    async def test_cancelled_unload_waits_for_active_poll_disconnect(self) -> None:
+        self.connection._persistent_connection_enabled = False
+        disconnect_started, release_disconnect = self.gate_disconnect()
+        poll = asyncio.create_task(self.connection.async_poll())
+        unload = None
+        try:
+            await self.wait_for_event(disconnect_started)
+            unload = asyncio.create_task(self.connection.async_unload())
+            await asyncio.sleep(0)
+            unload.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(unload.done())
+            self.assertTrue(self.client.is_connected)
+        finally:
+            release_disconnect.set()
+            tasks = [poll] if unload is None else [poll, unload]
+            results = await self.collect_tasks(*tasks)
+            await self.wait_for_event(self.disconnected)
+
+        self.assertIsNone(results[0])
+        self.assertIsInstance(results[1], asyncio.CancelledError)
+        self.assert_disconnected_once()
+
+    async def test_cancelled_manager_shutdown_drains_connections(self) -> None:
+        manager = connection_module.ValveConnectionManager(
+            self.hass, SimpleNamespace(options={}, data={}), SimpleNamespace()
+        )
+        manager._connections[self.connection.address] = self.connection
+        disconnect_started, release_disconnect = self.gate_disconnect()
+        await self.connection.async_poll()
+        shutdown = asyncio.create_task(manager.async_shutdown())
+        try:
+            await self.wait_for_event(disconnect_started)
+            shutdown.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(shutdown.done())
+            self.assertTrue(self.client.is_connected)
+            self.assertTrue(manager._connections)
+        finally:
+            release_disconnect.set()
+            results = await self.collect_tasks(shutdown)
+            await self.wait_for_event(self.disconnected)
+
+        self.assertIsInstance(results[0], asyncio.CancelledError)
+        self.assertFalse(manager._connections)
         self.assert_disconnected_once()
 
 
