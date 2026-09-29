@@ -31,6 +31,12 @@ def _load_platform_modules() -> SimpleNamespace:
     class Entity:
         hass = None
 
+        async def async_added_to_hass(self) -> None:
+            pass
+
+        async def async_will_remove_from_hass(self) -> None:
+            pass
+
         def async_write_ha_state(self) -> None:
             self.state_writes = getattr(self, "state_writes", 0) + 1
 

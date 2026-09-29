@@ -56,10 +56,17 @@ class ValveDashboardSensor(ChandlerValveEntity, SensorEntity):
         base_name = self._attr_name
         self._attr_unique_id = f"{advertisement.address}_{unique_id_suffix}"
         self._name_suffix = name_suffix
+        self._connection = connection
         self._remove_dashboard_listener: CALLBACK_TYPE | None = None
         self._attr_name = self._apply_name_suffix(base_name, advertisement)
         self._update_from_dashboard(connection.dashboard_data, write_state=False)
-        self._remove_dashboard_listener = connection.add_dashboard_listener(
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to dashboard updates only when the entity is enabled."""
+
+        await super().async_added_to_hass()
+        self._update_from_dashboard(self._connection.dashboard_data, write_state=False)
+        self._remove_dashboard_listener = self._connection.add_dashboard_listener(
             self._handle_dashboard_update
         )
 
@@ -185,6 +192,7 @@ class ValveTimeOfDaySensor(ValveDashboardSensor):
     """Represent the current valve time reported by the dashboard."""
 
     _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_entity_registry_enabled_default = False
 
     def __init__(
         self, advertisement: ValveAdvertisement, connection: ValveConnection
