@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 
-from homeassistant.components.bluetooth import BluetoothChange
 from homeassistant.components.number import NumberEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfTime
@@ -20,7 +19,7 @@ from .const import (
     MIN_PERSISTENT_POLL_INTERVAL_SECONDS,
 )
 from .connection import ValveConnection, ValveConnectionManager
-from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
+from .discovery import ValveDiscoveryChange, ValveDiscoveryManager
 from .entity import ChandlerValveEntity
 from .models import ValveAdvertisement
 
@@ -48,11 +47,11 @@ class ValvePersistentPollIntervalNumber(ChandlerValveEntity, NumberEntity):
 
     @callback
     def async_handle_bluetooth_update(
-        self, advertisement: ValveAdvertisement, change: BluetoothChange
+        self, advertisement: ValveAdvertisement, change: ValveDiscoveryChange
     ) -> None:
         """Handle Bluetooth discovery updates for the valve."""
 
-        if change in BLUETOOTH_LOST_CHANGES:
+        if change is ValveDiscoveryChange.UNAVAILABLE:
             self._attr_available = False
         else:
             self.async_update_from_advertisement(advertisement)
@@ -123,9 +122,9 @@ async def async_setup_entry(
 
     @callback
     def _handle_discovery(
-        advertisement: ValveAdvertisement, change: BluetoothChange
+        advertisement: ValveAdvertisement, change: ValveDiscoveryChange
     ) -> None:
-        if change in BLUETOOTH_LOST_CHANGES:
+        if change is ValveDiscoveryChange.UNAVAILABLE:
             entity = entities.get(advertisement.address)
             if entity is not None:
                 entity.async_handle_bluetooth_update(advertisement, change)

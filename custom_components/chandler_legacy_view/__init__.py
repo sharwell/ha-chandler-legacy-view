@@ -112,14 +112,21 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a Chandler Legacy View config entry."""
 
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if not unload_ok:
+        return False
 
     data = hass.data[DOMAIN].pop(entry.entry_id, None)
-    if data is not None:
-        await data[DATA_CONNECTION_MANAGER].async_unload()
-        await data[DATA_DISCOVERY_MANAGER].async_unload()
-
-    if not hass.data[DOMAIN]:
-        hass.data.pop(DOMAIN)
+    try:
+        if data is not None:
+            try:
+                await data[DATA_CONNECTION_MANAGER].async_unload()
+            finally:
+                # Connection cleanup drains cancellation before re-raising it.
+                # Discovery subscriptions must still be released afterward.
+                await data[DATA_DISCOVERY_MANAGER].async_unload()
+    finally:
+        if not hass.data.get(DOMAIN):
+            hass.data.pop(DOMAIN, None)
 
     return unload_ok
 

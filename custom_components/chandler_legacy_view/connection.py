@@ -19,7 +19,6 @@ from bleak_retry_connector import (
     establish_connection,
 )
 from homeassistant.components import bluetooth
-from homeassistant.components.bluetooth import BluetoothChange
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import CALLBACK_TYPE, CoreState, HomeAssistant, callback
@@ -38,7 +37,7 @@ from .const import (
     MIN_PERSISTENT_POLL_INTERVAL_SECONDS,
 )
 from .device_registry import async_update_device_serial_number
-from .discovery import BLUETOOTH_LOST_CHANGES, ValveDiscoveryManager
+from .discovery import ValveDiscoveryChange, ValveDiscoveryManager
 from .models import ValveAdvertisement, ValveDashboardData
 
 _LOGGER = logging.getLogger(__name__)
@@ -87,6 +86,8 @@ class ValveRequestCommand(IntEnum):
 _EVB019_REQUEST_PACKET_LENGTH = 20
 _DEVICE_LIST_RESPONSE_TIMEOUT_SECONDS = 5
 _DASHBOARD_RESPONSE_TIMEOUT_SECONDS = 5
+_RESET_BUFFER_TIMEOUT_SECONDS = 5
+_DISCONNECT_TIMEOUT_SECONDS = 30
 _DASHBOARD_PACKET_COUNT = 6
 _DEFAULT_SERIAL_NUMBER = "FFFFFFFF"
 _MAX_AUTHENTICATION_ATTEMPTS = 4
@@ -98,6 +99,24 @@ _CRC_ALLOWED_POLYNOMIALS: tuple[int, ...] = tuple(
     for polynomial in range(1, 256)
     if 4 <= int.bit_count(polynomial) <= 5
 )
+
+
+async def _async_wait_for_cleanup(task: asyncio.Task[None]) -> None:
+    """Finish cleanup before propagating cancellation of its caller."""
+
+    cancelled: asyncio.CancelledError | None = None
+    try:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                # Keep a strong reference and drain the same task, even when
+                # shutdown requests cancellation more than once.
+                cancelled = exc
+        task.result()
+    finally:
+        if cancelled is not None:
+            raise cancelled
 
 
 class _ChandlerCrc8:
@@ -200,6 +219,7 @@ class ValveConnection:
         hass: HomeAssistant,
         address: str,
         passcode_getter: Callable[[str], ValvePasscodeConfiguration] | None = None,
+        connection_state_callback: Callable[[str, bool], None] | None = None,
     ) -> None:
         """Initialize the valve connection handler."""
 
@@ -227,10 +247,13 @@ class ValveConnection:
         self._dashboard_listeners: list[Callable[[ValveDashboardData | None], None]] = []
         self._authentication_listeners: list[Callable[[bool], None]] = []
         self._passcode_getter = passcode_getter
+        self._connection_state_callback = connection_state_callback
         self._crc8 = _ChandlerCrc8()
         self._persistent_connection_enabled = False
         self._persistent_poll_interval = DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS
         self._persistent_task: asyncio.Task[None] | None = None
+        self._pending_persistent_client: BaseBleakClient | None = None
+        self._persistent_stop_task: asyncio.Task[None] | None = None
 
     @property
     def address(self) -> str:
@@ -473,8 +496,10 @@ class ValveConnection:
             self.schedule_poll()
 
     def _persistent_task_active(self) -> bool:
-        """Return ``True`` if a persistent session is currently running."""
+        """Return ``True`` while a persistent session or its cleanup is active."""
 
+        if self._persistent_stop_task is not None:
+            return True
         task = self._persistent_task
         if task is None:
             return False
@@ -488,14 +513,48 @@ class ValveConnection:
     async def _async_stop_persistent_session(self) -> None:
         """Cancel the persistent polling session if one is active."""
 
-        task = self._persistent_task
-        if task is None:
-            return
+        stop_task = self._persistent_stop_task
+        if stop_task is None:
+            task = self._persistent_task
+            if task is None:
+                return
 
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-        self._persistent_task = None
+            # Claim the client before cancellation; an unstarted task cannot
+            # enter its finally block. Other stop callers must join this worker.
+            pending_client = self._pending_persistent_client
+            self._pending_persistent_client = None
+            task.cancel()
+            stop_task = asyncio.create_task(
+                self._async_finish_persistent_stop(task, pending_client)
+            )
+            self._persistent_stop_task = stop_task
+        try:
+            await _async_wait_for_cleanup(stop_task)
+        finally:
+            if self._persistent_stop_task is stop_task:
+                self._persistent_stop_task = None
+                if self._persistent_connection_enabled and not self._unloaded:
+                    # Re-enabling during teardown may have scheduled a poll
+                    # that was skipped while this stop worker still owned cleanup.
+                    self.schedule_poll()
+
+    async def _async_finish_persistent_stop(
+        self,
+        task: asyncio.Task[None],
+        pending_client: BaseBleakClient | None,
+    ) -> None:
+        """Join the cancelled session and disconnect any unclaimed client."""
+
+        try:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        finally:
+            try:
+                if pending_client is not None:
+                    await self._async_disconnect_client(pending_client)
+            finally:
+                if self._persistent_task is task:
+                    self._persistent_task = None
 
     def _can_start_persistent_session(self) -> bool:
         """Return ``True`` if a persistent session may be started."""
@@ -524,9 +583,14 @@ class ValveConnection:
         _LOGGER.debug(
             "Maintaining persistent connection to valve %s", self._address
         )
-        self._persistent_task = self._hass.loop.create_task(
-            self._async_persistent_keepalive_loop(client)
-        )
+        self._pending_persistent_client = client
+        keepalive = self._async_persistent_keepalive_loop(client)
+        try:
+            self._persistent_task = self._hass.loop.create_task(keepalive)
+        except Exception:
+            self._pending_persistent_client = None
+            keepalive.close()
+            raise
         return True
 
     async def _async_persistent_keepalive_loop(
@@ -535,6 +599,8 @@ class ValveConnection:
         """Keep the BLE connection alive and poll on a frequent schedule."""
 
         try:
+            # From this point, this coroutine's finally block owns cleanup.
+            self._pending_persistent_client = None
             while True:
                 if (
                     not self._persistent_connection_enabled
@@ -597,23 +663,17 @@ class ValveConnection:
             )
             raise
         finally:
-            cancelled = False
             try:
                 await self._async_disconnect_client(client)
-            except asyncio.CancelledError:
-                cancelled = True
+            finally:
+                self._persistent_task = None
 
-            self._persistent_task = None
-
-            if (
-                self._persistent_connection_enabled
-                and not self._unloaded
-            ):
-                self._set_connection_cooldown()
-                self.schedule_poll()
-
-            if cancelled:
-                raise
+                if (
+                    self._persistent_connection_enabled
+                    and not self._unloaded
+                ):
+                    self._set_connection_cooldown()
+                    self.schedule_poll()
 
     async def async_unload(self) -> None:
         """Prevent future polls and wait for any active poll to finish."""
@@ -621,6 +681,11 @@ class ValveConnection:
         self._unloaded = True
         self._persistent_connection_enabled = False
         self._cancel_cooldown()
+        await _async_wait_for_cleanup(asyncio.create_task(self._async_finish_unload()))
+
+    async def _async_finish_unload(self) -> None:
+        """Wait for connection cleanup, including an active one-shot poll."""
+
         await self._async_stop_persistent_session()
         async with self._lock:
             return
@@ -631,10 +696,9 @@ class ValveConnection:
         if not self.available:
             return
 
-        task_active = self._persistent_task_active()
-        if self._persistent_connection_enabled and task_active:
+        if self._persistent_task_active():
             _LOGGER.debug(
-                "Skipping poll for %s; persistent session is already active",
+                "Skipping poll for %s; persistent session or cleanup is still active",
                 self._address,
             )
             return
@@ -718,6 +782,8 @@ class ValveConnection:
             cleanup_client = client
 
             try:
+                if self._connection_state_callback is not None:
+                    self._connection_state_callback(self._address, True)
                 await self._async_fetch_device_information(client)
             except Exception:  # pragma: no cover - future protocol work may raise
                 _LOGGER.exception(
@@ -1082,33 +1148,50 @@ class ValveConnection:
         return sent
 
     async def _async_disconnect_client(self, client: BaseBleakClient) -> None:
-        """Disconnect from the valve without being interrupted by cancellation."""
+        """Drain bounded reset and disconnect attempts before releasing the client."""
 
         async def _cleanup() -> None:
-            reset_packet_sent = False
             try:
-                reset_packet_sent = await self._async_send_reset_buffer_packet(client)
-            except asyncio.CancelledError:
-                reset_packet_sent = False
-            except Exception:
-                reset_packet_sent = False
-
-            if reset_packet_sent:
                 try:
-                    await asyncio.sleep(0.1)
-                except asyncio.CancelledError:
-                    pass
+                    async with asyncio.timeout(_RESET_BUFFER_TIMEOUT_SECONDS):
+                        if await self._async_send_reset_buffer_packet(client):
+                            await asyncio.sleep(0.1)
+                except TimeoutError:
+                    _LOGGER.warning(
+                        "Timed out resetting valve %s before disconnect", self._address
+                    )
                 except Exception:
-                    pass
+                    _LOGGER.debug(
+                        "Error resetting valve %s before disconnect",
+                        self._address,
+                        exc_info=True,
+                    )
+            finally:
+                # RESET is best effort and must not use the disconnect budget.
+                try:
+                    async with asyncio.timeout(_DISCONNECT_TIMEOUT_SECONDS):
+                        await client.disconnect()
+                except TimeoutError:
+                    _LOGGER.warning(
+                        "Timed out disconnecting from valve %s; the Bluetooth "
+                        "connection may still be open",
+                        self._address,
+                    )
+                except Exception:
+                    _LOGGER.warning(
+                        "Error disconnecting from valve %s; the Bluetooth "
+                        "connection may still be open",
+                        self._address,
+                        exc_info=True,
+                    )
 
-            try:
-                await client.disconnect()
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
-
-        await asyncio.shield(_cleanup())
+        try:
+            await _async_wait_for_cleanup(asyncio.create_task(_cleanup()))
+        finally:
+            # Session availability must end even if cleanup failed or its
+            # caller was cancelled. A silent valve may have a deferred loss.
+            if self._connection_state_callback is not None:
+                self._connection_state_callback(self._address, False)
 
     async def _async_request_device_list(
         self, client: BaseBleakClient
@@ -2210,6 +2293,13 @@ class ValveConnectionManager:
             self._startup_unsub()
             self._startup_unsub = None
 
+        await _async_wait_for_cleanup(
+            asyncio.create_task(self._async_unload_connections())
+        )
+
+    async def _async_unload_connections(self) -> None:
+        """Drain all valve cleanup before releasing manager ownership."""
+
         await asyncio.gather(
             *(connection.async_unload() for connection in self._connections.values()),
             return_exceptions=True,
@@ -2219,7 +2309,7 @@ class ValveConnectionManager:
     async def async_shutdown(self) -> None:
         """Best-effort cleanup when Home Assistant stops."""
 
-        await asyncio.shield(self.async_unload())
+        await self.async_unload()
 
     @callback
     def _handle_poll_interval(self, _: datetime) -> None:
@@ -2237,11 +2327,11 @@ class ValveConnectionManager:
 
     @callback
     def _handle_discovery_event(
-        self, advertisement: ValveAdvertisement, change: BluetoothChange
+        self, advertisement: ValveAdvertisement, change: ValveDiscoveryChange
     ) -> None:
         """React to Bluetooth discovery updates from the passive scanner."""
 
-        if change in BLUETOOTH_LOST_CHANGES:
+        if change is ValveDiscoveryChange.UNAVAILABLE:
             connection = self._connections.get(advertisement.address)
             if connection is not None:
                 connection.mark_unavailable()
@@ -2259,6 +2349,7 @@ class ValveConnectionManager:
                 self._hass,
                 advertisement.address,
                 self.get_passcode,
+                self._discovery_manager.async_set_connection_state,
             )
             self._connections[advertisement.address] = connection
         connection.update_from_advertisement(advertisement)
