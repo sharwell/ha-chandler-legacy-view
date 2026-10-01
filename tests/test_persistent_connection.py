@@ -105,7 +105,15 @@ class PersistentConnectionTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.connection._persistent_connection_enabled = True
-        self.connection._async_fetch_device_information = AsyncMock()
+        async def fetch_device_information(client) -> bool:
+            self.connection._device_list_authentication_state = (
+                connection_module.ValveAuthenticationState.AUTHENTICATED
+            )
+            return True
+
+        self.connection._async_fetch_device_information = AsyncMock(
+            side_effect=fetch_device_information
+        )
         self.connection._async_send_reset_buffer_packet = AsyncMock(return_value=False)
         self.connection.schedule_poll = Mock()
         self.disconnected = asyncio.Event()

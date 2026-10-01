@@ -85,6 +85,7 @@ class ValveRequestCommand(IntEnum):
 
 _EVB019_REQUEST_PACKET_LENGTH = 20
 _DEVICE_LIST_RESPONSE_TIMEOUT_SECONDS = 5
+_DEVICE_LIST_MIN_RESPONSE_LENGTH = 18
 _DASHBOARD_RESPONSE_TIMEOUT_SECONDS = 5
 _RESET_BUFFER_TIMEOUT_SECONDS = 5
 _DISCONNECT_TIMEOUT_SECONDS = 30
@@ -181,9 +182,18 @@ class ValveAuthenticationState(IntEnum):
         return cls.UNKNOWN
 
 
+class ValveAuthenticationProtocol(Enum):
+    """Protocol learned from validated metadata or a DeviceList challenge."""
+
+    UNKNOWN = "unknown"
+    CLASSIC = "classic"
+    COUNTER = "counter"
+
+
 class ValvePasswordDecodeState(Enum):
     """State machine describing the result of a passcode decode attempt."""
 
+    UNKNOWN = "unknown"
     CLASSIC = "classic"
     VALID = "valid"
     INVALID = "invalid"
@@ -239,7 +249,8 @@ class ValveConnection:
         self._serial_number: str | None = None
         self._device_list_is_twin_valve: bool | None = None
         self._device_list_decoded_password: ValveDecodedPassword | None = None
-        self._device_list_password_state = ValvePasswordDecodeState.CLASSIC
+        self._authentication_protocol = ValveAuthenticationProtocol.UNKNOWN
+        self._device_list_password_state = ValvePasswordDecodeState.UNKNOWN
         self._device_list_password_retries = 0
         self._device_list_authentication_state = ValveAuthenticationState.UNKNOWN
         self._device_list_connection_counter: int | None = None
@@ -443,6 +454,50 @@ class ValveConnection:
         self._advertisement = advertisement
         self._available = True
         self._last_seen = dt_util.utcnow()
+        if self._authentication_protocol is ValveAuthenticationProtocol.UNKNOWN:
+            firmware = advertisement.firmware_version
+            if advertisement.is_twin_valve:
+                self._set_authentication_protocol(ValveAuthenticationProtocol.COUNTER)
+            elif firmware is not None and firmware > 0:
+                self._set_authentication_protocol(
+                    ValveAuthenticationProtocol.CLASSIC
+                    if firmware < 419 else ValveAuthenticationProtocol.COUNTER
+                )
+            elif advertisement.has_connection_counter is True:
+                self._set_authentication_protocol(ValveAuthenticationProtocol.COUNTER)
+
+    def _set_authentication_protocol(self, protocol: ValveAuthenticationProtocol) -> None:
+        """Retain a resolved protocol independently of partial advertisements."""
+
+        if protocol is self._authentication_protocol:
+            return
+        self._authentication_protocol = protocol
+        _LOGGER.debug("Valve %s authentication protocol: %s", self._address, protocol.value)
+
+    def _reset_device_list_state(self) -> None:
+        """Require fresh access confirmation without forgetting the protocol."""
+
+        self._device_list_authentication_state = ValveAuthenticationState.UNKNOWN
+        self._device_list_connection_counter = None
+        self._device_list_decoded_password = None
+        self._device_list_password_state = ValvePasswordDecodeState.UNKNOWN
+
+    def _has_dashboard_access(self) -> bool:
+        """Allow access only after authentication or confirmed unprotected access."""
+
+        if self._device_list_authentication_state == ValveAuthenticationState.AUTHENTICATED:
+            return True
+        decoded = self._device_list_decoded_password
+        return (
+            self._advertisement is not None
+            and self._advertisement.authentication_required is False
+            and self._authentication_protocol is ValveAuthenticationProtocol.CLASSIC
+            and decoded is not None
+            and decoded.state in (
+                ValvePasswordDecodeState.VALID,
+                ValvePasswordDecodeState.RECOVERED,
+            )
+        )
 
     def mark_unavailable(self) -> None:
         """Mark the valve as temporarily unavailable."""
@@ -567,14 +622,7 @@ class ValveConnection:
         if self._persistent_task_active():
             return False
 
-        advertisement = self._advertisement
-        if advertisement is not None and not advertisement.authentication_required:
-            return True
-
-        return (
-            self._device_list_authentication_state
-            == ValveAuthenticationState.AUTHENTICATED
-        )
+        return self._has_dashboard_access()
 
     def _try_begin_persistent_session(self, client: BaseBleakClient) -> bool:
         """Start a persistent polling session if conditions allow."""
@@ -755,6 +803,7 @@ class ValveConnection:
 
             connection_attempted = True
             self._cancel_cooldown()
+            self._reset_device_list_state()
 
             try:
                 async with asyncio.timeout(CONNECTION_TIMEOUT_SECONDS):
@@ -786,14 +835,15 @@ class ValveConnection:
             try:
                 if self._connection_state_callback is not None:
                     self._connection_state_callback(self._address, True)
-                await self._async_fetch_device_information(client)
+                refreshed = await self._async_fetch_device_information(client)
             except Exception:  # pragma: no cover - future protocol work may raise
                 _LOGGER.exception(
                     "Error while retrieving extended data from valve %s", self._address
                 )
             else:
-                self._last_success = dt_util.utcnow()
-                if self._try_begin_persistent_session(client):
+                if refreshed:
+                    self._last_success = dt_util.utcnow()
+                if refreshed and self._try_begin_persistent_session(client):
                     cleanup_client = None
             finally:
                 if cleanup_client is not None:
@@ -804,12 +854,12 @@ class ValveConnection:
 
     async def _async_fetch_device_information(
         self, client: BaseBleakClient
-    ) -> None:
-        """Retrieve extended diagnostic information from the valve."""
+    ) -> bool:
+        """Return whether a fresh dashboard was retrieved from the valve."""
 
         advertisement = self._advertisement
         if advertisement is None:
-            return
+            return False
 
         model = advertisement.model
         manufacturer_data_complete = advertisement.manufacturer_data_complete
@@ -820,7 +870,7 @@ class ValveConnection:
                 self._address,
                 model or "unknown model",
             )
-            return
+            return False
 
         if model is None and not manufacturer_data_complete:
             _LOGGER.debug(
@@ -834,7 +884,7 @@ class ValveConnection:
                 "Unable to send DeviceList request to valve %s; will retry on next poll",
                 self._address,
             )
-            return
+            return False
 
         if response_received:
             _LOGGER.debug(
@@ -847,12 +897,7 @@ class ValveConnection:
                 self._address,
             )
 
-        authenticated = (
-            self._device_list_authentication_state
-            == ValveAuthenticationState.AUTHENTICATED
-        )
-
-        if self._advertisement.authentication_required and not authenticated:
+        if not response_received or not self._has_dashboard_access():
             passcode = self.get_configured_passcode()
             if passcode is not None:
                 passcode = passcode.strip()
@@ -863,7 +908,7 @@ class ValveConnection:
                     "Skipping Dashboard request to valve %s; authentication is required and no passcode is configured",
                     self._address,
                 )
-                return
+                return False
 
             if self._authentication_failed and (
                 passcode == self._authentication_failed_passcode
@@ -872,28 +917,27 @@ class ValveConnection:
                     "Skipping Dashboard request to valve %s; authentication was previously attempted and failed",
                     self._address,
                 )
-                return
+                return False
 
             if self._parse_passcode(passcode) is None:
                 _LOGGER.debug(
-                    "Skipping Dashboard request to valve %s; configured passcode %r is not numeric",
+                    "Skipping Dashboard request to valve %s; configured passcode is not numeric",
                     self._address,
-                    passcode,
                 )
-                return
+                return False
 
             if self._device_list_password_state == ValvePasswordDecodeState.AUTH_NEEDED:
                 _LOGGER.debug(
                     "Skipping Dashboard request to valve %s; valve still reports that authentication is required",
                     self._address,
                 )
-                return
+                return False
 
             _LOGGER.debug(
                 "Skipping Dashboard request to valve %s; authentication has not been confirmed",
                 self._address,
             )
-            return
+            return False
 
         dashboard_request_sent, dashboard_response_received = (
             await self._async_request_dashboard(client)
@@ -903,7 +947,7 @@ class ValveConnection:
                 "Unable to send Dashboard request to valve %s; will retry on next poll",
                 self._address,
             )
-            return
+            return False
 
         if dashboard_response_received:
             _LOGGER.debug(
@@ -915,6 +959,7 @@ class ValveConnection:
                 "Valve %s did not provide a Dashboard response during this poll",
                 self._address,
             )
+        return dashboard_response_received
 
     @staticmethod
     def _create_request_payload(request: ValveRequestCommand | int) -> bytes:
@@ -1200,6 +1245,7 @@ class ValveConnection:
     ) -> tuple[bool, bool]:
         """Send a DeviceList request and wait for a matching response packet."""
 
+        self._reset_device_list_state()
         loop = asyncio.get_running_loop()
         response_future: asyncio.Future[bytes] | None = loop.create_future()
 
@@ -1274,9 +1320,8 @@ class ValveConnection:
             passcode_value = self._parse_passcode(passcode)
             if passcode is not None and passcode_value is None:
                 _LOGGER.debug(
-                    "Skipping authentication for valve %s; configured passcode %r is not numeric",
+                    "Skipping authentication for valve %s; configured passcode is not numeric",
                     self._address,
-                    passcode,
                 )
 
             if self._should_attempt_authentication(passcode, passcode_value):
@@ -1303,6 +1348,12 @@ class ValveConnection:
                         sent_attempts = attempt
                         if authenticated:
                             break
+                        if (
+                            self._device_list_authentication_state
+                            != ValveAuthenticationState.NOT_AUTHENTICATED
+                        ):
+                            # A missing or unrecognized reply is not a rejected PIN.
+                            break
                         if attempt < _MAX_AUTHENTICATION_ATTEMPTS:
                             _LOGGER.debug(
                                 "Valve %s authentication attempt %d/%d failed; retrying",
@@ -1314,7 +1365,12 @@ class ValveConnection:
                             if next_counter is not None:
                                 connection_counter = next_counter
 
-                    if not authenticated and sent_attempts >= _MAX_AUTHENTICATION_ATTEMPTS:
+                    if (
+                        not authenticated
+                        and sent_attempts >= _MAX_AUTHENTICATION_ATTEMPTS
+                        and self._device_list_authentication_state
+                        == ValveAuthenticationState.NOT_AUTHENTICATED
+                    ):
                         self._record_authentication_failure(passcode)
 
             return True, response_received
@@ -1379,7 +1435,11 @@ class ValveConnection:
     ) -> bool:
         """Return ``True`` if authentication should be attempted."""
 
-        if self._device_list_password_state != ValvePasswordDecodeState.AUTH_NEEDED:
+        if (
+            self._authentication_protocol is not ValveAuthenticationProtocol.COUNTER
+            or self._device_list_authentication_state
+            != ValveAuthenticationState.NOT_AUTHENTICATED
+        ):
             return False
 
         if passcode is None:
@@ -1415,6 +1475,7 @@ class ValveConnection:
     ) -> tuple[bool, bool]:
         """Send the authentication payload and wait for a DeviceList response."""
 
+        self._reset_device_list_state()
         payload = self._create_password_buffer(connection_counter, passcode_value)
         _LOGGER.debug(
             "Attempting authentication with valve %s using connection counter %s",
@@ -1512,19 +1573,7 @@ class ValveConnection:
         for index in range(11, _EVB019_REQUEST_PACKET_LENGTH):
             buffer[index] = _CRC_RANDOM.randint(1, 255)
 
-        payload = bytes(buffer)
-        _LOGGER.debug(
-            "Valve %s authentication payload -> counter=%s digits=%s polynomial=%s seed=%s xor=%s intermediate=%s payload=%s",
-            self._address,
-            counter,
-            digits,
-            polynomial,
-            random_seed,
-            random_xor,
-            intermediate,
-            payload.hex(),
-        )
-        return payload
+        return bytes(buffer)
 
     @staticmethod
     def _get_password_digits(passcode: int) -> tuple[int, int, int, int]:
@@ -2036,24 +2085,23 @@ class ValveConnection:
     def _handle_device_list_packet(self, packet: bytes) -> None:
         """Update internal state from a DeviceList response packet."""
 
+        if not self._is_device_list_packet(packet):
+            self._reset_device_list_state()
+            return
         self._device_list_is_twin_valve = bool(packet[2])
 
         decoded_password = self._decode_device_list_password(packet)
         self._device_list_decoded_password = decoded_password
         if decoded_password is not None:
             _LOGGER.debug(
-                "Valve %s DeviceList passcode decode -> state=%s auth=%s requires_auth=%s passcode=%s",
+                "Valve %s DeviceList decode -> protocol=%s state=%s auth=%s requires_auth=%s",
                 self._address,
+                self._authentication_protocol.value,
                 decoded_password.state.name,
                 decoded_password.authentication_state.name,
                 decoded_password.authentication_required,
-                decoded_password.passcode if decoded_password.passcode else "<empty>",
             )
-            if (
-                decoded_password.authentication_state
-                == ValveAuthenticationState.AUTHENTICATED
-                or not decoded_password.authentication_required
-            ):
+            if self._has_dashboard_access():
                 if self._authentication_failed:
                     _LOGGER.debug(
                         "Valve %s reported authenticated state; clearing previous "
@@ -2061,6 +2109,11 @@ class ValveConnection:
                         self._address,
                     )
                 self._set_authentication_failed(False)
+        else:
+            _LOGGER.debug(
+                "Valve %s DeviceList access unresolved (length=%s, status=%s, protocol=%s)",
+                self._address, len(packet), packet[7], self._authentication_protocol.value,
+            )
 
         serial_number = self._extract_serial_number(packet)
         if serial_number is None:
@@ -2107,7 +2160,9 @@ class ValveConnection:
     def _is_device_list_packet(packet: bytes) -> bool:
         """Return ``True`` if the provided payload matches the DeviceList format."""
 
-        if len(packet) < 3:
+        # Require the complete set of fields used by the supported decoder,
+        # including serial data. A short echo must not select an auth protocol.
+        if len(packet) < _DEVICE_LIST_MIN_RESPONSE_LENGTH:
             return False
 
         opcode = int(ValveRequestCommand.DEVICE_LIST)
@@ -2121,46 +2176,46 @@ class ValveConnection:
     ) -> ValveDecodedPassword | None:
         """Return the decoded passcode reported within a DeviceList payload."""
 
-        if len(packet) <= 7:
+        if not self._is_device_list_packet(packet):
             return None
 
         status = packet[7]
         advertisement = self._advertisement
-        firmware_version = advertisement.firmware_version if advertisement else None
-        has_connection_counter = (
-            advertisement.has_connection_counter if advertisement else False
-        )
-        is_twin_valve = bool(self._device_list_is_twin_valve)
-
-        use_classic_decode = False
-        if not is_twin_valve:
-            if firmware_version is not None:
-                use_classic_decode = firmware_version < 420 and firmware_version != 419
+        if self._authentication_protocol is ValveAuthenticationProtocol.UNKNOWN:
+            # With classic encoding, status 0 makes the last decoded digit
+            # signed(byte_d // 4 + 112), which can never be 0..9. A complete
+            # response carrying this challenge identifies counter auth. Status
+            # 128 is ambiguous with classic encoding, so it cannot bootstrap it.
+            if status == ValveAuthenticationState.NOT_AUTHENTICATED:
+                self._set_authentication_protocol(ValveAuthenticationProtocol.COUNTER)
+            elif packet[2] == 1:
+                self._set_authentication_protocol(ValveAuthenticationProtocol.COUNTER)
             else:
-                use_classic_decode = not has_connection_counter
-
-        if use_classic_decode:
-            if len(packet) <= 11:
                 return None
+
+        if self._authentication_protocol is ValveAuthenticationProtocol.CLASSIC:
             return self._decode_classic_password(
                 status, packet[8], packet[9], packet[10], packet[11]
             )
 
-        connection_counter: int | None = None
-        if len(packet) > 11:
-            connection_counter = packet[11] & 0xFF
-            if advertisement is not None:
-                previous_counter = advertisement.connection_counter
-                if previous_counter != connection_counter:
-                    _LOGGER.debug(
-                        "Valve %s DeviceList connection counter updated from %s to %s",
-                        self._address,
-                        previous_counter,
-                        connection_counter,
-                    )
-                advertisement.connection_counter = connection_counter
-        elif advertisement and advertisement.connection_counter is not None:
-            connection_counter = advertisement.connection_counter
+        if ValveAuthenticationState.from_status(status) == ValveAuthenticationState.UNKNOWN:
+            self._device_list_authentication_state = ValveAuthenticationState.UNKNOWN
+            self._device_list_connection_counter = None
+            self._device_list_password_state = ValvePasswordDecodeState.UNKNOWN
+            return None
+
+        connection_counter = packet[11]
+        if advertisement is not None:
+            advertisement.has_connection_counter = True
+            if advertisement.authentication_required is None:
+                advertisement.authentication_required = True
+            previous_counter = advertisement.connection_counter
+            if previous_counter != connection_counter:
+                _LOGGER.debug(
+                    "Valve %s DeviceList connection counter updated from %s to %s",
+                    self._address, previous_counter, connection_counter,
+                )
+            advertisement.connection_counter = connection_counter
 
         self._device_list_connection_counter = connection_counter
         return self._decode_auth_needed_password(status, connection_counter)

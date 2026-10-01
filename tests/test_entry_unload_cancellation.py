@@ -84,7 +84,15 @@ class EntryUnloadCancellationTests(unittest.IsolatedAsyncioTestCase):
         connection = manager.get_connection("test-valve")
         self.assertIsNotNone(connection)
         connection._persistent_connection_enabled = True
-        connection._async_fetch_device_information = AsyncMock()
+        async def fetch_device_information(client) -> bool:
+            connection._device_list_authentication_state = (
+                production.connection.ValveAuthenticationState.AUTHENTICATED
+            )
+            return True
+
+        connection._async_fetch_device_information = AsyncMock(
+            side_effect=fetch_device_information
+        )
         connection._async_send_reset_buffer_packet = AsyncMock(return_value=False)
 
         disconnect_started = asyncio.Event()

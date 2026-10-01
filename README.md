@@ -39,6 +39,14 @@ enabled or disabled setting; disable an existing Time of Day sensor manually
 to stop its updates. The integration still reads the valve clock during normal
 dashboard polling when this sensor is disabled.
 
+Firmware and model information are accepted only from a recognized complete
+advertisement. Short status packets refresh presence without replacing trusted
+device metadata. After an integration reload, firmware may remain unknown until
+a complete advertisement arrives; an old incorrect value such as `C0.00` is
+cleared. Clock and water-use polling can recover independently when a complete
+DeviceList response identifies counter-based authentication. A successful
+connection alone does not count as a successful dashboard update.
+
 This repository currently focuses on the scaffolding required for discovery and
 entity creation. Additional device metadata, richer entities, diagnostics, and
 configuration options will follow as device details become available.

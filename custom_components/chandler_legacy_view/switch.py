@@ -92,7 +92,7 @@ class ValveAuthenticationLockoutSwitch(ChandlerValveEntity, SwitchEntity):
         self._connection = connection
         self._attr_unique_id = f"{advertisement.address}_authentication_lockout"
         self._attr_name = f"{self._attr_name} Authentication Lockout"
-        self._attr_available = advertisement.authentication_required
+        self._attr_available = advertisement.authentication_required is True
         self._attr_is_on = connection.authentication_lockout
         self._remove_authentication_listener: CALLBACK_TYPE | None = (
             connection.add_authentication_listener(self._handle_authentication_update)
@@ -108,7 +108,7 @@ class ValveAuthenticationLockoutSwitch(ChandlerValveEntity, SwitchEntity):
             self._attr_available = False
         else:
             self.async_update_from_advertisement(advertisement)
-            self._attr_available = advertisement.authentication_required
+            self._attr_available = advertisement.authentication_required is True
 
         if self.hass is not None:
             self.async_write_ha_state()
