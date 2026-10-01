@@ -336,7 +336,15 @@ class AvailabilityPlatformTests(unittest.IsolatedAsyncioTestCase):
         connection = manager.get_connection(info.address)
         self.assertIsNotNone(connection)
         await connection.async_set_persistent_connection_enabled(True)
-        connection._async_fetch_device_information = AsyncMock()
+        async def fetch_device_information(client) -> bool:
+            connection._device_list_authentication_state = (
+                production.connection.ValveAuthenticationState.AUTHENTICATED
+            )
+            return True
+
+        connection._async_fetch_device_information = AsyncMock(
+            side_effect=fetch_device_information
+        )
         connection._async_send_reset_buffer_packet = AsyncMock(return_value=False)
         client = SimpleNamespace(is_connected=True)
         availability_during_disconnect = []

@@ -26,7 +26,7 @@ class ValveAdvertisement:
     model: str | None = None
     is_twin_valve: bool = False
     is_400_series: bool = False
-    has_connection_counter: bool = False
+    has_connection_counter: bool | None = None
     valve_data_parsed: bool = False
     manufacturer_data_complete: bool = True
     valve_status: int | None = None
@@ -42,7 +42,7 @@ class ValveAdvertisement:
     connection_counter: int | None = None
     bootloader_version: int | None = None
     radio_protocol_version: int | None = None
-    authentication_required: bool = False
+    authentication_required: bool | None = None
 
     @property
     def is_metered_softener(self) -> bool:

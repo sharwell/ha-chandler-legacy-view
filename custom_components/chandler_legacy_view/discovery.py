@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Dict, Mapping
@@ -133,38 +133,6 @@ def _matches_valve_prefix(name: str | None) -> bool:
     )
 
 
-def _flatten_manufacturer_data(value: Any) -> bytes | None:
-    """Collapse a manufacturer data value into a single ``bytes`` object."""
-
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        return bytes(value)
-
-    if isinstance(value, str):
-        return value.encode()
-
-    if isinstance(value, int):
-        if 0 <= value <= 255:
-            return bytes((value,))
-        return None
-
-    if isinstance(value, Mapping):
-        return _flatten_manufacturer_data(value.values())
-
-    if isinstance(value, Iterable):
-        flattened = bytearray()
-        for item in value:
-            part = _flatten_manufacturer_data(item)
-            if part is None:
-                return None
-            flattened.extend(part)
-        return bytes(flattened)
-
-    try:
-        return bytes(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def _decode_firmware_number(value: int) -> int:
     """Decode Chandler's unusual firmware byte representation."""
 
@@ -186,7 +154,7 @@ class _ManufacturerClassification:
     model: str | None = None
     is_twin_valve: bool = False
     is_400_series: bool = False
-    has_connection_counter: bool = False
+    has_connection_counter: bool | None = None
     valve_data_parsed: bool = False
     manufacturer_data_complete: bool = True
     valve_status: int | None = None
@@ -203,31 +171,7 @@ class _ManufacturerClassification:
     bootloader_version: int | None = None
     radio_protocol_version: int | None = None
     ignore_advertisement: bool = False
-    authentication_required: bool = False
-
-
-def _has_manufacturer_data_values(value: Any) -> bool:
-    """Return ``True`` if the manufacturer data value contains at least one item."""
-
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        return len(value) > 0
-
-    if isinstance(value, str):
-        return len(value) > 0
-
-    if isinstance(value, int):
-        return True
-
-    if isinstance(value, Mapping):
-        return any(_has_manufacturer_data_values(item) for item in value.values())
-
-    if isinstance(value, Iterable):
-        for item in value:
-            if _has_manufacturer_data_values(item):
-                return True
-        return False
-
-    return value is not None
+    authentication_required: bool | None = None
 
 
 def _extract_raw_manufacturer_segments(
@@ -270,7 +214,7 @@ def _extract_raw_manufacturer_segments(
                 segment_length,
                 total_length,
             )
-            break
+            return []
 
         ad_type = data[index]
         index += 1
@@ -334,10 +278,21 @@ def _combine_manufacturer_segments(segments: list[bytes]) -> bytes | None:
 def _get_full_manufacturer_payload(
     raw_payload: Any, raw_advertisement: bytes | bytearray | memoryview | None
 ) -> bytes | None:
-    """Return the complete Chandler manufacturer payload."""
+    """Normalize one observation without mixing raw and cached manufacturer data."""
 
-    segments = _extract_raw_manufacturer_segments(raw_advertisement)
-    return _combine_manufacturer_segments(segments)
+    if raw_advertisement is not None:
+        if not isinstance(raw_advertisement, (bytes, bytearray, memoryview)):
+            return None
+        # Home Assistant can retain older manufacturer records. If raw data is
+        # available, only segments from this advertisement describe this update.
+        segments = _extract_raw_manufacturer_segments(raw_advertisement)
+        return _combine_manufacturer_segments(segments)
+
+    if not isinstance(raw_payload, (bytes, bytearray, memoryview)) or not raw_payload:
+        return None
+    # BluetoothServiceInfoBleak keys structured data by company identifier and
+    # excludes that identifier from the corresponding bytes.
+    return CSI_MANUFACTURER_ID.to_bytes(2, "little") + bytes(raw_payload)
 
 
 def _classify_manufacturer_data(
@@ -347,14 +302,6 @@ def _classify_manufacturer_data(
     """Identify Chandler valves and extract firmware details from manufacturer data."""
 
     raw_payload = manufacturer_data.get(CSI_MANUFACTURER_ID)
-    if raw_payload is None or not _has_manufacturer_data_values(raw_payload):
-        _LOGGER.debug(
-            "Manufacturer data for Chandler valve (id %s) was missing or empty: %s",
-            CSI_MANUFACTURER_ID,
-            raw_payload,
-        )
-        return _ManufacturerClassification(True, manufacturer_data_complete=False)
-
     payload = _get_full_manufacturer_payload(raw_payload, raw_advertisement)
     if payload is None:
         _LOGGER.debug(
@@ -371,15 +318,19 @@ def _classify_manufacturer_data(
             CSI_MANUFACTURER_ID,
             payload,
         )
-        return _ManufacturerClassification(True)
+        return _ManufacturerClassification(True, manufacturer_data_complete=False)
 
-    if len(payload) < 4:
+    # Short status/counter packets do not contain firmware. In particular their
+    # final zero bytes must never be interpreted as a complete C0.00 record.
+    # These lengths include the two-byte company identifier.
+    if len(payload) not in (10, 11, 12, 14):
         _LOGGER.debug(
-            "Manufacturer data for Chandler valve (id %s) was too short to parse firmware: %s",
+            "Partial or unsupported Chandler manufacturer layout (id %s, length %s): %s",
             CSI_MANUFACTURER_ID,
-            payload,
+            len(payload),
+            payload.hex(),
         )
-        return _ManufacturerClassification(True)
+        return _ManufacturerClassification(True, manufacturer_data_complete=False)
 
     firmware_major_raw = payload[-2]
     firmware_minor_raw = payload[-1]
@@ -388,11 +339,29 @@ def _classify_manufacturer_data(
     firmware_minor_converted = _decode_firmware_number(firmware_minor_raw)
     firmware_minor = 99 if firmware_minor_converted >= 250 else firmware_minor_converted
     firmware_version = firmware_major * 100 + firmware_minor
-    model: str | None
+    is_twin_valve = 100 <= firmware_version <= 199
+    has_connection_counter = is_twin_valve or firmware_version >= 412
     if firmware_version >= 600:
         model = "Evb034"
+        valid_layout = len(payload) == 10
+    elif has_connection_counter:
+        model = "Evb019"
+        valid_layout = len(payload) == 14 and (
+            not is_twin_valve or payload[7] == 100
+        )
     else:
         model = "Evb019"
+        # The legacy layout carries bootloader, series, valve type, and the
+        # final firmware pair; its longer variant also carries radio version.
+        valid_layout = len(payload) in (11, 12)
+
+    if firmware_version == 0 or not valid_layout:
+        _LOGGER.debug(
+            "Unsupported Chandler manufacturer layout (length %s); firmware and capabilities remain unknown: %s",
+            len(payload),
+            payload.hex(),
+        )
+        return _ManufacturerClassification(True, manufacturer_data_complete=False)
 
     classification = _ManufacturerClassification(
         True,
@@ -402,13 +371,10 @@ def _classify_manufacturer_data(
         model,
     )
 
-    classification.is_twin_valve = 100 <= firmware_version <= 199
+    classification.is_twin_valve = is_twin_valve
     classification.is_400_series = 400 <= firmware_version <= 499
 
-    classification.has_connection_counter = classification.is_twin_valve or (
-        classification.firmware_version is not None
-        and classification.firmware_version >= 412
-    )
+    classification.has_connection_counter = has_connection_counter
 
     if classification.model == "Evb034":
         _parse_evb034_payload(payload, classification)
@@ -663,6 +629,8 @@ class ValveDiscoveryManager:
                 return
 
             raw_advertisement = getattr(service_info, "raw", None)
+            # Keep an invalid-present value distinct from an absent raw record:
+            # conversion failure must not enable fallback to cached metadata.
             raw_for_classification = raw_advertisement
             if raw_advertisement is None:
                 _LOGGER.debug(
@@ -715,21 +683,6 @@ class ValveDiscoveryManager:
                     service_info.manufacturer_data,
                 )
                 return
-
-            if (
-                (
-                    classification.firmware_version is not None
-                    and classification.firmware_version >= 412
-                )
-                or classification.is_twin_valve
-            ) and not classification.valve_data_parsed:
-                _LOGGER.debug(
-                    "Bluetooth advertisement from %s had incomplete manufacturer data for firmware %s",
-                    service_info.address,
-                    classification.firmware_version
-                    if classification.firmware_version is not None
-                    else "unknown",
-                )
 
             is_clack_valve = _is_clack_valve(service_info.name)
             classification.valve_type = _map_valve_type(
@@ -791,19 +744,14 @@ class ValveDiscoveryManager:
                         connectable=True,
                     )
                 )
-            if classification.firmware_version is not None:
-                _LOGGER.debug(
-                    "Valve %s seen (RSSI=%s, firmware=%s)",
-                    service_info.address,
-                    service_info.rssi,
-                    classification.firmware_version,
-                )
-            else:
-                _LOGGER.debug(
-                    "Valve %s seen (RSSI=%s)",
-                    service_info.address,
-                    service_info.rssi,
-                )
+            _LOGGER.debug(
+                "Valve %s seen (RSSI=%s, effective firmware=%s, manufacturer data=%s)",
+                service_info.address,
+                service_info.rssi,
+                advertisement.firmware_version
+                if advertisement.firmware_version is not None else "unknown",
+                "complete" if classification.manufacturer_data_complete else "partial",
+            )
         else:
             _LOGGER.debug(
                 "Ignoring Bluetooth change %s for %s", change, service_info.address
