@@ -6,9 +6,10 @@ import asyncio
 import contextlib
 import inspect
 import logging
+import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum, IntEnum
 from random import SystemRandom
 
@@ -26,15 +27,29 @@ from homeassistant.helpers.event import async_call_later, async_track_time_inter
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    BLE_OPERATION_TIMEOUT_SECONDS,
     CONF_DEFAULT_PASSCODE,
     CONF_DEVICE_PASSCODES,
     CONNECTION_MIN_RETRY_INTERVAL,
     CONNECTION_POLL_INTERVAL,
     CONNECTION_TIMEOUT_SECONDS,
+    DATA_AGE_NONE,
+    DATA_AGE_OLDEST,
+    DATA_AGE_TIERS,
     DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS,
     DEFAULT_VALVE_PASSCODE,
+    HEAL_POLL_MIN_INTERVAL_SECONDS,
     MAX_PERSISTENT_POLL_INTERVAL_SECONDS,
     MIN_PERSISTENT_POLL_INTERVAL_SECONDS,
+    PERSISTENT_RECONNECT_DELAY_SECONDS,
+    PERSISTENT_REQUEST_TIMEOUT_SECONDS,
+    POLL_FETCH_TIMEOUT_SECONDS,
+    POLL_HARD_LIMIT_SECONDS,
+    STALE_AFTER_ON_DEMAND_SECONDS,
+    STALE_AFTER_PERSISTENT_INTERVALS,
+    STALE_AFTER_PERSISTENT_MIN_SECONDS,
+    UNLOAD_TIMEOUT_SECONDS,
+    WATCHDOG_INTERVAL,
 )
 from .device_registry import async_update_device_serial_number
 from .discovery import ValveDiscoveryChange, ValveDiscoveryManager
@@ -102,14 +117,32 @@ _CRC_ALLOWED_POLYNOMIALS: tuple[int, ...] = tuple(
 )
 
 
-async def _async_wait_for_cleanup(task: asyncio.Task[None]) -> None:
-    """Finish cleanup before propagating cancellation of its caller."""
+async def _async_wait_for_cleanup(
+    task: asyncio.Task[None], timeout: float | None = None
+) -> None:
+    """Finish cleanup before propagating cancellation of its caller.
+
+    With ``timeout`` the wait is bounded: cleanup that has not finished by then
+    is cancelled and abandoned so a stalled Bluetooth call cannot block unload.
+    """
 
     cancelled: asyncio.CancelledError | None = None
+    deadline = None if timeout is None else asyncio.get_running_loop().time() + timeout
     try:
         while not task.done():
+            remaining = None
+            if deadline is not None:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    _LOGGER.warning(
+                        "Abandoning Bluetooth cleanup that did not finish within "
+                        "%g seconds",
+                        timeout,
+                    )
+                    task.cancel()
+                    return
             try:
-                await asyncio.shield(task)
+                await asyncio.wait({task}, timeout=remaining)
             except asyncio.CancelledError as exc:
                 # Keep a strong reference and drain the same task, even when
                 # shutdown requests cancellation more than once.
@@ -118,6 +151,24 @@ async def _async_wait_for_cleanup(task: asyncio.Task[None]) -> None:
     finally:
         if cancelled is not None:
             raise cancelled
+
+
+async def _async_bounded(awaitable, timeout: float, description: str):
+    """Await a Bluetooth call, raising ``TimeoutError`` if it stalls.
+
+    Bluetooth stacks and proxies can leave a GATT call pending forever when the
+    link dies silently. Bounding each call turns that into an ordinary failure
+    that callers already handle by disconnecting and retrying.
+    """
+
+    try:
+        async with asyncio.timeout(timeout):
+            return await awaitable
+    except TimeoutError:
+        _LOGGER.warning(
+            "Timed out after %g seconds waiting for %s", timeout, description
+        )
+        raise
 
 
 class _ChandlerCrc8:
@@ -267,6 +318,26 @@ class ValveConnection:
         self._persistent_task: asyncio.Task[None] | None = None
         self._pending_persistent_client: BaseBleakClient | None = None
         self._persistent_stop_task: asyncio.Task[None] | None = None
+        # Watchdog bookkeeping, all in ``loop.time()`` seconds.
+        self._poll_task: asyncio.Task[None] | None = None
+        self._poll_started: float | None = None
+        self._persistent_progress: float | None = None
+        self._persistent_stop_started: float | None = None
+        self._last_heal_poll: float | None = None
+        self._created_at = self._monotonic()
+        # Freshness of the data, in ``loop.time()`` seconds and as a UTC time.
+        self._last_dashboard_monotonic: float | None = None
+        self._last_dashboard_at: datetime | None = None
+        self._data_stale = False
+        self._freshness_listeners: list[Callable[[bool], None]] = []
+        self._age_listeners: list[Callable[[], None]] = []
+        self._age_seen: tuple[str, float] | None = None
+
+    @staticmethod
+    def _monotonic() -> float:
+        """Return a monotonic clock reading in seconds."""
+
+        return time.monotonic()
 
     @property
     def address(self) -> str:
@@ -372,6 +443,7 @@ class ValveConnection:
                 "Persistent connection requested for valve %s", self._address
             )
             self._persistent_connection_enabled = True
+            self._update_freshness()
             self._cancel_cooldown()
             self._next_connection_time = None
             self.schedule_poll()
@@ -384,6 +456,7 @@ class ValveConnection:
             "Persistent connection disabled for valve %s", self._address
         )
         self._persistent_connection_enabled = False
+        self._update_freshness()
         await self._async_stop_persistent_session()
 
     async def async_set_persistent_poll_interval(self, seconds: float) -> None:
@@ -408,6 +481,7 @@ class ValveConnection:
             value,
         )
         self._persistent_poll_interval = value
+        self._update_freshness()
 
     def _get_passcode_configuration(self) -> ValvePasscodeConfiguration:
         """Return the stored passcode configuration for this valve."""
@@ -447,6 +521,152 @@ class ValveConnection:
                 self._dashboard_listeners.remove(listener)
 
         return _remove_listener
+
+    @property
+    def last_data_update(self) -> datetime | None:
+        """Return when a complete dashboard was last received, if ever."""
+
+        return self._last_dashboard_at
+
+    @property
+    def stale_after_seconds(self) -> float:
+        """Return how old dashboard data may get before it is considered stale."""
+
+        if self._persistent_connection_enabled:
+            return max(
+                STALE_AFTER_PERSISTENT_MIN_SECONDS,
+                STALE_AFTER_PERSISTENT_INTERVALS * self._persistent_poll_interval,
+            )
+        return STALE_AFTER_ON_DEMAND_SECONDS
+
+    @property
+    def data_is_stale(self) -> bool:
+        """Return ``True`` if no fresh dashboard arrived within the stale limit.
+
+        A valve that has never answered counts from when it was first seen, so
+        a valve that never produces data eventually reports stale too.
+        """
+
+        reference = (
+            self._last_dashboard_monotonic
+            if self._last_dashboard_monotonic is not None
+            else self._created_at
+        )
+        return self._monotonic() - reference > self.stale_after_seconds
+
+    def add_freshness_listener(
+        self, listener: Callable[[bool], None]
+    ) -> CALLBACK_TYPE:
+        """Register a callback invoked with ``True`` when data turns stale."""
+
+        self._freshness_listeners.append(listener)
+
+        def _remove_listener() -> None:
+            with contextlib.suppress(ValueError):
+                self._freshness_listeners.remove(listener)
+
+        return _remove_listener
+
+    @property
+    def data_age_label(self) -> str:
+        """Describe how old the data is, in coarse steps (see ``DATA_AGE_TIERS``)."""
+
+        if self._last_dashboard_monotonic is None:
+            return DATA_AGE_NONE
+        age = self._monotonic() - self._last_dashboard_monotonic
+        for limit, label in DATA_AGE_TIERS:
+            if age < limit:
+                return label
+        return DATA_AGE_OLDEST
+
+    def add_age_listener(self, listener: Callable[[], None]) -> CALLBACK_TYPE:
+        """Register a callback for when the data age step or the stale limit changes."""
+
+        self._age_listeners.append(listener)
+
+        def _remove_listener() -> None:
+            with contextlib.suppress(ValueError):
+                self._age_listeners.remove(listener)
+
+        return _remove_listener
+
+    def _update_freshness(self) -> None:
+        """Refresh the stale flag and the coarse data age, notifying on changes."""
+
+        # Age first, so an entity never publishes the old step next to new data.
+        self._update_data_age()
+        self._update_stale_flag()
+
+    def _update_data_age(self) -> None:
+        """Notify age listeners only when the step or the stale limit changed."""
+
+        seen = (self.data_age_label, self.stale_after_seconds)
+        if seen == self._age_seen:
+            return
+        self._age_seen = seen
+        for listener in list(self._age_listeners):
+            try:
+                listener()
+            except Exception:  # pragma: no cover - listener failures are logged
+                _LOGGER.exception(
+                    "Unexpected error in data age listener for valve %s",
+                    self._address,
+                )
+
+    def _update_stale_flag(self) -> None:
+        """Notify listeners if the stale state changed since the last check."""
+
+        stale = self.data_is_stale
+        if stale == self._data_stale:
+            return
+        self._data_stale = stale
+        if stale:
+            _LOGGER.warning(
+                "No fresh data from valve %s for over %.0f seconds; its sensors "
+                "are now unavailable",
+                self._address,
+                self.stale_after_seconds,
+            )
+        else:
+            _LOGGER.info("Fresh data from valve %s is flowing again", self._address)
+        for listener in list(self._freshness_listeners):
+            try:
+                listener(stale)
+            except Exception:  # pragma: no cover - listener failures are logged
+                _LOGGER.exception(
+                    "Unexpected error in freshness listener for valve %s",
+                    self._address,
+                )
+
+    def watchdog_check(self) -> None:
+        """Recover stuck work, refresh the stale flag and nudge idle valves.
+
+        Runs on a timer, independently of polls, so it still works when every
+        poll is stuck or failing.
+        """
+
+        if self._unloaded:
+            return
+
+        self._recover_stuck_work()
+        self._update_freshness()
+
+        if not self.available:
+            return
+        if not (self._data_stale or self._persistent_connection_enabled):
+            return
+        if self._lock.locked() or self._persistent_task_active():
+            return
+
+        now = self._monotonic()
+        if (
+            self._last_heal_poll is not None
+            and now - self._last_heal_poll < HEAL_POLL_MIN_INTERVAL_SECONDS
+        ):
+            return
+        self._last_heal_poll = now
+        _LOGGER.debug("Watchdog is polling idle valve %s", self._address)
+        self.schedule_poll()
 
     def update_from_advertisement(self, advertisement: ValveAdvertisement) -> None:
         """Record the most recent Bluetooth advertisement for the valve."""
@@ -585,11 +805,15 @@ class ValveConnection:
                 self._async_finish_persistent_stop(task, pending_client)
             )
             self._persistent_stop_task = stop_task
+            self._persistent_stop_started = self._monotonic()
         try:
-            await _async_wait_for_cleanup(stop_task)
+            # Bounded so a stalled disconnect cannot block a switch-off, an
+            # integration reload or Home Assistant shutdown.
+            await _async_wait_for_cleanup(stop_task, UNLOAD_TIMEOUT_SECONDS)
         finally:
             if self._persistent_stop_task is stop_task:
                 self._persistent_stop_task = None
+                self._persistent_stop_started = None
                 if self._persistent_connection_enabled and not self._unloaded:
                     # Re-enabling during teardown may have scheduled a poll
                     # that was skipped while this stop worker still owned cleanup.
@@ -651,6 +875,7 @@ class ValveConnection:
         try:
             # From this point, this coroutine's finally block owns cleanup.
             self._pending_persistent_client = None
+            self._persistent_progress = self._monotonic()
             while True:
                 if (
                     not self._persistent_connection_enabled
@@ -679,12 +904,22 @@ class ValveConnection:
                 ):
                     break
 
+                self._persistent_progress = self._monotonic()
                 try:
-                    request_sent, response_received = (
-                        await self._async_request_dashboard(client)
-                    )
+                    async with asyncio.timeout(PERSISTENT_REQUEST_TIMEOUT_SECONDS):
+                        request_sent, response_received = (
+                            await self._async_request_dashboard(client)
+                        )
                 except asyncio.CancelledError:
                     raise
+                except TimeoutError:
+                    _LOGGER.warning(
+                        "Persistent poll of valve %s timed out after %g seconds; "
+                        "reconnecting",
+                        self._address,
+                        PERSISTENT_REQUEST_TIMEOUT_SECONDS,
+                    )
+                    break
                 except Exception:  # pragma: no cover - unexpected protocol errors
                     _LOGGER.exception(
                         "Unexpected error while refreshing dashboard data for valve %s",
@@ -701,6 +936,7 @@ class ValveConnection:
 
                 if response_received:
                     self._last_success = dt_util.utcnow()
+                    self._persistent_progress = self._monotonic()
                 else:
                     _LOGGER.debug(
                         "Valve %s did not provide a Dashboard response during persistent polling",
@@ -716,13 +952,20 @@ class ValveConnection:
             try:
                 await self._async_disconnect_client(client)
             finally:
-                self._persistent_task = None
+                if self._persistent_task is asyncio.current_task():
+                    self._persistent_task = None
+                    self._persistent_progress = None
 
                 if (
                     self._persistent_connection_enabled
                     and not self._unloaded
                 ):
-                    self._set_connection_cooldown()
+                    # The link just dropped; reconnect soon instead of waiting
+                    # out the full on-demand retry interval.
+                    self._next_connection_time = dt_util.utcnow() + min(
+                        CONNECTION_MIN_RETRY_INTERVAL,
+                        timedelta(seconds=PERSISTENT_RECONNECT_DELAY_SECONDS),
+                    )
                     self.schedule_poll()
 
     async def async_unload(self) -> None:
@@ -731,20 +974,41 @@ class ValveConnection:
         self._unloaded = True
         self._persistent_connection_enabled = False
         self._cancel_cooldown()
-        await _async_wait_for_cleanup(asyncio.create_task(self._async_finish_unload()))
+        await _async_wait_for_cleanup(
+            asyncio.create_task(self._async_finish_unload()),
+            UNLOAD_TIMEOUT_SECONDS * 3,
+        )
 
     async def _async_finish_unload(self) -> None:
-        """Wait for connection cleanup, including an active one-shot poll."""
+        """Wait for connection cleanup, including an active one-shot poll.
+
+        A poll that is still running gets a grace period to finish and
+        disconnect. Nothing here waits unboundedly: after the grace period the
+        poll is cancelled and abandoned, even if it is stuck in a Bluetooth
+        call that ignores cancellation, which is what lets an integration
+        reload recover from a hung poll.
+        """
 
         await self._async_stop_persistent_session()
-        async with self._lock:
-            return
+        try:
+            async with asyncio.timeout(UNLOAD_TIMEOUT_SECONDS):
+                async with self._lock:
+                    return
+        except TimeoutError:
+            _LOGGER.warning(
+                "Abandoning a stuck poll of valve %s during unload", self._address
+            )
+            poll_task = self._poll_task
+            if poll_task is not None and not poll_task.done():
+                poll_task.cancel()
 
     async def async_poll(self) -> None:
         """Attempt to connect to the valve and fetch additional data."""
 
         if not self.available:
             return
+
+        self._recover_stuck_work()
 
         if self._persistent_task_active():
             _LOGGER.debug(
@@ -759,8 +1023,77 @@ class ValveConnection:
             )
             return
 
-        async with self._lock:
-            await self._async_poll_locked()
+        lock = self._lock
+        async with lock:
+            self._poll_task = asyncio.current_task()
+            self._poll_started = self._monotonic()
+            try:
+                await self._async_poll_locked()
+            finally:
+                # An abandoned poll must not clear its replacement's bookkeeping.
+                if self._lock is lock:
+                    self._poll_task = None
+                    self._poll_started = None
+
+    def _recover_stuck_work(self) -> None:
+        """Abandon a poll or persistent session that outlived its hard limit.
+
+        Every Bluetooth call is bounded, so this only fires if a call ignored
+        both its timeout and cancellation. Cancelling and replacing the lock
+        lets polling resume even though the stuck task can no longer be joined.
+        """
+
+        now = self._monotonic()
+
+        if (
+            self._poll_started is not None
+            and now - self._poll_started > POLL_HARD_LIMIT_SECONDS
+        ):
+            _LOGGER.warning(
+                "Poll of valve %s has been running for %.0f seconds; abandoning it",
+                self._address,
+                now - self._poll_started,
+            )
+            task = self._poll_task
+            if task is not None and not task.done():
+                task.cancel()
+            self._poll_task = None
+            self._poll_started = None
+            self._lock = asyncio.Lock()
+
+        task = self._persistent_task
+        if (
+            task is not None
+            and not task.done()
+            and self._persistent_progress is not None
+            and now - self._persistent_progress
+            > POLL_HARD_LIMIT_SECONDS + self._persistent_poll_interval
+        ):
+            _LOGGER.warning(
+                "Persistent session for valve %s made no progress for %.0f seconds; "
+                "abandoning it",
+                self._address,
+                now - self._persistent_progress,
+            )
+            task.cancel()
+            self._persistent_task = None
+            self._pending_persistent_client = None
+            self._persistent_progress = None
+
+        stop_task = self._persistent_stop_task
+        if (
+            stop_task is not None
+            and not stop_task.done()
+            and self._persistent_stop_started is not None
+            and now - self._persistent_stop_started > POLL_HARD_LIMIT_SECONDS
+        ):
+            _LOGGER.warning(
+                "Persistent session cleanup for valve %s is stuck; abandoning it",
+                self._address,
+            )
+            stop_task.cancel()
+            self._persistent_stop_task = None
+            self._persistent_stop_started = None
 
     async def _async_poll_locked(self) -> None:
         """Perform a Bluetooth connection cycle for the valve."""
@@ -835,7 +1168,15 @@ class ValveConnection:
             try:
                 if self._connection_state_callback is not None:
                     self._connection_state_callback(self._address, True)
-                refreshed = await self._async_fetch_device_information(client)
+                async with asyncio.timeout(POLL_FETCH_TIMEOUT_SECONDS):
+                    refreshed = await self._async_fetch_device_information(client)
+            except TimeoutError:
+                _LOGGER.warning(
+                    "Timed out exchanging data with valve %s after %g seconds; "
+                    "disconnecting",
+                    self._address,
+                    POLL_FETCH_TIMEOUT_SECONDS,
+                )
             except Exception:  # pragma: no cover - future protocol work may raise
                 _LOGGER.exception(
                     "Error while retrieving extended data from valve %s", self._address
@@ -1117,9 +1458,15 @@ class ValveConnection:
             write_with_response = response
 
         try:
-            await client.write_gatt_char(
-                char_uuid, payload, response=write_with_response
+            await _async_bounded(
+                client.write_gatt_char(
+                    char_uuid, payload, response=write_with_response
+                ),
+                BLE_OPERATION_TIMEOUT_SECONDS,
+                f"{command_name} write to valve {self._address}",
             )
+        except TimeoutError:
+            return False
         except BLEAK_RETRY_EXCEPTIONS as exc:
             _LOGGER.debug(
                 "Failed to send %s to valve %s via %s: %s",
@@ -1739,7 +2086,11 @@ class ValveConnection:
 
         for uuid in subscriptions:
             with contextlib.suppress(Exception):
-                await client.stop_notify(uuid)
+                await _async_bounded(
+                    client.stop_notify(uuid),
+                    BLE_OPERATION_TIMEOUT_SECONDS,
+                    f"notification unsubscribe on valve {self._address}",
+                )
 
     async def _async_get_services(self, client: BaseBleakClient):
         """Return the GATT services exposed by the connected client."""
@@ -1756,7 +2107,11 @@ class ValveConnection:
 
         services = get_services()
         if inspect.isawaitable(services):
-            services = await services
+            services = await _async_bounded(
+                services,
+                BLE_OPERATION_TIMEOUT_SECONDS,
+                f"GATT service discovery on valve {self._address}",
+            )
 
         return services
 
@@ -1851,7 +2206,13 @@ class ValveConnection:
         try:
             awaitable = client.start_notify(uuid, handler)
             if inspect.isawaitable(awaitable):
-                await awaitable
+                await _async_bounded(
+                    awaitable,
+                    BLE_OPERATION_TIMEOUT_SECONDS,
+                    f"notification subscribe on valve {self._address}",
+                )
+        except TimeoutError:
+            return False
         except BLEAK_RETRY_EXCEPTIONS as exc:
             _LOGGER.debug(
                 "Failed to subscribe to notifications from %s on valve %s: %s",
@@ -2025,6 +2386,9 @@ class ValveConnection:
             return
 
         self._dashboard_data = dashboard
+        self._last_dashboard_monotonic = self._monotonic()
+        self._last_dashboard_at = dt_util.utcnow()
+        self._update_freshness()
         self._notify_dashboard_listeners(dashboard)
 
     def _notify_dashboard_listeners(
@@ -2318,6 +2682,7 @@ class ValveConnectionManager:
         self._remove_listener: CALLBACK_TYPE | None = None
         self._cancel_interval: CALLBACK_TYPE | None = None
         self._startup_unsub: CALLBACK_TYPE | None = None
+        self._cancel_watchdog: CALLBACK_TYPE | None = None
 
     async def async_setup(self) -> None:
         """Begin tracking valves for periodic polling."""
@@ -2332,6 +2697,9 @@ class ValveConnectionManager:
         )
         self._cancel_interval = async_track_time_interval(
             self._hass, self._handle_poll_interval, CONNECTION_POLL_INTERVAL
+        )
+        self._cancel_watchdog = async_track_time_interval(
+            self._hass, self._handle_watchdog, WATCHDOG_INTERVAL
         )
 
         if self._hass.state != CoreState.running:
@@ -2350,12 +2718,17 @@ class ValveConnectionManager:
             self._cancel_interval()
             self._cancel_interval = None
 
+        if self._cancel_watchdog is not None:
+            self._cancel_watchdog()
+            self._cancel_watchdog = None
+
         if self._startup_unsub is not None:
             self._startup_unsub()
             self._startup_unsub = None
 
         await _async_wait_for_cleanup(
-            asyncio.create_task(self._async_unload_connections())
+            asyncio.create_task(self._async_unload_connections()),
+            UNLOAD_TIMEOUT_SECONDS * 4,
         )
 
     async def _async_unload_connections(self) -> None:
@@ -2378,6 +2751,18 @@ class ValveConnectionManager:
 
         for connection in self._connections.values():
             connection.schedule_poll()
+
+    @callback
+    def _handle_watchdog(self, _: datetime) -> None:
+        """Recover stuck work and flag stale data for every known valve."""
+
+        for connection in list(self._connections.values()):
+            try:
+                connection.watchdog_check()
+            except Exception:  # pragma: no cover - the watchdog must keep running
+                _LOGGER.exception(
+                    "Watchdog failed for valve %s", connection.address
+                )
 
     async def _handle_home_assistant_started(self, _: object) -> None:
         """Trigger an initial poll once Home Assistant startup completes."""

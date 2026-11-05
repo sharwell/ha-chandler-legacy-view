@@ -39,6 +39,51 @@ CONNECTION_POLL_INTERVAL: Final = timedelta(minutes=15)
 CONNECTION_MIN_RETRY_INTERVAL: Final = timedelta(seconds=30)
 CONNECTION_TIMEOUT_SECONDS: Final = 20
 
+# Reliability limits. A stalled Bluetooth link must never be able to hold a
+# valve's poll lock or its persistent session forever, so every Bluetooth call
+# is bounded and a watchdog abandons work that outlives these limits even if
+# the underlying call ignores cancellation.
+#
+# Longest a single GATT operation (write, notify, service lookup) may take.
+BLE_OPERATION_TIMEOUT_SECONDS: Final = 10
+# Longest the post-connect exchange of one on-demand poll may take.
+POLL_FETCH_TIMEOUT_SECONDS: Final = 60
+# Longest one persistent-session dashboard exchange may take.
+PERSISTENT_REQUEST_TIMEOUT_SECONDS: Final = 30
+# A poll or session still running this long is abandoned by the watchdog.
+POLL_HARD_LIMIT_SECONDS: Final = 180
+# Longest unload or reload waits for in-flight Bluetooth work before abandoning it.
+UNLOAD_TIMEOUT_SECONDS: Final = 15
+# Gap before a persistent session reconnects after the link drops.
+PERSISTENT_RECONNECT_DELAY_SECONDS: Final = 5
+# How often the watchdog checks every valve for stuck work and stale data.
+WATCHDOG_INTERVAL: Final = timedelta(seconds=30)
+# Minimum gap between self-heal polls triggered by stale data.
+HEAL_POLL_MIN_INTERVAL_SECONDS: Final = 120
+
+# The Last Data Update sensor reports how old the data is in coarse steps rather
+# than a timestamp. It only changes (and so only writes to the recorder) when the
+# age crosses a step, so a healthy valve writes almost nothing, even with a
+# persistent connection delivering data every few seconds. Staleness itself is
+# judged separately, from the connection's own timing.
+DATA_AGE_TIERS: Final = (
+    (5 * 60, "Within 5 minutes"),
+    (15 * 60, "5 to 15 minutes ago"),
+    (60 * 60, "15 to 60 minutes ago"),
+    (6 * 60 * 60, "1 to 6 hours ago"),
+    (24 * 60 * 60, "6 to 24 hours ago"),
+)
+DATA_AGE_FRESH: Final = DATA_AGE_TIERS[0][1]
+DATA_AGE_OLDEST: Final = "Over a day ago"
+DATA_AGE_NONE: Final = "No data yet"
+
+# Data older than this is reported as stale and its sensors become unavailable.
+# On-demand polling runs every 15 minutes, so three missed polls are stale.
+STALE_AFTER_ON_DEMAND_SECONDS: Final = 45 * 60
+# With a persistent connection the limit follows the configured poll interval.
+STALE_AFTER_PERSISTENT_MIN_SECONDS: Final = 120
+STALE_AFTER_PERSISTENT_INTERVALS: Final = 8
+
 # Default presentation details for discovered devices
 DEFAULT_FRIENDLY_NAME: Final = "Treatment Valve"
 DEFAULT_MANUFACTURER: Final = "Chandler"

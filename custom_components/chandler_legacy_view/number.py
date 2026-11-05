@@ -10,6 +10,7 @@ from homeassistant.const import UnitOfTime
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const import (
     DATA_CONNECTION_MANAGER,
@@ -27,8 +28,14 @@ from .models import ValveAdvertisement
 _LOGGER = logging.getLogger(__name__)
 
 
-class ValvePersistentPollIntervalNumber(ChandlerValveEntity, NumberEntity):
-    """Configure the polling interval used while a persistent connection is active."""
+class ValvePersistentPollIntervalNumber(
+    ChandlerValveEntity, NumberEntity, RestoreEntity
+):
+    """Configure the polling interval used while a persistent connection is active.
+
+    The interval is restored after a restart or reload instead of falling back
+    to the default.
+    """
 
     _attr_entity_category = EntityCategory.CONFIG
     _attr_native_unit_of_measurement = UnitOfTime.SECONDS
@@ -45,6 +52,20 @@ class ValvePersistentPollIntervalNumber(ChandlerValveEntity, NumberEntity):
         self._attr_name = f"{self._attr_name} Persistent Poll Interval"
         self._attr_available = True
         self._attr_native_value = connection.persistent_poll_interval
+
+    async def async_added_to_hass(self) -> None:
+        """Restore the configured interval from before a restart."""
+
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state is None:
+            return
+        try:
+            interval = float(last_state.state)
+        except (TypeError, ValueError):
+            return  # "unknown" or "unavailable" carry no setting
+        await self._connection.async_set_persistent_poll_interval(interval)
+        self._attr_native_value = self._connection.persistent_poll_interval
 
     @callback
     def async_handle_bluetooth_update(

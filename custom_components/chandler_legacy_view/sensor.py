@@ -22,6 +22,7 @@ from homeassistant.const import (
 # constant, so we keep using the unit string Chandler devices report.
 WATER_HARDNESS_GRAINS_PER_GALLON = "grains_per_gallon"
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
@@ -29,6 +30,10 @@ from .const import (
     DATA_CONNECTION_MANAGER,
     DATA_DISCOVERY_DEVICE_ID,
     DATA_DISCOVERY_MANAGER,
+    DATA_AGE_FRESH,
+    DATA_AGE_NONE,
+    DATA_AGE_OLDEST,
+    DATA_AGE_TIERS,
     DOMAIN,
 )
 from .connection import ValveConnection, ValveConnectionManager
@@ -58,8 +63,19 @@ class ValveDashboardSensor(ChandlerValveEntity, SensorEntity):
         self._name_suffix = name_suffix
         self._connection = connection
         self._remove_dashboard_listener: CALLBACK_TYPE | None = None
+        self._remove_freshness_listener: CALLBACK_TYPE | None = None
         self._attr_name = self._apply_name_suffix(base_name, advertisement)
         self._update_from_dashboard(connection.dashboard_data, write_state=False)
+
+    @property
+    def available(self) -> bool:
+        """Report unavailable instead of an old reading once data goes stale.
+
+        A stale flow or usage value is worse than none: it looks live. The
+        sensor stays unavailable until a fresh dashboard arrives.
+        """
+
+        return self._attr_available and not self._connection.data_is_stale
 
     async def async_added_to_hass(self) -> None:
         """Subscribe to dashboard updates only when the entity is enabled."""
@@ -68,6 +84,9 @@ class ValveDashboardSensor(ChandlerValveEntity, SensorEntity):
         self._update_from_dashboard(self._connection.dashboard_data, write_state=False)
         self._remove_dashboard_listener = self._connection.add_dashboard_listener(
             self._handle_dashboard_update
+        )
+        self._remove_freshness_listener = self._connection.add_freshness_listener(
+            self._handle_freshness_update
         )
 
     def _apply_name_suffix(
@@ -114,6 +133,9 @@ class ValveDashboardSensor(ChandlerValveEntity, SensorEntity):
         if self._remove_dashboard_listener is not None:
             self._remove_dashboard_listener()
             self._remove_dashboard_listener = None
+        if self._remove_freshness_listener is not None:
+            self._remove_freshness_listener()
+            self._remove_freshness_listener = None
 
     def _update_from_dashboard(
         self, dashboard: ValveDashboardData | None, *, write_state: bool
@@ -138,6 +160,91 @@ class ValveDashboardSensor(ChandlerValveEntity, SensorEntity):
         """Handle updates from the dashboard poller."""
 
         self._update_from_dashboard(dashboard, write_state=True)
+
+    @callback
+    def _handle_freshness_update(self, stale: bool) -> None:
+        """Re-publish availability when the data turns stale or fresh again."""
+
+        if self.hass is not None:
+            self.async_write_ha_state()
+
+
+class ValveLastDataUpdateSensor(ValveDashboardSensor):
+    """Report how recently a complete dashboard arrived, in coarse steps.
+
+    It reads "Within 5 minutes" while data flows and changes only when the age
+    crosses a step, so it writes almost nothing to the recorder. Once data has
+    stopped, the exact time of the last data is an attribute (it cannot change
+    from then on). Always available, so it keeps saying how old the data is
+    while every other sensor of a silent valve is unavailable.
+    """
+
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_options = [label for _, label in DATA_AGE_TIERS] + [
+        DATA_AGE_OLDEST,
+        DATA_AGE_NONE,
+    ]
+
+    def __init__(
+        self, advertisement: ValveAdvertisement, connection: ValveConnection
+    ) -> None:
+        super().__init__(
+            advertisement,
+            connection,
+            unique_id_suffix="last_data_update",
+            name_suffix="Last Data Update",
+        )
+        self._remove_age_listener: CALLBACK_TYPE | None = None
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    async def async_added_to_hass(self) -> None:
+        """Follow the data age while the entity is registered."""
+
+        await super().async_added_to_hass()
+        self._remove_age_listener = self._connection.add_age_listener(
+            self._handle_age_update
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Stop following the data age."""
+
+        await super().async_will_remove_from_hass()
+        if self._remove_age_listener is not None:
+            self._remove_age_listener()
+            self._remove_age_listener = None
+
+    @callback
+    def _handle_age_update(self) -> None:
+        """Publish the new step."""
+
+        self._update_from_dashboard(self._connection.dashboard_data, write_state=True)
+
+    @callback
+    def _handle_dashboard_update(
+        self, dashboard: ValveDashboardData | None
+    ) -> None:
+        """Do nothing: each dashboard is not worth a recorder row.
+
+        The age listener publishes when the step actually changes.
+        """
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str] | None:
+        """Give the exact time of the last data once it is no longer fresh."""
+
+        last_update = self._connection.last_data_update
+        if last_update is None or self._attr_native_value == DATA_AGE_FRESH:
+            return None
+        return {"last_data_update": last_update.isoformat()}
+
+    def _extract_native_value(
+        self, dashboard: ValveDashboardData | None
+    ) -> object | None:
+        return self._connection.data_age_label
 
 
 class ValvePresentFlowSensor(ValveDashboardSensor):
@@ -373,6 +480,7 @@ async def async_setup_entry(
     days_entities: dict[str, ValveDaysUntilRegenerationSensor] = {}
     usage_entities: dict[str, ValveWaterUsageTodaySensor] = {}
     peak_entities: dict[str, ValvePeakFlowTodaySensor] = {}
+    last_update_entities: dict[str, ValveLastDataUpdateSensor] = {}
 
     def _ensure_dashboard_entity(
         advertisement: ValveAdvertisement,
@@ -489,6 +597,16 @@ async def async_setup_entry(
             debug_description="peak flow today",
         )
 
+    def _ensure_last_update_entity(
+        advertisement: ValveAdvertisement,
+    ) -> tuple[ValveDashboardSensor | None, list[ValveDashboardSensor]]:
+        return _ensure_dashboard_entity(
+            advertisement,
+            last_update_entities,
+            factory=lambda adv, conn: ValveLastDataUpdateSensor(adv, conn),
+            debug_description="last data update",
+        )
+
     EnsureCallback = Callable[
         [ValveAdvertisement],
         tuple[ValveDashboardSensor | None, list[ValveDashboardSensor]],
@@ -503,6 +621,7 @@ async def async_setup_entry(
         _ensure_days_entity,
         _ensure_usage_entity,
         _ensure_peak_entity,
+        _ensure_last_update_entity,
     )
 
     initial_entities: list[SensorEntity] = []
@@ -523,6 +642,7 @@ async def async_setup_entry(
         days_entities,
         usage_entities,
         peak_entities,
+        last_update_entities,
     )
 
     @callback

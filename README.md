@@ -51,6 +51,46 @@ This repository currently focuses on the scaffolding required for discovery and
 entity creation. Additional device metadata, richer entities, diagnostics, and
 configuration options will follow as device details become available.
 
+## Reliability and stale data
+
+Water-system data is only useful if it is current, so the integration is
+built to fail loudly rather than quietly keep showing an old reading.
+
+* **Every Bluetooth call is bounded.** A write, notification subscribe or
+  unsubscribe, or service lookup that stalls on a dead link times out after
+  10 seconds instead of holding the valve's poll lock indefinitely. A whole
+  on-demand poll is cut off after 60 seconds and a persistent-session request
+  after 30.
+* **A watchdog abandons wedged work.** Every 30 seconds each valve is checked.
+  A poll or persistent session that outlives a 3 minute hard limit is cancelled
+  and replaced even if the Bluetooth stack ignores cancellation, so polling
+  always resumes without a restart.
+* **Reload and shutdown cannot hang.** Unloading the integration, switching a
+  persistent connection off, and shutting Home Assistant down wait a bounded
+  time for Bluetooth cleanup and then move on.
+* **Stale data is visible.** Dashboard sensors (flow, usage, battery, and the
+  rest) become *unavailable* when no fresh dashboard has arrived for too long:
+  45 minutes with on-demand polling (three missed 15 minute polls), or eight
+  poll intervals (never less than 2 minutes) with a persistent connection. An
+  idle valve with stale data is polled again automatically, at most every 2
+  minutes.
+* **Persistent connection settings survive restarts.** The *Persistent
+  Connection* switch and *Persistent Poll Interval* are restored after a restart
+  or reload.
+
+Two diagnostic entities per valve support alerting:
+
+| Entity | Meaning |
+| --- | --- |
+| **Data Stale** (problem) | On when the valve's data has gone stale. Always available, including when the valve is out of range, so an automation can alert on it. |
+| **Last Data Update** | How old the data is, in coarse steps: *Within 5 minutes*, *5 to 15 minutes ago*, *15 to 60 minutes ago*, *1 to 6 hours ago*, *6 to 24 hours ago*, *Over a day ago*, or *No data yet*. It changes only when a step is crossed, so a healthy valve writes almost nothing to the recorder even with a persistent connection. Once the data is no longer fresh, the exact time of the last data is in the `last_data_update` attribute. Always available. |
+
+For leak detection, alert on **Data Stale** turning on rather than only on flow
+values: a flow sensor that reads zero because polling has silently stopped looks
+the same as a quiet pipe unless staleness is monitored. Bluetooth is not a
+guaranteed link, so treat valve flow as one signal alongside a dedicated leak
+sensor rather than the only one.
+
 ## Installation
 
 Requires Home Assistant 2026.8.0 or later for config-entry-scoped device registry
