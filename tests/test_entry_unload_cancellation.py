@@ -66,10 +66,11 @@ class EntryUnloadCancellationTests(unittest.IsolatedAsyncioTestCase):
                 is_csi_device=True, model="Evb019", valve_data_parsed=True,
             ),
         ))
-        cancel_interval = Mock()
+        # One cancel callback per timer: the poll interval and the watchdog.
+        cancel_interval, cancel_watchdog = Mock(), Mock()
         self.enterContext(patch.object(
             production.connection, "async_track_time_interval",
-            return_value=cancel_interval,
+            side_effect=[cancel_interval, cancel_watchdog],
         ))
 
         await discovery.async_setup()
@@ -150,6 +151,7 @@ class EntryUnloadCancellationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(manager._remove_listener)
         self.assertIsNone(manager._cancel_interval)
         cancel_interval.assert_called_once_with()
+        cancel_watchdog.assert_called_once_with()
         for remove in advertisement_removers + unavailable_removers:
             remove.assert_called_once_with()
         self.assertEqual(cleanup_order[0], "disconnect")

@@ -30,6 +30,12 @@ def _load_platform_modules() -> SimpleNamespace:
 
     class Entity:
         hass = None
+        _attr_available = True
+
+        @property
+        def available(self) -> bool:
+            """Mirror Home Assistant: availability defaults to ``_attr_available``."""
+            return self._attr_available
 
         async def async_added_to_hass(self) -> None:
             pass
@@ -39,6 +45,14 @@ def _load_platform_modules() -> SimpleNamespace:
 
         def async_write_ha_state(self) -> None:
             self.state_writes = getattr(self, "state_writes", 0) + 1
+
+    class RestoreEntity(Entity):
+        """Return whatever last state a test queued for the entity."""
+
+        last_state = None
+
+        async def async_get_last_state(self):
+            return self.last_state
 
     module("bleak.backends.client", BaseBleakClient=object)
     module(
@@ -80,8 +94,9 @@ def _load_platform_modules() -> SimpleNamespace:
         "homeassistant.helpers.entity",
         DeviceInfo=dict,
         Entity=Entity,
-        EntityCategory=SimpleNamespace(CONFIG="config"),
+        EntityCategory=SimpleNamespace(CONFIG="config", DIAGNOSTIC="diagnostic"),
     )
+    module("homeassistant.helpers.restore_state", RestoreEntity=RestoreEntity)
     module("homeassistant.helpers.entity_platform", AddEntitiesCallback=object)
     module(
         "homeassistant.helpers.event",
@@ -105,7 +120,9 @@ def _load_platform_modules() -> SimpleNamespace:
     )
     module(
         "homeassistant.components.sensor",
-        SensorDeviceClass=SimpleNamespace(TIMESTAMP="timestamp", BATTERY="battery"),
+        SensorDeviceClass=SimpleNamespace(
+            TIMESTAMP="timestamp", BATTERY="battery", ENUM="enum"
+        ),
         SensorStateClass=SimpleNamespace(MEASUREMENT="measurement"),
     )
 
@@ -254,7 +271,22 @@ class AvailabilityPlatformTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(connections["softener"].available)
         self.assertTrue(connections["filter"].available)
         self.assertFalse(presence._attr_is_on)
-        self.assertTrue(all(not entity._attr_available for entity in softener_entities))
+        # The freshness entities report "no data" and so must outlive the valve.
+        always_available = (
+            production.binary_sensor.ValveDataStaleBinarySensor,
+            production.sensor.ValveLastDataUpdateSensor,
+        )
+        followers = [
+            entity for entity in softener_entities
+            if not isinstance(entity, always_available)
+        ]
+        survivors = [
+            entity for entity in softener_entities
+            if isinstance(entity, always_available)
+        ]
+        self.assertEqual(len(survivors), 2)
+        self.assertTrue(all(not entity._attr_available for entity in followers))
+        self.assertTrue(all(entity.available for entity in survivors))
         self.assertTrue(all(entity._attr_available for entity in filter_entities))
         for entity in softener_entities:
             self.assertEqual(entity.state_writes, original_writes[id(entity)] + 1)

@@ -9,6 +9,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const import (
     DATA_CONNECTION_MANAGER,
@@ -24,8 +25,14 @@ from .models import ValveAdvertisement
 _LOGGER = logging.getLogger(__name__)
 
 
-class ValvePersistentConnectionSwitch(ChandlerValveEntity, SwitchEntity):
-    """Allow the user to request a persistent BLE connection to a valve."""
+class ValvePersistentConnectionSwitch(
+    ChandlerValveEntity, SwitchEntity, RestoreEntity
+):
+    """Allow the user to request a persistent BLE connection to a valve.
+
+    The preference is restored after a restart or reload. Without that, every
+    restart silently dropped the valve back to polling every 15 minutes.
+    """
 
     _attr_entity_category = EntityCategory.CONFIG
 
@@ -38,6 +45,23 @@ class ValvePersistentConnectionSwitch(ChandlerValveEntity, SwitchEntity):
         self._attr_name = f"{self._attr_name} Persistent Connection"
         self._attr_available = True
         self._attr_is_on = connection.persistent_connection_enabled
+
+    async def async_added_to_hass(self) -> None:
+        """Restore the persistent connection preference from before a restart."""
+
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if (
+            last_state is not None
+            and last_state.state == "on"
+            and not self._connection.persistent_connection_enabled
+        ):
+            _LOGGER.debug(
+                "Restoring persistent connection for valve %s",
+                self._connection.address,
+            )
+            await self._connection.async_set_persistent_connection_enabled(True)
+            self._attr_is_on = self._connection.persistent_connection_enabled
 
     @callback
     def async_handle_bluetooth_update(

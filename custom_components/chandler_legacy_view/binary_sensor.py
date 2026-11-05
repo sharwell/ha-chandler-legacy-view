@@ -9,10 +9,17 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntity,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DATA_DISCOVERY_DEVICE_ID, DATA_DISCOVERY_MANAGER, DOMAIN
+from .connection import ValveConnection
+from .const import (
+    DATA_CONNECTION_MANAGER,
+    DATA_DISCOVERY_DEVICE_ID,
+    DATA_DISCOVERY_MANAGER,
+    DOMAIN,
+)
 from .discovery import ValveDiscoveryChange, ValveDiscoveryManager
 from .entity import (
     ChandlerValveEntity,
@@ -226,6 +233,102 @@ class ValveSaltBinarySensor(ChandlerValveEntity, BinarySensorEntity):
         return attributes
 
 
+class ValveDataStaleBinarySensor(ChandlerValveEntity, BinarySensorEntity):
+    """Report that a valve has stopped delivering fresh data.
+
+    This is the sensor to alert on. It is always available, including while the
+    valve is out of Bluetooth range, because "no data" is what it reports.
+    """
+
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(
+        self, advertisement: ValveAdvertisement, connection: ValveConnection
+    ) -> None:
+        super().__init__(advertisement)
+        self._connection = connection
+        self._attr_unique_id = f"{advertisement.address}_data_stale"
+        self._attr_name = f"{self._attr_name} Data Stale"
+        self._attr_available = True
+        self._attr_is_on = connection.data_is_stale
+        self._remove_freshness_listener: CALLBACK_TYPE | None = None
+        self._remove_age_listener: CALLBACK_TYPE | None = None
+        self._shown_limit = connection.stale_after_seconds
+
+    async def async_added_to_hass(self) -> None:
+        """Follow the connection's freshness while the entity is registered."""
+
+        await super().async_added_to_hass()
+        self._attr_is_on = self._connection.data_is_stale
+        self._remove_freshness_listener = self._connection.add_freshness_listener(
+            self._handle_freshness_update
+        )
+        # The stale limit changes with the polling mode and interval; republish
+        # so the ``stale_after_seconds`` attribute never shows an old limit.
+        self._shown_limit = self._connection.stale_after_seconds
+        self._remove_age_listener = self._connection.add_age_listener(
+            self._handle_limit_update
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Stop following the connection."""
+
+        await super().async_will_remove_from_hass()
+        if self._remove_freshness_listener is not None:
+            self._remove_freshness_listener()
+            self._remove_freshness_listener = None
+        if self._remove_age_listener is not None:
+            self._remove_age_listener()
+            self._remove_age_listener = None
+
+    @callback
+    def _handle_limit_update(self) -> None:
+        """Republish only when the stale limit changed, not on every age step."""
+
+        limit = self._connection.stale_after_seconds
+        if limit != self._shown_limit:
+            self._shown_limit = limit
+            self._handle_freshness_update(self._connection.data_is_stale)
+
+    @callback
+    def _handle_freshness_update(self, stale: bool) -> None:
+        """Publish the new stale state."""
+
+        self._attr_is_on = stale
+        if self.hass is not None:
+            self.async_write_ha_state()
+
+    def async_update_from_advertisement(self, advertisement: ValveAdvertisement) -> None:
+        """Store advertisement details and keep the suffixed name."""
+
+        super().async_update_from_advertisement(advertisement)
+        self._attr_name = f"{self._attr_name} Data Stale"
+
+    @callback
+    def async_handle_bluetooth_update(
+        self, advertisement: ValveAdvertisement, change: ValveDiscoveryChange
+    ) -> None:
+        """Track advertisement details; availability never follows the valve."""
+
+        if change is not ValveDiscoveryChange.UNAVAILABLE:
+            self.async_update_from_advertisement(advertisement)
+        self._attr_is_on = self._connection.data_is_stale
+        if self.hass is not None:
+            self.async_write_ha_state()
+
+    @property
+    def extra_state_attributes(self) -> Mapping[str, float]:
+        """Expose how old the data is allowed to get.
+
+        When the data last arrived is the Last Data Update sensor. Repeating it
+        here changed this entity's attributes on every update and wrote a new
+        recorder row each time.
+        """
+
+        return {"stale_after_seconds": self._connection.stale_after_seconds}
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -235,6 +338,7 @@ async def async_setup_entry(
 
     entry_data = hass.data[DOMAIN][entry.entry_id]
     manager: ValveDiscoveryManager = entry_data[DATA_DISCOVERY_MANAGER]
+    connection_manager = entry_data.get(DATA_CONNECTION_MANAGER)
     entities: dict[str, dict[str, ChandlerValveEntity]] = {}
 
     def _ensure_entities_for_advertisement(
@@ -267,6 +371,17 @@ async def async_setup_entry(
 
         if _can_report_low_salt(advertisement.name):
             _get_or_create("salt", lambda: ValveSaltBinarySensor(advertisement))
+
+        connection = (
+            connection_manager.get_connection(advertisement.address)
+            if connection_manager is not None
+            else None
+        )
+        if connection is not None:
+            _get_or_create(
+                "data_stale",
+                lambda: ValveDataStaleBinarySensor(advertisement, connection),
+            )
 
         return device_entities, new_entities
 
