@@ -11,6 +11,29 @@ _METERED_SOFTENER_VALVE_TYPES = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class ValveCapabilities:
+    """Confirmed metadata for the Water System 6.18.2 Dashboard display rules.
+
+    CsDashboardViewModel.setupValveOptions uses CsValveType.isMeteredSoftener
+    for hardness, remaining water, and days. None of the currently exposed
+    Dashboard rows has a firmware cutoff; the battery row excludes Clack.
+    """
+
+    is_twin_valve: bool | None = None
+    valve_type: str | None = None
+
+    @property
+    def is_metered_softener(self) -> bool | None:
+        """Distinguish an unresolved valve type from a confirmed non-metered valve."""
+
+        if self.is_twin_valve:
+            return True
+        if self.valve_type is None:
+            return None
+        return self.valve_type in _METERED_SOFTENER_VALVE_TYPES
+
+
 @dataclass(slots=True)
 class ValveAdvertisement:
     """Representation of a Bluetooth advertisement emitted by a valve."""

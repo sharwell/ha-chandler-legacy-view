@@ -38,7 +38,7 @@ from .const import (
 )
 from .device_registry import async_update_device_serial_number
 from .discovery import ValveDiscoveryChange, ValveDiscoveryManager, _map_valve_type
-from .models import ValveAdvertisement, ValveDashboardData
+from .models import ValveAdvertisement, ValveCapabilities, ValveDashboardData
 from .protocol_compatibility import (
     PreviousProtocol,
     password_digits,
@@ -265,6 +265,8 @@ class ValveConnection:
         self._authentication_failed_passcode: str | None = None
         self._dashboard_data: ValveDashboardData | None = None
         self._dashboard_listeners: list[Callable[[ValveDashboardData | None], None]] = []
+        self._entity_capabilities = ValveCapabilities()
+        self._capability_listeners: list[Callable[[], None]] = []
         self._authentication_listeners: list[Callable[[bool], None]] = []
         self._passcode_getter = passcode_getter
         self._connection_state_callback = connection_state_callback
@@ -311,6 +313,12 @@ class ValveConnection:
         """Return the parsed data from the most recent Dashboard response."""
 
         return self._dashboard_data
+
+    @property
+    def entity_capabilities(self) -> ValveCapabilities:
+        """Return confirmed support metadata without changing advertisement data."""
+
+        return self._entity_capabilities
 
     @property
     def authentication_lockout(self) -> bool:
@@ -474,6 +482,67 @@ class ValveConnection:
                 )
             elif advertisement.has_connection_counter is True:
                 self._set_authentication_protocol(ValveAuthenticationProtocol.COUNTER)
+
+        previous = self._entity_capabilities
+        complete = advertisement.manufacturer_data_complete
+        firmware = advertisement.firmware_version
+        self._update_entity_capabilities(
+            is_twin_valve=(
+                advertisement.is_twin_valve
+                if (firmware is not None or advertisement.is_twin_valve)
+                and (complete or previous.is_twin_valve is None)
+                else None
+            ),
+            valve_type=(
+                advertisement.valve_type
+                if complete or previous.valve_type is None
+                else None
+            ),
+        )
+
+    def add_capability_listener(self, listener: Callable[[], None]) -> CALLBACK_TYPE:
+        """Subscribe to confirmed entity support changes while an entity is enabled."""
+
+        self._capability_listeners.append(listener)
+
+        def _remove_listener() -> None:
+            with contextlib.suppress(ValueError):
+                self._capability_listeners.remove(listener)
+
+        return _remove_listener
+
+    def _update_entity_capabilities(
+        self,
+        *,
+        is_twin_valve: bool | None = None,
+        valve_type: str | None = None,
+    ) -> None:
+        """Retain known support until newer, explicit metadata supersedes it.
+
+        Unlike password/packet state, this describes the device across polls.
+        Missing fields and incomplete advertisements must not erase evidence
+        that an existing entity is unsupported.
+        """
+
+        previous = self._entity_capabilities
+        if valve_type == "Unknown":
+            valve_type = None
+        updated = ValveCapabilities(
+            is_twin_valve=(
+                is_twin_valve if is_twin_valve is not None else previous.is_twin_valve
+            ),
+            valve_type=valve_type if valve_type is not None else previous.valve_type,
+        )
+        if updated == previous:
+            return
+        self._entity_capabilities = updated
+        for listener in list(self._capability_listeners):
+            try:
+                listener()
+            except Exception:  # pragma: no cover - listener failures are logged
+                _LOGGER.exception(
+                    "Unexpected error in capability listener for valve %s", self._address
+                )
 
     def _set_authentication_protocol(self, protocol: ValveAuthenticationProtocol) -> None:
         """Retain a resolved protocol independently of partial advertisements."""
@@ -2194,6 +2263,12 @@ class ValveConnection:
             _LOGGER.debug(
                 "Valve %s DeviceList access unresolved (length=%s, status=%s, protocol=%s)",
                 self._address, len(packet), packet[7], self._authentication_protocol.value,
+            )
+
+        if not (packet[5] or packet[6]) or self._device_list_firmware_version is not None:
+            self._update_entity_capabilities(
+                is_twin_valve=self._device_list_is_twin_valve,
+                valve_type=self._device_list_valve_type,
             )
 
         serial_number = self._extract_serial_number(packet)
