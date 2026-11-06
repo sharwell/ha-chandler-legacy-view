@@ -72,6 +72,9 @@ class Valve:
         self.pin = "1234"
         self.authentication_required = True
         self.connection_counter = 23
+        self.firmware_version = None
+        self.is_twin_valve = False
+        self.legacy_reserved_counter_byte = 42
         self.device_lists = deque()
         self.auth_replies = deque()
         self.dashboards = deque()
@@ -132,7 +135,10 @@ class Client:
         self.require_connected()
         if len(packet) >= 18 and packet[:2] == b"tt" and packet[2] in (0, 1):
             if packet[7] == 0:
-                self.challenge = packet[11]
+                # CsDeviceListPacket.update uses the advertisement counter for
+                # C4.19; byte 11 is not a challenge until C4.20 (or on twins).
+                self.challenge = (self.connection_counter if self.counter_in_advertisement
+                                  else packet[11])
                 self.dashboard_access = not self.valve.authentication_required
             elif packet[7] == 128:
                 # Scripted DeviceList status 128 explicitly represents a
@@ -143,6 +149,17 @@ class Client:
         assert characteristic is not None
         for callback in list(self.notifications.values()):
             callback(characteristic, bytearray(packet))
+
+    @property
+    def counter_in_advertisement(self):
+        return self.valve.firmware_version == 419 and not self.valve.is_twin_valve
+
+    def device_list_reply(self, status, counter):
+        return device_list_frame(
+            status=status,
+            counter=self.valve.legacy_reserved_counter_byte if self.counter_in_advertisement else counter,
+            firmware=self.valve.firmware_version, twin=self.valve.is_twin_valve,
+        )
 
     async def write_gatt_char(self, uuid, payload, *, response):
         self.require_connected()
@@ -155,14 +172,14 @@ class Client:
             counter = self.challenge if self.challenge is not None else self.connection_counter
             if authentication_pin(payload, self.challenge) != self.valve.pin:
                 self.dashboard_access = False
-                replies = [device_list_frame(status=0, counter=counter)]
+                replies = [self.device_list_reply(0, counter)]
             else:
                 replies = (self.valve.auth_replies.popleft() if self.valve.auth_replies
-                           else [device_list_frame(status=128, counter=(counter + 1) & 255)])
+                           else [self.device_list_reply(128, (counter + 1) & 255)])
         elif payload == b"t" * 20:
             operation = "device_list"
             replies = (self.valve.device_lists.popleft() if self.valve.device_lists
-                       else [device_list_frame(status=0, counter=self.connection_counter)])
+                       else [self.device_list_reply(0, self.connection_counter)])
         elif payload == b"u" * 20:
             operation = "dashboard"
             self.valve.dashboard_requests += 1

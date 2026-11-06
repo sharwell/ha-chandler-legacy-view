@@ -41,11 +41,16 @@ def raw_advertisement(*segments: bytes) -> bytes:
 
 
 def device_list_frame(*, status: int, counter: int = 23,
+                      firmware: int | None = None, twin: bool = False,
                       serial: bytes = b"\x01\x02\x03\x04") -> bytes:
     """Build a synthetic EVB019 response without using a device's private data."""
 
     packet = bytearray(20)
     packet[0:2] = b"tt"
+    packet[2] = int(twin)
+    if firmware is not None:
+        packet[5] = firmware // 100
+        packet[6] = int(f"{firmware % 100:02d}", 16)
     packet[7] = status
     packet[11] = counter
     packet[13:17] = serial

@@ -2204,7 +2204,16 @@ class ValveConnection:
             self._device_list_password_state = ValvePasswordDecodeState.UNKNOWN
             return None
 
-        connection_counter = packet[11]
+        # CsDeviceListPacket.update in Water System 6.18.2 uses advertisement
+        # data for C4.19. Byte 11 becomes the challenge in C4.20 and on twins.
+        counter_in_advertisement = (
+            advertisement is not None
+            and advertisement.firmware_version == 419
+            and packet[2] == 0
+        )
+        connection_counter = (
+            advertisement.connection_counter if counter_in_advertisement else packet[11]
+        )
         if advertisement is not None:
             advertisement.has_connection_counter = True
             if advertisement.authentication_required is None:
