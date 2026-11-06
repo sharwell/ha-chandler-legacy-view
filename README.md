@@ -104,8 +104,11 @@ encoder, checks the PIN against the current session's issued challenge,
 and withholds protected readings until access is established. Fixed
 synthetic wire examples exercise this decoder, including challenge wrap
 and rejection of stale requests; they are not live-valve captures. The shared
-clock advances event-loop deadlines and HA UTC time together without
-shortening production retries or cleanup budgets.
+clock derives HA UTC and local time from one controlled instant and advances
+them together with event-loop deadlines, without shortening production
+retries or cleanup budgets. Timestamp tests check complete published dates,
+times, and offsets across local midnight in UTC and America/Chicago; fixed
+start times use the same shared clock, and HA configures the real time zone.
 
 Coverage includes exhaustive advertisement layouts and counter values,
 authentication and fresh data, queued old notifications, session ownership,

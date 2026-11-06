@@ -126,8 +126,8 @@ def transport(bluetooth_io, monkeypatch):
 
 
 @pytest.fixture
-async def clock(monkeypatch):
-    return Clock(monkeypatch)
+async def clock(monkeypatch, request):
+    return Clock(monkeypatch, start=getattr(request, "param", None))
 
 
 @pytest.fixture

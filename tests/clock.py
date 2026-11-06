@@ -1,19 +1,30 @@
-"""Advance the real event loop's deadlines together with HA's UTC clock."""
+"""Advance event-loop deadlines together with HA's UTC and local clocks."""
 
 import asyncio
-from datetime import timedelta
+from datetime import UTC, timedelta
 
 from homeassistant.util import dt as dt_util
 
 
 class Clock:
-    def __init__(self, monkeypatch):
+    def __init__(self, monkeypatch, start=None):
         self.loop = asyncio.get_running_loop()
         self.offset = 0.0
-        real_time = self.loop.time
-        real_utcnow = dt_util.utcnow
-        monkeypatch.setattr(self.loop, "time", lambda: real_time() + self.offset)
-        monkeypatch.setattr(dt_util, "utcnow", lambda: real_utcnow() + timedelta(seconds=self.offset))
+        self._real_time = self.loop.time
+        self._monotonic_start = self._real_time()
+        if start is not None and start.tzinfo is None:
+            raise ValueError("The controlled clock's start must include a time zone")
+        self._utc_start = (start or dt_util.utcnow()).astimezone(UTC)
+        monkeypatch.setattr(self.loop, "time", lambda: self._real_time() + self.offset)
+        monkeypatch.setattr(dt_util, "utcnow", self.utcnow)
+        monkeypatch.setattr(dt_util, "now", self.now)
+
+    def utcnow(self):
+        elapsed = self._real_time() - self._monotonic_start + self.offset
+        return self._utc_start + timedelta(seconds=elapsed)
+
+    def now(self, time_zone=None):
+        return self.utcnow().astimezone(time_zone or dt_util.get_default_time_zone())
 
     async def drain(self):
         for _ in range(12):

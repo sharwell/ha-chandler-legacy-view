@@ -1,9 +1,10 @@
 """Sensor defaults, lifecycle, and retained choices using HA's own registries."""
 
-from datetime import datetime
+from datetime import UTC, datetime
 import logging
 import pytest
 from homeassistant.helpers import entity_registry as er
+from homeassistant.util import dt as dt_util
 from custom_components.chandler_legacy_view.const import DOMAIN, DATA_CONNECTION_MANAGER
 from packets import dashboard_frames
 
@@ -44,8 +45,47 @@ async def test_enabling_clock_uses_real_lifecycle_and_current_reading(hass, runt
     transport.valve().dashboards.append(dashboard_frames(hour=4, minute=36, is_pm=is_pm))
     await clock.run(connection(hass, entry).async_poll())
     published = datetime.fromisoformat(hass.states.get(identifier).state)
-    assert (published.hour, published.minute) == (expected_hour, 36)
+    expected = dt_util.as_local(dt_util.utcnow()).replace(
+        hour=expected_hour, minute=36, second=0, microsecond=0)
+    assert published.isoformat() == expected.astimezone(UTC).isoformat()
     assert er.async_get(hass).async_get(identifier).disabled_by is None
+
+
+@pytest.mark.parametrize("time_zone,clock,before,after", [
+    ("UTC", datetime(2026, 1, 31, 23, 59, tzinfo=UTC),
+     "2026-01-31T23:59:00+00:00", "2026-02-01T00:01:00+00:00"),
+    ("America/Chicago", datetime(2026, 2, 1, 5, 59, tzinfo=UTC),
+     "2026-01-31T23:59:00-06:00", "2026-02-01T00:01:00-06:00"),
+], indirect=["clock"], ids=["UTC-midnight", "Chicago-midnight"])
+async def test_clock_publishes_complete_timestamps_across_local_midnight(hass, entry_factory, runtime_factory, bluetooth_io, transport, clock, time_zone, before, after):
+    original_time_zone = hass.config.time_zone
+    try:
+        await hass.config.async_set_time_zone(time_zone)
+        entry = entry_factory()
+        record = er.async_get(hass).async_get_or_create("sensor", DOMAIN, "valve-a_time_of_day",
+                                                       config_entry=entry, disabled_by=None)
+        await runtime_factory(entry=entry)
+        bluetooth_io.advertise()
+        await hass.async_block_till_done()
+        valve = transport.valve()
+        for index, (expected_local, hour, minute, is_pm) in enumerate(
+            ((before, 11, 59, True), (after, 12, 1, False))
+        ):
+            if index:
+                # Advance the real retry deadline as well as the calendar.
+                # A stale local clock would date the fresh reading yesterday.
+                await clock.advance(120)
+            valve.dashboards.append(dashboard_frames(hour=hour, minute=minute, is_pm=is_pm))
+            await clock.run(connection(hass, entry).async_poll())
+            published = hass.states.get(record.entity_id).state
+            expected = datetime.fromisoformat(expected_local)
+            # HA serializes timestamp sensors in UTC; verify both that public
+            # state and the corresponding configured local date and offset.
+            assert published == expected.astimezone(UTC).isoformat()
+            local = dt_util.as_local(datetime.fromisoformat(published))
+            assert local.isoformat() == expected_local
+    finally:
+        await hass.config.async_set_time_zone(original_time_zone)
 
 
 @pytest.mark.parametrize("suffix", ["time_of_day", "water_usage_today"])
