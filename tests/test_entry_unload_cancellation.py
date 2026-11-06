@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from test_availability_platforms import production
+from legacy_platforms import production
 from test_entry_unload import integration
 
 

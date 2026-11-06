@@ -13,7 +13,7 @@ from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from test_availability_platforms import production
+from legacy_platforms import production
 
 
 def _load_registry_helpers():

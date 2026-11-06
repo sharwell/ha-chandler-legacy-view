@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from test_availability_platforms import production
+from legacy_platforms import production
 
 
 class SensorLifecycleTests(unittest.IsolatedAsyncioTestCase):

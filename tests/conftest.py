@@ -8,9 +8,15 @@ objects directly, without replacing their validation or starting host services.
 import pytest
 from types import MappingProxyType
 from homeassistant import loader
-from homeassistant.config_entries import ConfigEntries, ConfigEntry
+from homeassistant.config_entries import ConfigEntries, ConfigEntry, ConfigEntryState
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import device_registry, entity_registry, frame
+from homeassistant.helpers import (
+    area_registry, category_registry, device_registry, entity_registry,
+    floor_registry, frame, label_registry, issue_registry, entity,
+    restore_state, translation,
+)
+from custom_components import chandler_legacy_view as integration
+from custom_components.chandler_legacy_view.const import DOMAIN
 
 from custom_components.chandler_legacy_view import discovery
 from support import BluetoothIO
@@ -22,15 +28,41 @@ from custom_components.chandler_legacy_view import connection
 @pytest.fixture
 async def hass(tmp_path):
     instance = HomeAssistant(str(tmp_path))
+    instance.config.skip_pip = True
     loader.async_setup(instance)
     frame.async_setup(instance)
+    entity.async_setup(instance)
+    translation.async_setup(instance)
     device_registry.async_setup(instance)
     await device_registry.async_load(instance, load_empty=True)
     await entity_registry.async_load(instance, load_empty=True)
+    for registry in (area_registry, category_registry, floor_registry,
+                     label_registry, issue_registry):
+        await registry.async_load(instance, load_empty=True)
+    await restore_state.async_load(instance, load_empty=True)
     instance.config_entries = ConfigEntries(instance, {})
     await instance.config_entries.async_initialize()
     yield instance
     await instance.async_stop(force=True)
+
+
+@pytest.fixture
+async def runtime_factory(hass, entry_factory, bluetooth_io, transport):
+    entries = []
+    async def create(entry_id="test-entry", entry=None):
+        entry = entry or entry_factory(entry_id)
+        # Initialize this component without bootstrapping HA's Bluetooth/USB
+        # host services. Scanner and GATT boundaries are supplied by fixtures.
+        await integration.async_setup(hass, {})
+        hass.config.components.add(DOMAIN)
+        await entry.async_setup_locked(hass)
+        assert entry.state is ConfigEntryState.LOADED, entry.reason
+        entries.append(entry)
+        return entry
+    yield create
+    for entry in reversed(entries):
+        if entry.state is ConfigEntryState.LOADED:
+            await hass.config_entries.async_unload(entry.entry_id)
 
 
 @pytest.fixture

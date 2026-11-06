@@ -28,6 +28,9 @@ class BluetoothIO:
     def register(self, hass, callback, matcher, scanning_mode):
         registration = (callback, matcher, scanning_mode)
         self.advertisement_callbacks.append(registration)
+        for info in self.history.values():
+            if fnmatchcase(info.name, matcher["local_name"]):
+                callback(info, BluetoothChange.ADVERTISEMENT)
         return lambda: self.advertisement_callbacks.remove(registration)
 
     def track_unavailable(self, hass, callback, address, connectable=True):
