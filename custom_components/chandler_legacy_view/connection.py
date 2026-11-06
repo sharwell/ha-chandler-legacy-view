@@ -37,7 +37,7 @@ from .const import (
     MIN_PERSISTENT_POLL_INTERVAL_SECONDS,
 )
 from .device_registry import async_update_device_serial_number
-from .discovery import ValveDiscoveryChange, ValveDiscoveryManager
+from .discovery import ValveDiscoveryChange, ValveDiscoveryManager, _map_valve_type
 from .models import ValveAdvertisement, ValveDashboardData
 
 _LOGGER = logging.getLogger(__name__)
@@ -249,6 +249,7 @@ class ValveConnection:
         self._serial_number: str | None = None
         self._device_list_is_twin_valve: bool | None = None
         self._device_list_firmware_version: int | None = None
+        self._device_list_valve_type: str | None = None
         self._device_list_decoded_password: ValveDecodedPassword | None = None
         self._authentication_protocol = ValveAuthenticationProtocol.UNKNOWN
         self._device_list_password_state = ValvePasswordDecodeState.UNKNOWN
@@ -1256,6 +1257,7 @@ class ValveConnection:
         # it across authentication replies, but never borrow it on reconnect.
         self._device_list_firmware_version = None
         self._device_list_is_twin_valve = None
+        self._device_list_valve_type = None
         self._reset_device_list_state()
         loop = asyncio.get_running_loop()
         response_future: asyncio.Future[bytes] | None = loop.create_future()
@@ -1957,6 +1959,22 @@ class ValveConnection:
         first, second, third, fourth, fifth, sixth = packets
 
         try:
+            advertisement = self._advertisement
+            firmware = self._device_list_firmware_version
+            is_twin = self._device_list_is_twin_valve
+            valve_type = self._device_list_valve_type
+            if advertisement is not None:
+                if firmware is None:
+                    firmware = advertisement.firmware_version
+                if is_twin is None:
+                    is_twin = advertisement.is_twin_valve
+                if valve_type is None:
+                    valve_type = advertisement.valve_type
+            # CsDashboardPacket.parsePacket1/parsePacket2 (Water System 6.18.2)
+            # leave unsupported fields at their defaults. Reserved bytes on
+            # older firmware must not invent operating modes.
+            has_flags = bool(is_twin) or (firmware is not None and firmware >= 410)
+            has_soak = bool(is_twin) or (firmware is not None and firmware >= 210)
             time_hour = first[3]
             time_minute = first[4]
             is_pm = first[5] != 0
@@ -1969,7 +1987,7 @@ class ValveConnection:
             regeneration_time_hour = first[16]
             regeneration_time_is_pm = first[17] == 1
 
-            flags = first[18]
+            flags = first[18] if has_flags else 0
             shutoff_setting_enabled = bool(flags & 0x01)
             bypass_setting_enabled = bool(flags & 0x02)
             shutoff_active = bool(flags & 0x04)
@@ -1982,9 +2000,11 @@ class ValveConnection:
             pos_option_seconds = second[6]
             regen_cycle_position = second[7]
             regen_active = second[8]
-            prefill_soak_mode = bool(second[10] & 0x08)
-            soak_timer = second[11]
-            is_in_aeration = not bool(second[12] & 0x01)
+            prefill_soak_mode = has_soak and bool(second[10] & 0x08)
+            soak_timer = second[11] if has_soak else 0
+            is_in_aeration = (
+                valve_type == "NitroProSidekick" and not bool(second[12] & 0x01)
+            )
             tank_in_service = second[18]
 
             graph_values = (
@@ -2094,6 +2114,8 @@ class ValveConnection:
             self._reset_device_list_state()
             return
         self._device_list_is_twin_valve = bool(packet[2])
+        valve_type = _map_valve_type(packet[3], False)
+        self._device_list_valve_type = None if valve_type == "Unknown" else valve_type
 
         decoded_password = self._decode_device_list_password(packet)
         self._device_list_decoded_password = decoded_password
