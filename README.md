@@ -117,6 +117,13 @@ remain focused byte-to-result tests. Fake-only classifier outcomes that
 the production parser never emits have been replaced by actual rejected
 observations; malformed-input parser checks remain.
 
+Partial startup is also covered through the real discovery and connection
+managers and HA startup. Empty manufacturer data and logged short packets
+are tested both before and after entry setup: presence appears, followed
+by authenticated clock and water-use readings, while firmware stays unknown.
+The standalone connection fixture preserves existing scanner observations
+and does not supplement partial metadata with a complete advertisement.
+
 Narrow failure injection is retained for task-creation failure, platform
 unload refusal/cancellation, and unexpected manager cleanup errors. These
 are the core scenarios of those tests and cannot be produced by normal

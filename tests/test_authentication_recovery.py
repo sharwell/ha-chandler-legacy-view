@@ -38,10 +38,12 @@ async def test_partial_startup_authenticates_and_retrieves_dashboard(connection_
 
 
 async def test_logged_short_packet_startup_authenticates(connection_factory, discovery_manager, bluetooth_io, transport, clock):
-    bluetooth_io.advertise(raw=bytes.fromhex(LOGGED_SHORT_ADVERTISEMENTS[0]))
+    observation = bluetooth_io.advertise(raw=bytes.fromhex(LOGGED_SHORT_ADVERTISEMENTS[0]), manufacturer_data={})
     advertisement = discovery_manager.devices["valve-a"]
     assert advertisement.firmware_version is None
     connection = connection_factory(advertisement=advertisement)
+    assert bluetooth_io.history["valve-a"] is observation
+    assert not discovery_manager.devices["valve-a"].manufacturer_data_complete
     transport.valve().authenticated(counter=0)
     await clock.run(connection.async_poll())
     assert_dashboard(connection, transport.valve())

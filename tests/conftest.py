@@ -135,7 +135,15 @@ async def connection_factory(hass, discovery_manager, bluetooth_io, transport):
     connections = []
     def create(address="valve-a", passcode="1234", advertisement=None, state_callback=None,
                entry_id="test-entry"):
-        bluetooth_io.advertise(address)
+        if address not in bluetooth_io.history:
+            # A standalone connection may receive metadata at its module
+            # boundary. Do not fabricate a complete scanner observation when
+            # the scenario supplies partial metadata or already has an advert.
+            observation = {} if advertisement is None else {
+                "name": advertisement.name, "rssi": advertisement.rssi,
+                "manufacturer_data": advertisement.manufacturer_data,
+            }
+            bluetooth_io.advertise(address, **observation)
         instance = connection.ValveConnection(
             hass, address, entry_id,
             passcode_getter=lambda _: connection.ValvePasscodeConfiguration(passcode, True),
