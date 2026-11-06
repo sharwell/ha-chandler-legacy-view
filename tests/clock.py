@@ -20,8 +20,15 @@ class Clock:
             await asyncio.sleep(0)
 
     async def advance(self, seconds):
+        await self.drain()
         self.offset += seconds
         await self.drain()
+
+    async def until(self, predicate, budget=120):
+        async def wait():
+            while not predicate():
+                await asyncio.sleep(0)
+        await self.run(wait(), budget)
 
     async def run(self, awaitable, budget=120):
         task = asyncio.ensure_future(awaitable)

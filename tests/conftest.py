@@ -81,12 +81,12 @@ async def clock(monkeypatch):
 @pytest.fixture
 async def connection_factory(hass, discovery_manager, bluetooth_io, transport):
     connections = []
-    def create(address="valve-a", passcode="1357", advertisement=None):
+    def create(address="valve-a", passcode="1357", advertisement=None, state_callback=None):
         bluetooth_io.advertise(address)
         instance = connection.ValveConnection(
             hass, address, "test-entry",
             passcode_getter=lambda _: connection.ValvePasscodeConfiguration(passcode, True),
-            connection_state_callback=discovery_manager.async_set_connection_state,
+            connection_state_callback=state_callback or discovery_manager.async_set_connection_state,
         )
         instance.update_from_advertisement(advertisement or discovery_manager.devices[address])
         connections.append(instance)
