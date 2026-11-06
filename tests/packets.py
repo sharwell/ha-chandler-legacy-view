@@ -28,14 +28,15 @@ def raw_advertisement(*segments: bytes) -> bytes:
     )
 
 
-def device_list_frame(*, status: int, counter: int = 23) -> bytes:
+def device_list_frame(*, status: int, counter: int = 23,
+                      serial: bytes = b"\x01\x02\x03\x04") -> bytes:
     """Build a synthetic EVB019 response without using a device's private data."""
 
     packet = bytearray(20)
     packet[0:2] = b"tt"
     packet[7] = status
     packet[11] = counter
-    packet[13:17] = b"\x01\x02\x03\x04"
+    packet[13:17] = serial
     return bytes(packet)
 
 
