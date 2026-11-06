@@ -124,6 +124,11 @@ by authenticated clock and water-use readings, while firmware stays unknown.
 The standalone connection fixture preserves existing scanner observations
 and does not supplement partial metadata with a complete advertisement.
 
+Persistent refresh coverage turns the real HA switch on, observes successive
+water-use state-change events on one still-connected GATT session, and then
+turns it off for cleanup. This exposes notification leaks before disconnect
+can clear them or a replacement connection can supply the next reading.
+
 Narrow failure injection is retained for task-creation failure, platform
 unload refusal/cancellation, and unexpected manager cleanup errors. These
 are the core scenarios of those tests and cannot be produced by normal

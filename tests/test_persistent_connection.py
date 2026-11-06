@@ -2,7 +2,55 @@
 
 import asyncio
 import pytest
+from homeassistant.const import EVENT_STATE_CHANGED
+from homeassistant.helpers import entity_registry as er
+from custom_components.chandler_legacy_view.const import DOMAIN
 from packets import dashboard_frames
+
+
+async def test_persistent_refreshes_publish_new_readings_on_same_session(hass, runtime_factory, bluetooth_io, transport, clock):
+    await runtime_factory()
+    bluetooth_io.advertise()
+    await hass.async_block_till_done()
+    registry = er.async_get(hass)
+    usage = registry.async_get_entity_id("sensor", DOMAIN, "valve-a_water_usage_today")
+    persistent = registry.async_get_entity_id("switch", DOMAIN, "valve-a_persistent_connection")
+    assert usage is not None
+    assert persistent is not None
+    assert hass.states.get(usage).state == "unknown"
+    valve = transport.valve()
+    valve.dashboards.extend(dashboard_frames(gallons=reading) for reading in (123, 456, 789))
+    published = []
+    remove = hass.bus.async_listen(EVENT_STATE_CHANGED, lambda event:
+        published.append(event.data["new_state"].state)
+        if event.data["entity_id"] == usage and event.data["new_state"] else None)
+    try:
+        await hass.services.async_call("switch", "turn_on", {"entity_id": persistent}, blocking=True)
+        await hass.async_start()
+        await clock.until(lambda: hass.states.get(usage).state == "123")
+        assert len(valve.clients) == 1
+        session = valve.clients[0]
+        assert session.is_connected
+        # Disconnect clears subscriptions legitimately. Successive published
+        # readings must prove request cleanup while this same session is live,
+        # otherwise a one-shot disconnect could conceal a subscription leak.
+        for reading in (456, 789):
+            await clock.until(lambda: hass.states.get(usage).state == str(reading), budget=15)
+            assert valve.clients == [session]
+            assert session.is_connected
+            assert session.disconnects == 0
+            assert session.notifications == {}
+        assert published == ["123", "456", "789"]
+        assert hass.states.get(persistent).state == "on"
+    finally:
+        await clock.run(hass.services.async_call("switch", "turn_off", {"entity_id": persistent}, blocking=True))
+        remove()
+    assert valve.clients == [session]
+    assert not session.is_connected
+    assert session.disconnects == 1
+    assert session.notifications == {}
+    assert hass.states.get(persistent).state == "off"
+    assert hass.states.get(usage).state == "789"
 
 
 @pytest.mark.parametrize("started", [False, True], ids=["queued-handoff", "running-session"])
