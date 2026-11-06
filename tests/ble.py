@@ -2,7 +2,9 @@
 
 import asyncio
 from collections import deque
-from dataclasses import dataclass
+
+from bleak.backends.characteristic import BleakGATTCharacteristic
+from bleak.backends.service import BleakGATTService, BleakGATTServiceCollection
 
 from packets import dashboard_frames, device_list_frame
 
@@ -35,18 +37,6 @@ def authentication_pin(payload, counter):
         digits.append(encoded ^ state)
         previous = encoded
     return "".join(map(str, digits)) if all(digit < 10 for digit in digits) else None
-
-
-@dataclass
-class Characteristic:
-    uuid: str
-    properties: tuple[str, ...]
-
-
-@dataclass
-class Service:
-    uuid: str
-    characteristics: list[Characteristic]
 
 
 class Operation:
@@ -108,11 +98,20 @@ class Client:
         valve.connection_counter = (valve.connection_counter + 1) & 255
         self.challenge = None
         self.dashboard_access = not valve.authentication_required
+        # These Bleak data objects perform no host I/O. Keep the real service
+        # representation so polling cannot rely on a test-only list contract.
+        self._services = BleakGATTServiceCollection()
+        service = BleakGATTService(obj=None, handle=1, uuid=SERVICE)
+        self._services.add_service(service)
+        for handle, uuid, properties in ((2, WRITE, ["write"]), (3, NOTIFY, ["notify"])):
+            self._services.add_characteristic(BleakGATTCharacteristic(
+                obj=None, handle=handle, uuid=uuid, properties=properties,
+                max_write_without_response_size=lambda: 20, service=service,
+            ))
 
     @property
     def services(self):
-        return [Service(SERVICE, [Characteristic(WRITE, ("write",)),
-                                  Characteristic(NOTIFY, ("notify",))])]
+        return self._services
 
     def require_connected(self):
         if not self.is_connected:
@@ -140,8 +139,10 @@ class Client:
                 # preauthenticated session; it is never inherited on reconnect.
                 self.challenge = None
                 self.dashboard_access = True
+        characteristic = self.services.get_characteristic(NOTIFY)
+        assert characteristic is not None
         for callback in list(self.notifications.values()):
-            callback(NOTIFY, bytearray(packet))
+            callback(characteristic, bytearray(packet))
 
     async def write_gatt_char(self, uuid, payload, *, response):
         self.require_connected()

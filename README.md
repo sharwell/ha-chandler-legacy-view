@@ -97,8 +97,11 @@ No Bluetooth scanner, adapter, proxy, USB watcher, or HA server is started.
 
 Shared fakes supply scanner observations, expiry, and GATT I/O while
 production discovery, connection, protocol, and entity code runs normally.
-GATT sessions have distinct identities, services, subscriptions, gated
-operations, cancellation, and connected/disconnected state. The simulated
+GATT sessions have distinct identities, subscriptions, gated operations,
+cancellation, and connected/disconnected state. Each session exposes real
+Bleak service collections, services, and characteristics constructed without
+hardware access. Notification callbacks receive the real characteristic
+object, including queued notifications from old sessions. The simulated
 valve decodes authentication requests independently of the production
 encoder, checks the PIN against the current session's issued challenge,
 and withholds protected readings until access is established. Fixed

@@ -5,6 +5,7 @@ import pytest
 from homeassistant.const import EVENT_STATE_CHANGED
 from homeassistant.helpers import entity_registry as er
 from custom_components.chandler_legacy_view.const import DOMAIN
+from ble import NOTIFY
 from packets import dashboard_frames
 
 
@@ -201,6 +202,8 @@ async def test_old_notifications_cannot_satisfy_replacement_request(connection_f
     valve.dashboards.append(dashboard_frames(hour=4, minute=12, gallons=111))
     await clock.run(connection.async_poll())
     old_handler = valve.clients[0].notification_history[-1]
+    old_sender = valve.clients[0].services.get_characteristic(NOTIFY)
+    assert old_sender is not None
     assert connection.dashboard_data.water_usage == 111
     await clock.advance(31)
     valve.dashboards.append([])
@@ -210,7 +213,7 @@ async def test_old_notifications_cannot_satisfy_replacement_request(connection_f
         assert len(valve.clients) == 2
         assert valve.clients[1].notifications
         for packet in dashboard_frames(gallons=222):
-            old_handler("old-notify", bytearray(packet))
+            old_handler(old_sender, bytearray(packet))
         await clock.drain()
         assert not poll.done()
         assert connection.dashboard_data.water_usage == 111

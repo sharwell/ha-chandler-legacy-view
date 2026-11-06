@@ -1,9 +1,40 @@
 """Wire examples keep the shared valve fake from accepting arbitrary commands."""
 
 import pytest
+from bleak.backends.characteristic import BleakGATTCharacteristic
+from bleak.backends.service import BleakGATTService, BleakGATTServiceCollection
 
-from ble import NOTIFY, WRITE
+from ble import NOTIFY, SERVICE, WRITE
 from packets import AUTHENTICATION_VECTORS, device_list_frame
+
+
+async def test_simulated_session_exposes_bleak_service_and_notification_contract(bluetooth_io, transport):
+    info = bluetooth_io.advertise()
+    client = await transport.connect(None, info.device, info.name)
+    try:
+        services = client.services
+        # These types are the external API contract. Using the real graph makes
+        # a traversal that only accepts lists fail the normal polling tests.
+        assert isinstance(services, BleakGATTServiceCollection)
+        assert client.services is services
+        service = services.get_service(SERVICE)
+        assert isinstance(service, BleakGATTService)
+        write = services.get_characteristic(WRITE)
+        notify = services.get_characteristic(NOTIFY)
+        assert isinstance(write, BleakGATTCharacteristic)
+        assert isinstance(notify, BleakGATTCharacteristic)
+        assert write.service_handle == service.handle
+        assert notify.service_handle == service.handle
+        assert service.get_characteristic(NOTIFY) is notify
+        received = []
+        await client.start_notify(NOTIFY, lambda sender, packet: received.append((sender, bytes(packet))))
+        await client.write_gatt_char(WRITE, b"t" * 20, response=True)
+        assert received == [(notify, device_list_frame(status=0))]
+        await client.stop_notify(NOTIFY)
+        client.notify(device_list_frame(status=0))
+        assert len(received) == 1
+    finally:
+        await client.disconnect()
 
 
 @pytest.mark.parametrize("pin,counter,payload", AUTHENTICATION_VECTORS)
