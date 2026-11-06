@@ -26,25 +26,34 @@ from custom_components.chandler_legacy_view import connection
 
 
 @pytest.fixture
-async def hass(tmp_path):
-    instance = HomeAssistant(str(tmp_path))
-    instance.config.skip_pip = True
-    loader.async_setup(instance)
-    frame.async_setup(instance)
-    entity.async_setup(instance)
-    translation.async_setup(instance)
-    device_registry.async_setup(instance)
-    await device_registry.async_load(instance, load_empty=True)
-    await entity_registry.async_load(instance, load_empty=True)
-    for registry in (area_registry, category_registry, floor_registry,
-                     label_registry, issue_registry):
-        await registry.async_load(instance, load_empty=True)
-    await restore_state.async_load(instance, load_empty=True)
-    instance.config_entries = ConfigEntries(instance, {})
-    await instance.config_entries.async_initialize()
-    yield instance
-    await instance.async_stop(force=True)
+async def hass_factory():
+    instances = []
+    async def create(config_dir):
+        instance = HomeAssistant(str(config_dir))
+        instance.config.skip_pip = True
+        loader.async_setup(instance)
+        frame.async_setup(instance)
+        entity.async_setup(instance)
+        translation.async_setup(instance)
+        device_registry.async_setup(instance)
+        await device_registry.async_load(instance)
+        await entity_registry.async_load(instance)
+        for registry in (area_registry, category_registry, floor_registry,
+                         label_registry, issue_registry):
+            await registry.async_load(instance)
+        await restore_state.async_load(instance)
+        instance.config_entries = ConfigEntries(instance, {})
+        await instance.config_entries.async_initialize()
+        instances.append(instance)
+        return instance
+    yield create
+    for instance in reversed(instances):
+        await instance.async_stop(force=True)
 
+
+@pytest.fixture
+async def hass(tmp_path, hass_factory):
+    return await hass_factory(tmp_path)
 
 @pytest.fixture
 async def runtime_factory(hass, entry_factory, bluetooth_io, transport):
