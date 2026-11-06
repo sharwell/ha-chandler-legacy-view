@@ -31,6 +31,19 @@ AUTHENTICATION_VECTORS = (
     ("9999", 254, bytes.fromhex("747450413901a243eeaec9010203040506070809")),
 )
 
+# Synthetic DeviceList bytes 7..11, checked against Water System 6.18.2
+# CsDeviceListPacket.decodePassword(BBBBB). The second 1234 vector also
+# requires Dalvik division toward zero for negative, non-divisible bytes.
+CLASSIC_PASSWORD_VECTORS = (
+    ("0000", bytes.fromhex("50e0c0a080")),
+    ("0001", bytes.fromhex("50e1c2a384")),
+    ("1234", bytes.fromhex("5cf6ead9c0")),
+    ("1234", bytes.fromhex("5cf6e9d8bd")),
+    ("1357", bytes.fromhex("5cfcf6e8cc")),
+    ("9999", bytes.fromhex("5c100efad4")),
+    ("1357", bytes.fromhex("70101e241c")),
+)
+
 
 def raw_advertisement(*segments: bytes) -> bytes:
     """Wrap company-prefixed payloads in Bluetooth manufacturer AD structures."""

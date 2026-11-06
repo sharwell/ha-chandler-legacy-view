@@ -2235,10 +2235,16 @@ class ValveConnection:
         """Decode the four-digit passcode embedded in legacy DeviceList packets."""
 
         self._device_list_connection_counter = None
+        # CsDeviceListPacket.decodePassword(BBBBB) uses signed bytes and
+        # Dalvik integer division, which truncates toward zero rather than
+        # Python's floor division. Values here are bounded to a single byte.
+        byte_a, byte_b, byte_c, byte_d = (
+            self._to_signed_byte(value) for value in (byte_a, byte_b, byte_c, byte_d)
+        )
         b = self._to_signed_byte(status - 112)
-        b2 = self._to_signed_byte((byte_d // 4) - b)
-        b3 = self._to_signed_byte((byte_c // 3) - b2 - b)
-        b4 = self._to_signed_byte((byte_b // 2) - b3 - b2 - b)
+        b2 = self._to_signed_byte(int(byte_d / 4) - b)
+        b3 = self._to_signed_byte(int(byte_c / 3) - b2 - b)
+        b4 = self._to_signed_byte(int(byte_b / 2) - b3 - b2 - b)
         b5 = self._to_signed_byte(byte_a - b4 - b3 - b2 - b)
 
         digits = [b5, b4, b3, b2]

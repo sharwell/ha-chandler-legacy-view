@@ -4,7 +4,10 @@ from dataclasses import replace
 import logging
 import pytest
 from custom_components.chandler_legacy_view.models import ValveAdvertisement
-from packets import device_list_frame, classic_device_list_frame, LOGGED_SHORT_ADVERTISEMENTS
+from packets import (
+    CLASSIC_PASSWORD_VECTORS, LOGGED_SHORT_ADVERTISEMENTS,
+    classic_device_list_frame, device_list_frame,
+)
 
 
 def partial():
@@ -143,11 +146,34 @@ async def test_classic_metadata_retains_legacy_dashboard_access(connection_facto
     assert_dashboard(connection, valve)
 
 
-async def test_invalid_classic_decode_never_falls_back_to_pin_attempts(connection_factory, transport, clock):
+@pytest.mark.parametrize("pin,encoded", CLASSIC_PASSWORD_VECTORS)
+async def test_signed_classic_response_allows_dashboard(
+    connection_factory, transport, clock, pin, encoded,
+):
+    # A signed-byte decode failure must not strand an otherwise unprotected
+    # legacy valve without readings or send unnecessary authentication writes.
+    connection = connection_factory(advertisement=classic(), passcode=pin)
+    valve = transport.valve()
+    valve.authentication_required = False
+    response = bytearray(device_list_frame(status=encoded[0]))
+    response[7:12] = encoded
+    valve.device_lists.append([bytes(response)])
+    await clock.run(connection.async_poll())
+    assert_dashboard(connection, valve)
+    assert valve.authentication_payloads == []
+    assert not connection.authentication_lockout
+
+
+@pytest.mark.parametrize("encoded", [bytes(5), bytes.fromhex("70ffffffff")])
+async def test_invalid_classic_decode_never_falls_back_to_pin_attempts(
+    connection_factory, transport, clock, encoded,
+):
     connection = connection_factory(advertisement=classic())
     valve = transport.valve()
     for _ in range(4):
-        valve.device_lists.append([device_list_frame(status=0)])
+        response = bytearray(device_list_frame(status=encoded[0]))
+        response[7:12] = encoded
+        valve.device_lists.append([bytes(response)])
         await clock.run(connection.async_poll())
         await clock.advance(31)
     assert valve.authentication_payloads == []
