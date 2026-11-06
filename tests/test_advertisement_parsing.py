@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from test_device_registry import helpers as registry_helpers, production
-from test_discovery_availability import discovery_module as discovery
+from legacy_discovery import discovery_module as discovery
 
 
 MODERN_422 = bytes.fromhex("3a070100082aae00010203040422")

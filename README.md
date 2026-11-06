@@ -68,6 +68,30 @@ lookups and parent-device links by registry ID.
 
 ## Development
 
+### Tests
+
+Use Python 3.14.2 or later with the pinned Home Assistant 2026.10.4 test
+environment. Create a virtual environment, install `requirements-test.txt`,
+then run `python -m pytest`. The migrated fixtures work on native Windows
+and initialize Home Assistant's real objects directly. They avoid the
+upstream fixture plugin's Unix-only startup runner.
+
+Home Assistant configuration and registry storage are confined to the
+test-owned `.pytest-tmp` directory, which pytest recreates for each run.
+External sockets are blocked; loopback and Unix sockets remain available
+for asyncio's internal wakeup mechanism. Bluetooth advertisements and
+expiry notifications are simulated through shared callbacks. No Bluetooth
+scanner, adapter, proxy, USB watcher, or Home Assistant server is started.
+This validation does not establish physical disconnection or released
+proxy connection capacity.
+
+Tests are being migrated in nine steps: discovery, advertisement metadata,
+authentication, session ownership, bounded cancellation, published
+availability, sensor settings, registries, and entry teardown. Each step
+keeps its consumers runnable and removes legacy support as its last
+consumer migrates. The declared minimum Home Assistant version remains
+2026.8.0; validation of that version is part of the final migration audit.
+
 * `custom_components/chandler_legacy_view/discovery.py` implements the Bluetooth
   discovery logic.
 * `custom_components/chandler_legacy_view/binary_sensor.py` defines the initial
