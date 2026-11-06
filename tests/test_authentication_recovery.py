@@ -134,6 +134,7 @@ async def test_repeated_valid_rejections_lock_out_pin(connection_factory, transp
 async def test_classic_metadata_retains_legacy_dashboard_access(connection_factory, transport, clock):
     connection = connection_factory(advertisement=classic())
     valve = transport.valve()
+    valve.authentication_required = False
     valve.device_lists.append([classic_device_list_frame()])
     await clock.run(connection.async_poll())
     assert valve.authentication_payloads == []
@@ -219,9 +220,23 @@ async def test_logs_omit_configured_and_decoded_pin(connection_factory, transpor
     caplog.set_level(logging.DEBUG)
     connection = connection_factory(passcode=passcode, advertisement=advertisement)
     valve = transport.valve()
+    valve.pin = "1357"
+    valve.authentication_required = advertisement.authentication_required is not False
     valve.device_lists.append([response])
     await clock.run(connection.async_poll())
     assert passcode not in caplog.text
     assert "digits=" not in caplog.text
     for payload in valve.authentication_payloads:
         assert payload.hex() not in caplog.text
+
+
+async def test_incorrect_pin_cannot_publish_dashboard(connection_factory, transport, clock):
+    connection = connection_factory(passcode="2468")
+    valve = transport.valve()
+    await clock.run(connection.async_poll())
+    assert connection.authentication_lockout
+    assert connection.dashboard_data is None
+    assert connection.last_success is None
+    assert valve.dashboard_requests == 0
+    assert len(valve.authentication_payloads) == 4
+    assert not valve.clients[-1].is_connected

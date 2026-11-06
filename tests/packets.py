@@ -19,6 +19,18 @@ FOREIGN_MANUFACTURER_ADVERTISEMENT = bytes.fromhex(
     "02010609ff59000100052552000e0943535f4d657465725f536f6674"
 )
 
+# Synthetic reference requests, calculated with polynomial long division rather
+# than the production encoder. Each row is PIN, challenge, and complete request.
+# For row 1 (polynomial 0x11d), the successive remainders are
+# 92, 54, ff, 39, 85; XOR with digits 1, 2, 3, 4 gives 55, fd, 3a, 81.
+# These are arithmetic protocol examples, not captured hardware evidence.
+AUTHENTICATION_VECTORS = (
+    ("1234", 23, bytes.fromhex("747450411da55a55fd3a81010203040506070809")),
+    ("1357", 0, bytes.fromhex("74745041872345f19c867b010203040506070809")),
+    ("0001", 255, bytes.fromhex("747450419bff7ea0cfe2e9010203040506070809")),
+    ("9999", 254, bytes.fromhex("747450413901a243eeaec9010203040506070809")),
+)
+
 
 def raw_advertisement(*segments: bytes) -> bytes:
     """Wrap company-prefixed payloads in Bluetooth manufacturer AD structures."""

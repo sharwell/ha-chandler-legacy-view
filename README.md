@@ -98,7 +98,12 @@ No Bluetooth scanner, adapter, proxy, USB watcher, or HA server is started.
 Shared fakes supply scanner observations, expiry, and GATT I/O while
 production discovery, connection, protocol, and entity code runs normally.
 GATT sessions have distinct identities, services, subscriptions, gated
-operations, cancellation, and connected/disconnected state. The shared
+operations, cancellation, and connected/disconnected state. The simulated
+valve decodes authentication requests independently of the production
+encoder, checks the PIN against the current session's issued challenge,
+and withholds protected readings until access is established. Fixed
+synthetic wire examples exercise this decoder, including challenge wrap
+and rejection of stale requests; they are not live-valve captures. The shared
 clock advances event-loop deadlines and HA UTC time together without
 shortening production retries or cleanup budgets.
 
