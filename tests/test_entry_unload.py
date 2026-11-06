@@ -2,34 +2,39 @@
 
 import asyncio
 import pytest
-from homeassistant.config_entries import ConfigEntryState
+from homeassistant.config_entries import ConfigEntryState, OperationNotAllowed
 from homeassistant.helpers import entity_registry as er
-from custom_components import chandler_legacy_view as integration
 from custom_components.chandler_legacy_view.const import DOMAIN, DATA_CONNECTION_MANAGER, DATA_DISCOVERY_MANAGER
 
 
-async def test_failed_platform_unload_preserves_runtime_for_retry(hass, runtime_factory, bluetooth_io, monkeypatch):
+async def test_failed_platform_unload_retains_runtime_and_blocks_retry(hass, runtime_factory, bluetooth_io, monkeypatch):
     entry = await runtime_factory()
     bluetooth_io.advertise()
     await hass.async_block_till_done()
     runtime = hass.data[DOMAIN][entry.entry_id]
     presence = er.async_get(hass).async_get_entity_id("binary_sensor", DOMAIN, "valve-a")
+    advertisements = list(bluetooth_io.advertisement_callbacks)
+    unavailable = list(bluetooth_io.unavailable_callbacks)
     async def refuse(entry, platforms):
+        assert entry.state is ConfigEntryState.UNLOAD_IN_PROGRESS
         return False
     # Platform refusal is the behavior this module must handle. The real HA
     # entity platform catches entity-removal errors, so Bluetooth I/O cannot
     # produce this return value; inject it only at this public API boundary.
     with monkeypatch.context() as context:
         context.setattr(hass.config_entries, "async_unload_platforms", refuse)
-        for _ in range(2):
-            assert not await integration.async_unload_entry(hass, entry)
-            assert hass.data[DOMAIN][entry.entry_id] is runtime
-            assert hass.states.get(presence).state == "on"
-    assert await hass.config_entries.async_unload(entry.entry_id)
-    assert entry.state is ConfigEntryState.NOT_LOADED
-    assert DOMAIN not in hass.data
-    assert bluetooth_io.advertisement_callbacks == []
-    assert bluetooth_io.unavailable_callbacks == []
+        assert not await hass.config_entries.async_unload(entry.entry_id)
+    assert entry.state is ConfigEntryState.FAILED_UNLOAD
+    assert hass.data[DOMAIN][entry.entry_id] is runtime
+    assert hass.states.get(presence).state == "on"
+    assert bluetooth_io.advertisement_callbacks == advertisements
+    assert bluetooth_io.unavailable_callbacks == unavailable
+    # A direct integration call would bypass HA's failed-entry guard and imply
+    # users can retry an unload that the real config-entry API rejects.
+    with pytest.raises(OperationNotAllowed, match="non recoverable state"):
+        await hass.config_entries.async_unload(entry.entry_id)
+    assert entry.state is ConfigEntryState.FAILED_UNLOAD
+    assert hass.data[DOMAIN][entry.entry_id] is runtime
 
 
 async def test_successful_unload_preserves_other_entry_and_discovery(hass, runtime_factory, bluetooth_io):
@@ -67,22 +72,32 @@ async def test_unexpected_connection_cleanup_error_still_releases_discovery(hass
     assert bluetooth_io.unavailable_callbacks == []
 
 
-async def test_cancelled_platform_unload_keeps_runtime_and_states(hass, runtime_factory, bluetooth_io, monkeypatch):
+async def test_cancelled_platform_unload_retains_runtime_and_blocks_retry(hass, runtime_factory, bluetooth_io, monkeypatch):
     entry = await runtime_factory()
     bluetooth_io.advertise()
     await hass.async_block_till_done()
     runtime = hass.data[DOMAIN][entry.entry_id]
     identifier = er.async_get(hass).async_get_entity_id("binary_sensor", DOMAIN, "valve-a")
+    advertisements = list(bluetooth_io.advertisement_callbacks)
+    unavailable = list(bluetooth_io.unavailable_callbacks)
     async def cancelled(entry, platforms):
+        assert entry.state is ConfigEntryState.UNLOAD_IN_PROGRESS
         raise asyncio.CancelledError
     with monkeypatch.context() as context:
         context.setattr(hass.config_entries, "async_unload_platforms", cancelled)
         with pytest.raises(asyncio.CancelledError):
-            await integration.async_unload_entry(hass, entry)
+            await hass.config_entries.async_unload(entry.entry_id)
+    assert entry.state is ConfigEntryState.UNLOAD_IN_PROGRESS
     assert hass.data[DOMAIN][entry.entry_id] is runtime
     assert hass.states.get(identifier).state == "on"
-    assert bluetooth_io.advertisement_callbacks
-    assert await hass.config_entries.async_unload(entry.entry_id)
+    assert bluetooth_io.advertisement_callbacks == advertisements
+    assert bluetooth_io.unavailable_callbacks == unavailable
+    # Cancellation also leaves a non-recoverable entry; do not reset its state
+    # in the fixture to manufacture a successful unload retry.
+    with pytest.raises(OperationNotAllowed, match="non recoverable state"):
+        await hass.config_entries.async_unload(entry.entry_id)
+    assert entry.state is ConfigEntryState.UNLOAD_IN_PROGRESS
+    assert hass.data[DOMAIN][entry.entry_id] is runtime
 
 
 async def test_concurrent_entry_unloads_preserve_cancellation(hass, runtime_factory, bluetooth_io, transport, clock):

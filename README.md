@@ -118,6 +118,12 @@ are the core scenarios of those tests and cannot be produced by normal
 Bluetooth responses. There are no synthetic HA entity/registry classes,
 private production-method replacements, or cross-test fixture imports.
 
+Unload failures and cancellation run through HA's config-entry API. A
+platform refusal leaves the entry in `FAILED_UNLOAD`; cancellation during
+platform unload leaves `UNLOAD_IN_PROGRESS`. Both retain the runtime and
+published entities, and HA rejects a subsequent unload attempt. These
+tests do not reset entry state or imply that retrying unload is supported.
+
 Validation uses simulated Bluetooth I/O. In particular, a timed-out
 disconnect deliberately leaves the simulated link connected; completion
 of a cleanup task does not establish physical disconnection or released
