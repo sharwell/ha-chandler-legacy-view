@@ -7,7 +7,7 @@ import contextlib
 import inspect
 import logging
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from datetime import datetime
 from enum import Enum, IntEnum
 from random import SystemRandom
@@ -39,6 +39,11 @@ from .const import (
 from .device_registry import async_update_device_serial_number
 from .discovery import ValveDiscoveryChange, ValveDiscoveryManager, _map_valve_type
 from .models import ValveAdvertisement, ValveDashboardData
+from .protocol_compatibility import (
+    PreviousProtocol,
+    password_digits,
+    previous_dashboard_packet_index,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -264,6 +269,7 @@ class ValveConnection:
         self._passcode_getter = passcode_getter
         self._connection_state_callback = connection_state_callback
         self._crc8 = _ChandlerCrc8()
+        self._previous_protocol = PreviousProtocol()
         self._persistent_connection_enabled = False
         self._persistent_poll_interval = DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS
         self._persistent_task: asyncio.Task[None] | None = None
@@ -453,6 +459,7 @@ class ValveConnection:
     def update_from_advertisement(self, advertisement: ValveAdvertisement) -> None:
         """Record the most recent Bluetooth advertisement for the valve."""
 
+        self._previous_protocol.observe_advertisement(advertisement)
         self._advertisement = advertisement
         self._available = True
         self._last_seen = dt_util.utcnow()
@@ -1258,6 +1265,7 @@ class ValveConnection:
         self._device_list_firmware_version = None
         self._device_list_is_twin_valve = None
         self._device_list_valve_type = None
+        self._previous_protocol.begin_poll()
         self._reset_device_list_state()
         loop = asyncio.get_running_loop()
         response_future: asyncio.Future[bytes] | None = loop.create_future()
@@ -1386,6 +1394,7 @@ class ValveConnection:
                     ):
                         self._record_authentication_failure(passcode)
 
+            self._log_device_list_compatibility()
             return True, response_received
         finally:
             if response_future is not None and not response_future.done():
@@ -1488,6 +1497,7 @@ class ValveConnection:
     ) -> tuple[bool, bool]:
         """Send the authentication payload and wait for a DeviceList response."""
 
+        self._previous_protocol.before_authentication(connection_counter)
         self._reset_device_list_state()
         payload = self._create_password_buffer(connection_counter, passcode_value)
         _LOGGER.debug(
@@ -1606,12 +1616,20 @@ class ValveConnection:
         loop = asyncio.get_running_loop()
         response_future: asyncio.Future[list[bytes]] = loop.create_future()
         packets: dict[int, bytes] = {}
+        previous_packets: dict[int, bytes] = {}
+        compare_previous = self._previous_protocol.access
 
         def _notification_handler(_: int | str, data: bytearray) -> None:
+            if response_future.cancelled():
+                return
+            packet = bytes(data)
+            if compare_previous and len(previous_packets) < _DASHBOARD_PACKET_COUNT:
+                previous_index = previous_dashboard_packet_index(packet, previous_packets)
+                if previous_index is not None:
+                    previous_packets[previous_index] = packet
             if response_future.done():
                 return
 
-            packet = bytes(data)
             index = self._get_dashboard_packet_index(packet, packets)
             status: str
             if index is None:
@@ -1669,6 +1687,15 @@ class ValveConnection:
                     "Timed out waiting for Dashboard response from valve %s",
                     self._address,
                 )
+                if len(previous_packets) == _DASHBOARD_PACKET_COUNT:
+                    _LOGGER.warning(
+                        "Protocol compatibility: valve %s previous Dashboard framing "
+                        "accepted a complete response but current framing rejected it "
+                        "(previous_lengths=%s, current_indexes=%s); readings were not updated",
+                        self._address,
+                        [len(previous_packets[i]) for i in range(_DASHBOARD_PACKET_COUNT)],
+                        sorted(packets),
+                    )
                 return True, False
             except asyncio.CancelledError:
                 raise
@@ -1681,7 +1708,29 @@ class ValveConnection:
                 )
                 return True, False
 
-            self._handle_dashboard_packets(packets_list)
+            dashboard = self._handle_dashboard_packets(packets_list)
+            if (
+                dashboard is not None
+                and len(previous_packets) == _DASHBOARD_PACKET_COUNT
+                and _LOGGER.isEnabledFor(logging.DEBUG)
+            ):
+                self._log_device_list_compatibility(dashboard_succeeded=True)
+                previous = self._decode_dashboard_fields([
+                    previous_packets[i] for i in range(_DASHBOARD_PACKET_COUNT)
+                ])
+                changed_fields = [
+                    field.name for field in fields(dashboard)
+                    if getattr(previous, field.name) != getattr(dashboard, field.name)
+                ]
+                if changed_fields:
+                    _LOGGER.debug(
+                        "Protocol compatibility: valve %s Dashboard succeeds under both "
+                        "decoders with changed fields=%s (session_firmware=%s, "
+                        "advertised_firmware=%s, twin=%s, valve_type=%s)",
+                        self._address, changed_fields, self._device_list_firmware_version,
+                        self._previous_protocol.advertised_firmware,
+                        self._device_list_is_twin_valve, self._device_list_valve_type,
+                    )
             return True, True
         finally:
             await self._async_unsubscribe_notifications(client, subscriptions)
@@ -1935,7 +1984,7 @@ class ValveConnection:
 
         return None
 
-    def _handle_dashboard_packets(self, packets: list[bytes]) -> None:
+    def _handle_dashboard_packets(self, packets: list[bytes]) -> ValveDashboardData | None:
         """Parse and store the most recent Dashboard response from the valve."""
 
         if len(packets) != _DASHBOARD_PACKET_COUNT:
@@ -1956,8 +2005,6 @@ class ValveConnection:
                 return
             validated[index] = packet
 
-        first, second, third, fourth, fifth, sixth = packets
-
         try:
             advertisement = self._advertisement
             firmware = self._device_list_firmware_version
@@ -1975,73 +2022,17 @@ class ValveConnection:
             # older firmware must not invent operating modes.
             has_flags = bool(is_twin) or (firmware is not None and firmware >= 410)
             has_soak = bool(is_twin) or (firmware is not None and firmware >= 210)
-            time_hour = first[3]
-            time_minute = first[4]
-            is_pm = first[5] != 0
-            battery_capacity = self._calculate_battery_capacity(first[6])
-            present_flow = self._decode_flow_value(first, 7)
-            water_remaining = self._read_uint16_be(first, 9)
-            water_usage = self._read_uint16_be(first, 11)
-            peak_flow = self._decode_flow_value(first, 13)
-            water_hardness = first[15]
-            regeneration_time_hour = first[16]
-            regeneration_time_is_pm = first[17] == 1
-
-            flags = first[18] if has_flags else 0
-            shutoff_setting_enabled = bool(flags & 0x01)
-            bypass_setting_enabled = bool(flags & 0x02)
-            shutoff_active = bool(flags & 0x04)
-            bypass_active = bool(flags & 0x08)
-            display_off = bool(flags & 0x10)
-
-            filter_backwash = second[3]
-            air_recharge = second[4]
-            pos_time = second[5]
-            pos_option_seconds = second[6]
-            regen_cycle_position = second[7]
-            regen_active = second[8]
-            prefill_soak_mode = has_soak and bool(second[10] & 0x08)
-            soak_timer = second[11] if has_soak else 0
-            is_in_aeration = (
-                valve_type == "NitroProSidekick" and not bool(second[12] & 0x01)
-            )
-            tank_in_service = second[18]
-
-            graph_values = (
-                list(third[3:20])
-                + list(fourth[0:20])
-                + list(fifth[0:20])
-                + list(sixth[0:5])
-            )
-
-            dashboard = ValveDashboardData(
-                time_hour=time_hour,
-                time_minute=time_minute,
-                is_pm=is_pm,
-                battery_capacity=battery_capacity,
-                present_flow=present_flow,
-                water_remaining_until_regeneration=water_remaining,
-                water_usage=water_usage,
-                peak_flow=peak_flow,
-                water_hardness=water_hardness,
-                regeneration_time_hour=regeneration_time_hour,
-                regeneration_time_is_pm=regeneration_time_is_pm,
-                shutoff_setting_enabled=shutoff_setting_enabled,
-                bypass_setting_enabled=bypass_setting_enabled,
-                shutoff_active=shutoff_active,
-                bypass_active=bypass_active,
-                display_off=display_off,
-                filter_backwash=filter_backwash,
-                air_recharge=air_recharge,
-                pos_time=pos_time,
-                pos_option_seconds=pos_option_seconds,
-                regen_cycle_position=regen_cycle_position,
-                regen_active=regen_active,
-                prefill_soak_mode=prefill_soak_mode,
-                soak_timer=soak_timer,
-                is_in_aeration=is_in_aeration,
-                tank_in_service=tank_in_service,
-                graph_usage_ten_gallons=tuple(graph_values),
+            raw = self._decode_dashboard_fields(packets)
+            dashboard = replace(
+                raw,
+                shutoff_setting_enabled=has_flags and raw.shutoff_setting_enabled,
+                bypass_setting_enabled=has_flags and raw.bypass_setting_enabled,
+                shutoff_active=has_flags and raw.shutoff_active,
+                bypass_active=has_flags and raw.bypass_active,
+                display_off=has_flags and raw.display_off,
+                prefill_soak_mode=has_soak and raw.prefill_soak_mode,
+                soak_timer=raw.soak_timer if has_soak else 0,
+                is_in_aeration=valve_type == "NitroProSidekick" and raw.is_in_aeration,
             )
         except Exception:  # pragma: no cover - parsing errors should be rare
             _LOGGER.exception(
@@ -2051,6 +2042,68 @@ class ValveConnection:
 
         self._dashboard_data = dashboard
         self._notify_dashboard_listeners(dashboard)
+        return dashboard
+
+    def _decode_dashboard_fields(self, packets: list[bytes]) -> ValveDashboardData:
+        """Decode shared byte positions before applying capability conditions."""
+
+        first, second, third, fourth, fifth, sixth = packets
+        return ValveDashboardData(
+            time_hour=first[3], time_minute=first[4], is_pm=first[5] != 0,
+            battery_capacity=self._calculate_battery_capacity(first[6]),
+            present_flow=self._decode_flow_value(first, 7),
+            water_remaining_until_regeneration=self._read_uint16_be(first, 9),
+            water_usage=self._read_uint16_be(first, 11),
+            peak_flow=self._decode_flow_value(first, 13), water_hardness=first[15],
+            regeneration_time_hour=first[16], regeneration_time_is_pm=first[17] == 1,
+            shutoff_setting_enabled=bool(first[18] & 0x01),
+            bypass_setting_enabled=bool(first[18] & 0x02),
+            shutoff_active=bool(first[18] & 0x04), bypass_active=bool(first[18] & 0x08),
+            display_off=bool(first[18] & 0x10), filter_backwash=second[3],
+            air_recharge=second[4], pos_time=second[5], pos_option_seconds=second[6],
+            regen_cycle_position=second[7], regen_active=second[8],
+            prefill_soak_mode=bool(second[10] & 0x08), soak_timer=second[11],
+            is_in_aeration=not bool(second[12] & 0x01), tank_in_service=second[18],
+            graph_usage_ten_gallons=tuple(third[3:20] + fourth[:20] + fifth[:20] + sixth[:5]),
+        )
+
+    def _log_device_list_compatibility(self, *, dashboard_succeeded: bool = False) -> None:
+        """Log only previous acceptance followed by rejection or changed meaning."""
+
+        previous = self._previous_protocol
+        if not previous.access:
+            return
+        if not self._has_dashboard_access():
+            _LOGGER.warning(
+                "Protocol compatibility: valve %s DeviceList allowed Dashboard access "
+                "under the previous decoder but is rejected by the current decoder "
+                "(previous_protocol=%s, current_protocol=%s, firmware_fields=%s, "
+                "advertised_firmware=%s, decode_state=%s)",
+                self._address, previous.accepted_protocol, self._authentication_protocol.value,
+                previous.firmware_fields, previous.advertised_firmware,
+                self._device_list_password_state.value,
+            )
+            return
+        if not dashboard_succeeded:
+            return
+        decoded = self._device_list_decoded_password
+        changed_digits = (
+            previous.accepted_protocol == self._authentication_protocol.value == "classic"
+            and decoded is not None
+            and tuple(map(int, decoded.passcode)) != previous.accepted_digits
+        )
+        if (
+            previous.actions_changed
+            or previous.accepted_protocol != self._authentication_protocol.value
+            or changed_digits
+        ):
+            _LOGGER.debug(
+                "Protocol compatibility: valve %s DeviceList succeeds under both "
+                "decoders with changed interpretation (previous_protocol=%s, "
+                "current_protocol=%s, firmware_fields=%s, advertised_firmware=%s)",
+                self._address, previous.accepted_protocol, self._authentication_protocol.value,
+                previous.firmware_fields, previous.advertised_firmware,
+            )
 
     def _notify_dashboard_listeners(
         self, dashboard: ValveDashboardData | None
@@ -2114,6 +2167,7 @@ class ValveConnection:
             self._reset_device_list_state()
             return
         self._device_list_is_twin_valve = bool(packet[2])
+        self._previous_protocol.observe_device_list(packet)
         valve_type = _map_valve_type(packet[3], False)
         self._device_list_valve_type = None if valve_type == "Unknown" else valve_type
 
@@ -2296,18 +2350,8 @@ class ValveConnection:
 
         self._device_list_connection_counter = None
         # CsDeviceListPacket.decodePassword(BBBBB) uses signed bytes and
-        # Dalvik integer division, which truncates toward zero rather than
-        # Python's floor division. Values here are bounded to a single byte.
-        byte_a, byte_b, byte_c, byte_d = (
-            self._to_signed_byte(value) for value in (byte_a, byte_b, byte_c, byte_d)
-        )
-        b = self._to_signed_byte(status - 112)
-        b2 = self._to_signed_byte(int(byte_d / 4) - b)
-        b3 = self._to_signed_byte(int(byte_c / 3) - b2 - b)
-        b4 = self._to_signed_byte(int(byte_b / 2) - b3 - b2 - b)
-        b5 = self._to_signed_byte(byte_a - b4 - b3 - b2 - b)
-
-        digits = [b5, b4, b3, b2]
+        # Dalvik division toward zero. The unsigned mode is diagnostic only.
+        digits = password_digits(status, byte_a, byte_b, byte_c, byte_d, signed_bytes=True)
         valid = all(0 <= digit < 10 for digit in digits)
 
         if valid:
