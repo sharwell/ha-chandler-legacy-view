@@ -129,6 +129,12 @@ water-use state-change events on one still-connected GATT session, and then
 turns it off for cleanup. This exposes notification leaks before disconnect
 can clear them or a replacement connection can supply the next reading.
 
+Configured authentication runs through real config entries and the
+production connection manager. Tests cover custom default PINs, per-valve
+override precedence without affecting another valve, and published lockout
+and reading recovery after correcting settings through HA's options flow
+and automatic reload. Simulated valves retain independently configured PINs.
+
 Narrow failure injection is retained for task-creation failure, platform
 unload refusal/cancellation, and unexpected manager cleanup errors. These
 are the core scenarios of those tests and cannot be produced by normal
