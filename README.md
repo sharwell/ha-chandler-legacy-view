@@ -70,95 +70,28 @@ lookups and parent-device links by registry ID.
 
 ### Tests
 
-Use Python 3.14 (validated with 3.14.2). Create a virtual environment,
-install one of the requirement sets below, then run `python -m pytest`.
-Each target pins its Home Assistant release and that release's declared
-Bluetooth and USB integration dependencies.
+Use Python 3.14 (validated with 3.14.2). Create and activate a virtual
+environment, then choose a requirements file for the HA version to test:
 
 | Home Assistant target | Test requirements |
 | --- | --- |
 | 2026.10.4 | `requirements-test.txt` |
 | 2026.8.0, the declared minimum | `requirements-test-min.txt` |
 
-The fixtures run on native Windows and initialize HA's real objects
-directly, including config entries, platforms, services, state machine,
-event bus, registries, and storage restoration. They avoid the upstream
-fixture plugin's Unix-only startup runner; no HA validation rules are
-reimplemented in local entity or registry substitutes.
+Install the selected requirements and run the suite, for example:
 
-Home Assistant configuration and registry storage are confined to the
-test-owned `.pytest-tmp` directory, which pytest recreates for each run.
-External sockets are blocked. Loopback and Unix sockets are allowed for
-asyncio's initial wakeup mechanism; once a real-HA fixture is active,
-connections (including loopback), server binds/listeners, and datagrams
-are also rejected. Fixture paths outside the owning test's directory are
-rejected before HA is constructed. Runtime package installation is off.
-No Bluetooth scanner, adapter, proxy, USB watcher, or HA server is started.
+```console
+python -m pip install -r requirements-test.txt
+python -m pytest
+```
 
-Shared fakes supply scanner observations, expiry, and GATT I/O while
-production discovery, connection, protocol, and entity code runs normally.
-GATT sessions have distinct identities, subscriptions, gated operations,
-cancellation, and connected/disconnected state. Each session exposes real
-Bleak service collections, services, and characteristics constructed without
-hardware access. Notification callbacks receive the real characteristic
-object, including queued notifications from old sessions. The simulated
-valve decodes authentication requests independently of the production
-encoder, checks the PIN against the current session's issued challenge,
-and withholds protected readings until access is established. Fixed
-synthetic wire examples exercise this decoder, including challenge wrap
-and rejection of stale requests; they are not live-valve captures. The shared
-clock derives HA UTC and local time from one controlled instant and advances
-them together with event-loop deadlines, without shortening production
-retries or cleanup budgets. Timestamp tests check complete published dates,
-times, and offsets across local midnight in UTC and America/Chicago; fixed
-start times use the same shared clock, and HA configures the real time zone.
+The tests exercise production integration code with real HA objects and
+Bleak data objects. Bluetooth scanner and GATT I/O are simulated, external
+I/O is blocked, and HA storage uses per-test temporary directories.
 
-Coverage includes exhaustive advertisement layouts and counter values,
-authentication and fresh data, queued old notifications, session ownership,
-bounded cancellation, published availability sequences across all four
-platforms, sensor defaults and AM/PM readings, enabled/disabled choices
-across reload and storage restoration, scoped device metadata and parent
-links, and failed/concurrent/cancelled entry teardown. Pure parser cases
-remain focused byte-to-result tests. Fake-only classifier outcomes that
-the production parser never emits have been replaced by actual rejected
-observations; malformed-input parser checks remain.
-
-Partial startup is also covered through the real discovery and connection
-managers and HA startup. Empty manufacturer data and logged short packets
-are tested both before and after entry setup: presence appears, followed
-by authenticated clock and water-use readings, while firmware stays unknown.
-The standalone connection fixture preserves existing scanner observations
-and does not supplement partial metadata with a complete advertisement.
-
-Persistent refresh coverage turns the real HA switch on, observes successive
-water-use state-change events on one still-connected GATT session, and then
-turns it off for cleanup. This exposes notification leaks before disconnect
-can clear them or a replacement connection can supply the next reading.
-
-Configured authentication runs through real config entries and the
-production connection manager. Tests cover custom default PINs, per-valve
-override precedence without affecting another valve, and published lockout
-and reading recovery after correcting settings through HA's options flow
-and automatic reload. Simulated valves retain independently configured PINs.
-
-Narrow failure injection is retained for task-creation failure, platform
-unload refusal/cancellation, and unexpected manager cleanup errors. These
-are the core scenarios of those tests and cannot be produced by normal
-Bluetooth responses. There are no synthetic HA entity/registry classes,
-private production-method replacements, or cross-test fixture imports.
-
-Unload failures and cancellation run through HA's config-entry API. A
-platform refusal leaves the entry in `FAILED_UNLOAD`; cancellation during
-platform unload leaves `UNLOAD_IN_PROGRESS`. Both retain the runtime and
-published entities, and HA rejects a subsequent unload attempt. These
-tests do not reset entry state or imply that retrying unload is supported.
-
-Validation uses simulated Bluetooth I/O. In particular, a timed-out
-disconnect deliberately leaves the simulated link connected; completion
-of a cleanup task does not establish physical disconnection or released
-proxy capacity. Live adapters, ESP32 proxies, and valve firmware recovery
-remain hardware validation gaps. The version matrix above is validated on
-Windows; Linux and macOS execution have not been checked in this migration.
+Both HA versions above have been validated on Windows. Simulated Bluetooth
+I/O does not establish physical disconnects, released proxy capacity, or
+live hardware recovery. Linux and macOS execution have not been validated.
 
 * `custom_components/chandler_legacy_view/discovery.py` implements the Bluetooth
   discovery logic.
