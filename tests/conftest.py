@@ -14,6 +14,9 @@ from homeassistant.helpers import device_registry, entity_registry, frame
 
 from custom_components.chandler_legacy_view import discovery
 from support import BluetoothIO
+from ble import Transport
+from clock import Clock
+from custom_components.chandler_legacy_view import connection
 
 
 @pytest.fixture
@@ -60,3 +63,34 @@ async def discovery_manager(hass, bluetooth_io):
     await manager.async_setup()
     yield manager
     await manager.async_unload()
+
+
+@pytest.fixture
+def transport(bluetooth_io, monkeypatch):
+    simulated = Transport(bluetooth_io)
+    monkeypatch.setattr(connection, "establish_connection", simulated.connect)
+    monkeypatch.setattr(connection.bluetooth, "async_ble_device_from_address", simulated.resolve)
+    return simulated
+
+
+@pytest.fixture
+async def clock(monkeypatch):
+    return Clock(monkeypatch)
+
+
+@pytest.fixture
+async def connection_factory(hass, discovery_manager, bluetooth_io, transport):
+    connections = []
+    def create(address="valve-a", passcode="1357", advertisement=None):
+        bluetooth_io.advertise(address)
+        instance = connection.ValveConnection(
+            hass, address, "test-entry",
+            passcode_getter=lambda _: connection.ValvePasscodeConfiguration(passcode, True),
+            connection_state_callback=discovery_manager.async_set_connection_state,
+        )
+        instance.update_from_advertisement(advertisement or discovery_manager.devices[address])
+        connections.append(instance)
+        return instance
+    yield create
+    for instance in connections:
+        await instance.async_unload()

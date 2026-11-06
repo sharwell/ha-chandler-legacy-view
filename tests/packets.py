@@ -26,3 +26,38 @@ def raw_advertisement(*segments: bytes) -> bytes:
     return b"\x02\x01\x06" + b"".join(
         bytes((len(segment) + 1, 0xFF)) + segment for segment in segments
     )
+
+
+def device_list_frame(*, status: int, counter: int = 23) -> bytes:
+    """Build a synthetic EVB019 response without using a device's private data."""
+
+    packet = bytearray(20)
+    packet[0:2] = b"tt"
+    packet[7] = status
+    packet[11] = counter
+    packet[13:17] = b"\x01\x02\x03\x04"
+    return bytes(packet)
+
+
+def classic_device_list_frame(*, status: int = 112) -> bytes:
+    """Encode a synthetic legacy PIN, 1357, using the classic wire layout."""
+
+    packet = bytearray(device_list_frame(status=status))
+    offset = status - 112
+    packet[8:12] = bytes(
+        (offset + 16, (offset + 15) * 2, (offset + 12) * 3, (offset + 7) * 4)
+    )
+    return bytes(packet)
+
+
+def dashboard_frames() -> list[bytes]:
+    """Return a complete synthetic dashboard reporting 7:23 and 567 gallons."""
+
+    first, second, third = (bytearray(20) for _ in range(3))
+    first[0:5] = b"uu\x00\x07\x17"
+    first[11:13] = (567).to_bytes(2, "big")
+    first[-1] = 57
+    second[0:3] = b"uu\x01"
+    second[-1] = 58
+    third[0:3] = b"uu\x02"
+    return [bytes(first), bytes(second), bytes(third), bytes(20), bytes(20), bytes(5) + b":"]
