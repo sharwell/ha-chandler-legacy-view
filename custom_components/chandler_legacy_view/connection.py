@@ -248,6 +248,7 @@ class ValveConnection:
         self._request_characteristic: tuple[str, set[str]] | None = None
         self._serial_number: str | None = None
         self._device_list_is_twin_valve: bool | None = None
+        self._device_list_firmware_version: int | None = None
         self._device_list_decoded_password: ValveDecodedPassword | None = None
         self._authentication_protocol = ValveAuthenticationProtocol.UNKNOWN
         self._device_list_password_state = ValvePasswordDecodeState.UNKNOWN
@@ -490,7 +491,13 @@ class ValveConnection:
         decoded = self._device_list_decoded_password
         return (
             self._advertisement is not None
-            and self._advertisement.authentication_required is False
+            and (
+                self._advertisement.authentication_required is False
+                or (
+                    self._advertisement.authentication_required is None
+                    and self._device_list_firmware_version is not None
+                )
+            )
             and self._authentication_protocol is ValveAuthenticationProtocol.CLASSIC
             and decoded is not None
             and decoded.state in (
@@ -1245,6 +1252,10 @@ class ValveConnection:
     ) -> tuple[bool, bool]:
         """Send a DeviceList request and wait for a matching response packet."""
 
+        # Firmware learned from a response belongs to this poll/session. Keep
+        # it across authentication replies, but never borrow it on reconnect.
+        self._device_list_firmware_version = None
+        self._device_list_is_twin_valve = None
         self._reset_device_list_state()
         loop = asyncio.get_running_loop()
         response_future: asyncio.Future[bytes] | None = loop.create_future()
@@ -2181,6 +2192,21 @@ class ValveConnection:
 
         status = packet[7]
         advertisement = self._advertisement
+        if packet[5] or packet[6]:
+            firmware = self._decode_device_list_firmware(packet)
+            if firmware is None:
+                self._device_list_firmware_version = None
+                self._reset_device_list_state()
+                return None
+            # CsDeviceListPacket.update decodes response firmware before
+            # selecting the password format. Leave advertisement/registry
+            # firmware tied to the scanner evidence that produced it.
+            self._device_list_firmware_version = firmware
+            self._set_authentication_protocol(
+                ValveAuthenticationProtocol.COUNTER
+                if packet[2] == 1 or firmware >= 419
+                else ValveAuthenticationProtocol.CLASSIC
+            )
         if self._authentication_protocol is ValveAuthenticationProtocol.UNKNOWN:
             # With classic encoding, status 0 makes the last decoded digit
             # signed(byte_d // 4 + 112), which can never be 0..9. A complete
@@ -2206,14 +2232,15 @@ class ValveConnection:
 
         # CsDeviceListPacket.update in Water System 6.18.2 uses advertisement
         # data for C4.19. Byte 11 becomes the challenge in C4.20 and on twins.
-        counter_in_advertisement = (
-            advertisement is not None
-            and advertisement.firmware_version == 419
-            and packet[2] == 0
-        )
-        connection_counter = (
-            advertisement.connection_counter if counter_in_advertisement else packet[11]
-        )
+        firmware = self._device_list_firmware_version
+        if firmware is None and advertisement is not None:
+            firmware = advertisement.firmware_version
+        if firmware == 419 and packet[2] == 0:
+            connection_counter = (
+                advertisement.connection_counter if advertisement is not None else None
+            )
+        else:
+            connection_counter = packet[11]
         if advertisement is not None:
             advertisement.has_connection_counter = True
             if advertisement.authentication_required is None:
@@ -2228,6 +2255,23 @@ class ValveConnection:
 
         self._device_list_connection_counter = connection_counter
         return self._decode_auth_needed_password(status, connection_counter)
+
+    @staticmethod
+    def _decode_device_list_firmware(packet: bytes) -> int | None:
+        """Return a validated EVB019 version from the DeviceList fields."""
+
+        major, minor = packet[5:7]
+        if not 1 <= major < 6:
+            return None
+        # getFirmwareData([BZ) uses a binary major and BCD minor, with FA..FF
+        # representing beta revision 99. Invalid BCD cannot establish access.
+        if minor >= 0xFA:
+            minor = 99
+        elif minor >> 4 > 9 or minor & 0x0F > 9:
+            return None
+        else:
+            minor = (minor >> 4) * 10 + (minor & 0x0F)
+        return major * 100 + minor
 
     def _decode_classic_password(
         self, status: int, byte_a: int, byte_b: int, byte_c: int, byte_d: int

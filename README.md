@@ -45,7 +45,10 @@ device metadata. After an integration reload, firmware may remain unknown until
 a complete advertisement arrives; an old incorrect value such as `C0.00` is
 cleared. Clock and water-use polling can recover independently when a complete
 DeviceList response identifies counter-based authentication. A successful
-connection alone does not count as a successful dashboard update.
+connection alone does not count as a successful dashboard update. A complete,
+validated DeviceList response can also resolve the session's firmware and
+authentication format when advertisements are incomplete. Advertisement and
+device-registry firmware remain unknown until a complete advertisement arrives.
 
 This repository currently focuses on the scaffolding required for discovery and
 entity creation. Additional device metadata, richer entities, diagnostics, and
