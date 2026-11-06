@@ -14,6 +14,76 @@
 - Mention how to validate briefly (commands or manual check) when it's not obvious.
 - If there's a compatibility risk, note it; use `BREAKING CHANGE:` when applicable.
 
+## GitHub issues and stories
+
+- Write a readable title and complete body from initial creation. Open with
+  the problem, why it matters, and what someone should be able to do or
+  understand. Use a concrete Home Assistant or valve example when useful;
+  introduce API names, jargon, and internal data structures only when they
+  help explain the problem.
+- Use familiar action verbs that match the deliverable: Investigate for
+  discovery, Add or Implement for behavior, Validate or Verify for
+  acceptance, and Decide for choosing among established options.
+- For investigations, state the questions and expected deliverable,
+  including evidence, significant version differences, and remaining
+  uncertainties. Identify relevant Home Assistant, Bluetooth backend,
+  proxy, or valve firmware differences when they affect the result.
+- For implementation or acceptance, lead with observable behavior or
+  results and define how completion can be reviewed. Describe relevant
+  entity states, availability transitions, settings, or recovery behavior
+  rather than prescribing internal structure. Do not impose one rigid
+  issue template.
+- Put issue-specific technical requirements below the introduction and
+  main outcomes in a closed `<details>` section with a descriptive
+  `<summary>`. Leave blank lines around Markdown inside the section.
+  Preserve necessary contracts, resource limits, failure cases, and
+  acceptance requirements; readability edits must not silently reduce
+  the scope.
+- Keep repository-wide privacy, testing, authorization, and security rules
+  in this guide or the relevant documentation instead of repeating them
+  in each issue. Retain a rule in an issue when it defines that issue's
+  specific deliverable or behavior. Include a separate collapsed
+  agent-guidance section only for instructions unique to the issue.
+- Use GitHub Relationships for parents and actual blockers. Do not repeat
+  parent links, prerequisite lists, a Leaf designation, or sequence
+  metadata in child bodies. Prefer direct blockers over redundant
+  transitive dependencies; suggested work order alone is not a blocker.
+- A story organizes children that are each a single logical unit of work
+  or another story. Keep the overall sequence in the parent story and let
+  independent work remain independent.
+- Plan each story as a coherent sequence of reviewable issues and commits.
+  Each step explains why it is needed, what behavior or capability it
+  adds, how it builds on preceding work, and how its result is validated.
+  One issue may require several commits; each commit should still make an
+  understandable contribution with appropriate validation at that point.
+- Add or update relevant tests in the same step that introduces or changes
+  the behavior they cover. Each implementation issue owns its behavior
+  and failure tests, and its acceptance criteria should identify those
+  checks. For example, connection recovery includes ownership and
+  cancellation checks, availability changes include published state
+  transitions, and settings persistence includes restoration checks.
+  A final generic "add tests" issue must not carry coverage that earlier
+  implementation steps already needed. Keep completed steps loadable
+  and run their applicable checks.
+- Introduce test infrastructure when its first consumer needs it. A
+  separate issue may deliver a reusable Bluetooth test harness or cover an
+  integrated path that first becomes testable there, such as proxy
+  recovery or multiple valves sharing connection capacity. Such issues
+  extend the evidence from earlier steps. Documentation-only steps can
+  use document review and formatting checks without tests for prose.
+- Record validation requirements and remaining gaps, including necessary
+  Home Assistant versions, adapters, proxies, or valve hardware. Follow
+  the testing guidance below when distinguishing simulated I/O from live
+  hardware evidence; simulation or successful setup alone does not prove
+  physical connection release or recovery.
+- When rewriting an issue, preserve relationships, state, labels, and
+  other metadata. Verify saved text and changed relationships.
+- When showing a draft for review, provide the complete proposed title
+  and body, or clearly identify an excerpt. Give alternatives stable
+  labels so the user can refer to specific presentations. Do not add a
+  review or approval step when the user has already authorized issue
+  creation or updates.
+
 ## Testing
 
 - Prefer regression tests that exercise production behavior and assert
