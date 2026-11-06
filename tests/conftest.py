@@ -7,6 +7,8 @@ objects directly, without replacing their validation or starting host services.
 
 import pytest
 from types import MappingProxyType
+from pathlib import Path
+import socket
 from homeassistant import loader
 from homeassistant.config_entries import ConfigEntries, ConfigEntry, ConfigEntryState
 from homeassistant.core import HomeAssistant
@@ -26,10 +28,20 @@ from custom_components.chandler_legacy_view import connection
 
 
 @pytest.fixture
-async def hass_factory():
+async def hass_factory(tmp_path, monkeypatch):
+    def deny_host_io(*args, **kwargs):
+        raise PermissionError("Host socket I/O is disabled in the HA test runtime")
+    # The asyncio runner's wakeup sockets already exist before this async
+    # fixture starts. Real HA objects may not connect to local services, bind
+    # server ports, or send datagrams while their fixtures are active.
+    for operation in ("connect", "connect_ex", "bind", "listen", "sendto"):
+        monkeypatch.setattr(socket.socket, operation, deny_host_io)
     instances = []
     async def create(config_dir):
+        if not Path(config_dir).resolve().is_relative_to(tmp_path.resolve()):
+            raise ValueError("HA test storage must stay inside this test's directory")
         instance = HomeAssistant(str(config_dir))
+        instances.append(instance)
         instance.config.skip_pip = True
         loader.async_setup(instance)
         frame.async_setup(instance)
@@ -44,7 +56,6 @@ async def hass_factory():
         await restore_state.async_load(instance)
         instance.config_entries = ConfigEntries(instance, {})
         await instance.config_entries.async_initialize()
-        instances.append(instance)
         return instance
     yield create
     for instance in reversed(instances):

@@ -1,0 +1,7 @@
+-r requirements-test-common.txt
+homeassistant==2026.8.0
+# Match this HA release's Bluetooth and USB integration manifests.
+serialx==1.8.2
+bleak-retry-connector==4.6.3
+bluetooth-data-tools==1.29.18
+habluetooth==6.26.5

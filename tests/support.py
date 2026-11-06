@@ -68,4 +68,6 @@ class BluetoothIO:
         return lambda: [callback(info) for callback in callbacks]
 
     def expire(self, address="valve-a"):
-        self.queued_loss(address)()
+        deliver = self.queued_loss(address)
+        self.history.pop(address, None)
+        deliver()

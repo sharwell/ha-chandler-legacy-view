@@ -11,9 +11,9 @@ class Clock:
         self.loop = asyncio.get_running_loop()
         self.offset = 0.0
         real_time = self.loop.time
-        started = dt_util.utcnow()
+        real_utcnow = dt_util.utcnow
         monkeypatch.setattr(self.loop, "time", lambda: real_time() + self.offset)
-        monkeypatch.setattr(dt_util, "utcnow", lambda: started + timedelta(seconds=self.offset))
+        monkeypatch.setattr(dt_util, "utcnow", lambda: real_utcnow() + timedelta(seconds=self.offset))
 
     async def drain(self):
         for _ in range(12):

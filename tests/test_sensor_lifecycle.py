@@ -33,17 +33,18 @@ async def test_clock_default_is_disabled_but_shared_data_stays_fresh(hass, runti
     assert hass.states.get(sensor_id(hass, "water_usage_today")).state == "135"
 
 
-async def test_enabling_clock_uses_real_lifecycle_and_current_reading(hass, runtime_factory, bluetooth_io, transport, clock):
+@pytest.mark.parametrize("is_pm,expected_hour", [(False, 4), (True, 16)])
+async def test_enabling_clock_uses_real_lifecycle_and_current_reading(hass, runtime_factory, bluetooth_io, transport, clock, is_pm, expected_hour):
     entry = await runtime_factory()
     bluetooth_io.advertise()
     await hass.async_block_till_done()
     identifier = sensor_id(hass, "time_of_day")
     er.async_get(hass).async_update_entity(identifier, disabled_by=None)
     await clock.until(lambda: hass.states.get(identifier) is not None)
-    transport.valve().dashboards.append(dashboard_frames(hour=4, minute=36))
+    transport.valve().dashboards.append(dashboard_frames(hour=4, minute=36, is_pm=is_pm))
     await clock.run(connection(hass, entry).async_poll())
     published = datetime.fromisoformat(hass.states.get(identifier).state)
-    assert (published.hour, published.minute) == (4, 36)
+    assert (published.hour, published.minute) == (expected_hour, 36)
     assert er.async_get(hass).async_get(identifier).disabled_by is None
 
 
@@ -102,3 +103,18 @@ async def test_clock_choice_is_restored_from_actual_registry_storage(hass, hass_
     assert saved is not None
     assert saved.disabled_by is None
     assert saved.unique_id == "valve-a_time_of_day"
+
+
+async def test_dashboard_subscriber_receives_current_cached_reading(connection_factory, transport, clock):
+    current = connection_factory()
+    transport.valve().dashboards.append(dashboard_frames(minute=35, gallons=135))
+    await clock.run(current.async_poll())
+    received = []
+    remove = current.add_dashboard_listener(received.append)
+    await clock.drain()
+    assert len(received) == 1
+    assert (received[0].time_minute, received[0].water_usage) == (35, 135)
+    remove()
+    await clock.advance(31)
+    await clock.run(current.async_poll())
+    assert len(received) == 1

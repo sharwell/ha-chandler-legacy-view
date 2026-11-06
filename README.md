@@ -70,27 +70,60 @@ lookups and parent-device links by registry ID.
 
 ### Tests
 
-Use Python 3.14.2 or later with the pinned Home Assistant 2026.10.4 test
-environment. Create a virtual environment, install `requirements-test.txt`,
-then run `python -m pytest`. The migrated fixtures work on native Windows
-and initialize Home Assistant's real objects directly. They avoid the
-upstream fixture plugin's Unix-only startup runner.
+Use Python 3.14 (validated with 3.14.2). Create a virtual environment,
+install one of the requirement sets below, then run `python -m pytest`.
+Each target pins its Home Assistant release and that release's declared
+Bluetooth and USB integration dependencies.
+
+| Home Assistant target | Test requirements |
+| --- | --- |
+| 2026.10.4 | `requirements-test.txt` |
+| 2026.8.0, the declared minimum | `requirements-test-min.txt` |
+
+The fixtures run on native Windows and initialize HA's real objects
+directly, including config entries, platforms, services, state machine,
+event bus, registries, and storage restoration. They avoid the upstream
+fixture plugin's Unix-only startup runner; no HA validation rules are
+reimplemented in local entity or registry substitutes.
 
 Home Assistant configuration and registry storage are confined to the
 test-owned `.pytest-tmp` directory, which pytest recreates for each run.
-External sockets are blocked; loopback and Unix sockets remain available
-for asyncio's internal wakeup mechanism. Bluetooth advertisements and
-expiry notifications are simulated through shared callbacks. No Bluetooth
-scanner, adapter, proxy, USB watcher, or Home Assistant server is started.
-This validation does not establish physical disconnection or released
-proxy connection capacity.
+External sockets are blocked. Loopback and Unix sockets are allowed for
+asyncio's initial wakeup mechanism; once a real-HA fixture is active,
+connections (including loopback), server binds/listeners, and datagrams
+are also rejected. Fixture paths outside the owning test's directory are
+rejected before HA is constructed. Runtime package installation is off.
+No Bluetooth scanner, adapter, proxy, USB watcher, or HA server is started.
 
-Tests are being migrated in nine steps: discovery, advertisement metadata,
-authentication, session ownership, bounded cancellation, published
-availability, sensor settings, registries, and entry teardown. Each step
-keeps its consumers runnable and removes legacy support as its last
-consumer migrates. The declared minimum Home Assistant version remains
-2026.8.0; validation of that version is part of the final migration audit.
+Shared fakes supply scanner observations, expiry, and GATT I/O while
+production discovery, connection, protocol, and entity code runs normally.
+GATT sessions have distinct identities, services, subscriptions, gated
+operations, cancellation, and connected/disconnected state. The shared
+clock advances event-loop deadlines and HA UTC time together without
+shortening production retries or cleanup budgets.
+
+Coverage includes exhaustive advertisement layouts and counter values,
+authentication and fresh data, queued old notifications, session ownership,
+bounded cancellation, published availability sequences across all four
+platforms, sensor defaults and AM/PM readings, enabled/disabled choices
+across reload and storage restoration, scoped device metadata and parent
+links, and failed/concurrent/cancelled entry teardown. Pure parser cases
+remain focused byte-to-result tests. Fake-only classifier outcomes that
+the production parser never emits have been replaced by actual rejected
+observations; malformed-input parser checks remain.
+
+Narrow failure injection is retained for task-creation failure, platform
+unload refusal/cancellation, and unexpected manager cleanup errors. These
+are the core scenarios of those tests and cannot be produced by normal
+Bluetooth responses. There are no synthetic HA entity/registry classes,
+private production-method replacements, or cross-test fixture imports.
+
+Validation uses simulated Bluetooth I/O. In particular, a timed-out
+disconnect deliberately leaves the simulated link connected; completion
+of a cleanup task does not establish physical disconnection or released
+proxy capacity. Live adapters, ESP32 proxies, and valve firmware recovery
+remain hardware validation gaps. The version matrix above is validated on
+Windows; Linux and macOS execution have not been checked in this migration.
 
 * `custom_components/chandler_legacy_view/discovery.py` implements the Bluetooth
   discovery logic.

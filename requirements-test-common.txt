@@ -1,0 +1,9 @@
+# Shared tooling and transport dependencies for both supported HA targets.
+aiousbwatcher==1.1.2
+dbus-fast==5.0.22
+bleak==3.0.2
+bluetooth-adapters==2.4.0
+bluetooth-auto-recovery==1.6.4
+pytest==9.0.3
+pytest-asyncio==1.4.0
+pytest-socket==0.8.1
