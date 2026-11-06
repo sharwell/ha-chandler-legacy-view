@@ -25,18 +25,14 @@ class Clock:
         await self.drain()
 
     async def until(self, predicate, budget=120):
-        async def wait():
-            while not predicate():
-                await asyncio.sleep(0)
-        await self.run(wait(), budget)
-
-    async def run(self, awaitable, budget=120):
-        task = asyncio.ensure_future(awaitable)
         start = self.loop.time()
         for _ in range(500):
             await self.drain()
-            if task.done():
-                return task.result()
+            if predicate():
+                return
+            # Finish nested cleanup continuations before jumping to a timer.
+            if self.loop._ready:
+                continue
             # Timer inspection belongs to this controlled-clock driver. The
             # production deadlines, retries, and cleanup budgets stay unchanged.
             deadlines = [handle.when() for handle in self.loop._scheduled
@@ -47,6 +43,14 @@ class Clock:
             if self.loop.time() + delta - start > budget:
                 break
             await self.advance(delta)
-        task.cancel()
-        await self.drain()
         raise AssertionError("Operation did not complete within the virtual-time budget")
+
+    async def run(self, awaitable, budget=120):
+        task = asyncio.ensure_future(awaitable)
+        try:
+            await self.until(task.done, budget)
+            return task.result()
+        except AssertionError:
+            task.cancel()
+            await self.drain()
+            raise
