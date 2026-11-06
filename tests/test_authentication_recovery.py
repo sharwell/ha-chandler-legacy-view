@@ -10,7 +10,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from test_advertisement_parsing import LOGGED_SHORT_ADVERTISEMENTS, discovery
+from packets import LOGGED_SHORT_ADVERTISEMENTS
+from legacy_discovery import discovery_module as discovery
 from test_persistent_connection import connection_module as production
 
 

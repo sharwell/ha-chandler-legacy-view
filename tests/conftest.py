@@ -6,7 +6,9 @@ objects directly, without replacing their validation or starting host services.
 """
 
 import pytest
+from types import MappingProxyType
 from homeassistant import loader
+from homeassistant.config_entries import ConfigEntries, ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry, entity_registry, frame
 
@@ -22,8 +24,26 @@ async def hass(tmp_path):
     device_registry.async_setup(instance)
     await device_registry.async_load(instance, load_empty=True)
     await entity_registry.async_load(instance, load_empty=True)
+    instance.config_entries = ConfigEntries(instance, {})
+    await instance.config_entries.async_initialize()
     yield instance
     await instance.async_stop(force=True)
+
+
+@pytest.fixture
+def entry_factory(hass):
+    def create(entry_id="test-entry", data=None, options=None):
+        entry = ConfigEntry(
+            entry_id=entry_id, domain="chandler_legacy_view", title="Test valves",
+            data={} if data is None else data, options=options or {},
+            source="user", version=1, minor_version=1, unique_id=None,
+            subentries_data=None, discovery_keys=MappingProxyType({}),
+        )
+        # Register without setup, as upstream MockConfigEntry.add_to_hass does.
+        # Public async_add also starts integrations and unrelated host services.
+        hass.config_entries._entries[entry.entry_id] = entry
+        return entry
+    return create
 
 
 @pytest.fixture

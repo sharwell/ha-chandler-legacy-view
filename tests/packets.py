@@ -1,0 +1,28 @@
+MODERN_422 = bytes.fromhex("3a070100082aae00010203040422")
+LEGACY_310 = bytes.fromhex("3a070100082a0102040310")
+LEGACY_411 = bytes.fromhex("3a070100082a010203040411")
+TWIN_122 = bytes.fromhex("3a070100082aae64010203040122")
+EVB034_622 = bytes.fromhex("3a07e000082a04020622")
+
+# Captured before/after the registry and sensor changes. These contain no PINs.
+LOGGED_SHORT_ADVERTISEMENTS = (
+    "02010609ff3a070100081500000e0943535f4d657465725f536f6674",
+    "02010609ff3a070100081600000e0943535f4d657465725f536f6674",
+    "02010609ff3a070100081900000d0943535f42575f46696c746572",
+    "02010609ff3a070100081700000e0943535f4d657465725f536f6674",
+    "02010609ff3a070100081a00000d0943535f42575f46696c746572",
+    "02010608ff3a07191a1b1c1d0d0943535f42575f46696c746572",
+    "02010609ff3a0701000527ae000d0943535f42575f46696c746572",
+    "02010609ff3a0701000528af000d0943535f42575f46696c746572",
+)
+FOREIGN_MANUFACTURER_ADVERTISEMENT = bytes.fromhex(
+    "02010609ff59000100052552000e0943535f4d657465725f536f6674"
+)
+
+
+def raw_advertisement(*segments: bytes) -> bytes:
+    """Wrap company-prefixed payloads in Bluetooth manufacturer AD structures."""
+
+    return b"\x02\x01\x06" + b"".join(
+        bytes((len(segment) + 1, 0xFF)) + segment for segment in segments
+    )
