@@ -1894,41 +1894,39 @@ class ValveConnection:
         """
 
         length = len(packet)
-        if length < 5 or length > 20:
+        if length not in (6, 20):
             return None
 
         opcode = int(ValveRequestCommand.DASHBOARD)
         has_signature = length >= 3 and packet[0] == opcode and packet[1] == opcode
 
-        if has_signature:
+        if 2 not in existing_packets:
+            if not has_signature or length != 20:
+                return None
             index = packet[2]
             if index not in (0, 1, 2) or index in existing_packets:
                 return None
 
             if index == 0:
-                if length < 19 or packet[-1] != 57:
+                if packet[19] != 57:
                     return None
             elif index == 1:
-                if length < 19 or packet[-1] != 58:
-                    return None
-            else:  # index == 2
-                if length < 20:
+                if packet[19] != 58:
                     return None
 
             return index
 
-        if 2 not in existing_packets:
-            return None
-
+        # CsDashboardPacket.updatePacket consumes the remaining graph bytes
+        # by fragment length. Their sample values can resemble a header.
         for candidate in range(3, _DASHBOARD_PACKET_COUNT):
             if candidate in existing_packets:
                 continue
 
-            if candidate in (3, 4) and length < 20:
+            if candidate in (3, 4) and length != 20:
                 return None
 
             if candidate == _DASHBOARD_PACKET_COUNT - 1:
-                if packet[-1] != 58:
+                if length != 6 or packet[5] != 58:
                     return None
 
             return candidate
@@ -1947,20 +1945,16 @@ class ValveConnection:
             )
             return
 
-        first, second, third, fourth, fifth, sixth = packets
+        validated: dict[int, bytes] = {}
+        for index, packet in enumerate(packets):
+            if self._get_dashboard_packet_index(packet, validated) != index:
+                _LOGGER.debug(
+                    "Valve %s provided malformed Dashboard framing", self._address
+                )
+                return
+            validated[index] = packet
 
-        if not (
-            len(first) >= 19
-            and len(second) >= 19
-            and len(third) >= 20
-            and len(fourth) >= 20
-            and len(fifth) >= 20
-            and len(sixth) >= 5
-        ):
-            _LOGGER.debug(
-                "Valve %s provided malformed Dashboard packet lengths", self._address
-            )
-            return
+        first, second, third, fourth, fifth, sixth = packets
 
         try:
             time_hour = first[3]
