@@ -1,7 +1,9 @@
 """C6.x notifications must progress without invented read requests."""
 
 import asyncio
+import pytest
 
+from homeassistant.const import EVENT_STATE_CHANGED
 from homeassistant.helpers import entity_registry as er
 from custom_components.chandler_legacy_view.const import DOMAIN
 from evb034_packets import frames
@@ -119,3 +121,55 @@ async def test_blocked_authentication_write_times_out_without_credential_lockout
     assert hass.states.get(lockout).state == "off"
     assert not valve.clients[0].is_connected
     assert all(task.done() for task in valve.clients[0].peer_tasks)
+
+
+@pytest.mark.parametrize("null_update", [{"dwu": None}, {"as": None, "dwu": None}])
+async def test_null_update_preserves_pending_reading_and_authenticated_session(
+    hass, runtime_factory, bluetooth_io, transport, clock, null_update,
+):
+    _, connection, valve, lockout = await setup_valve(hass, runtime_factory, bluetooth_io, transport)
+    await connection.async_set_persistent_poll_interval(300)
+    await connection.async_set_persistent_connection_enabled(True)
+    await clock.run(connection.async_poll())
+    valve.stream_enabled = False
+    owner = valve.clients[0]
+    usage = sensor_id(hass, "water_usage_today")
+    published = []
+    remove = hass.bus.async_listen(EVENT_STATE_CHANGED, lambda event:
+        published.append(event.data["new_state"].state)
+        if event.data["entity_id"] == usage and event.data["new_state"] else None)
+    try:
+        for packet in ({"dwu": 12300}, null_update):
+            for frame in frames(packet):
+                owner.notify(frame)
+        await clock.advance(1)
+        assert owner.is_connected
+        assert hass.states.get(usage).state == "5.67"
+        await clock.advance(300)
+        await hass.async_block_till_done()
+        assert hass.states.get(usage).state == "123.0"
+        assert published == ["123.0"]
+        assert hass.states.get(lockout).state == "off"
+        assert valve.clients == [owner]
+    finally:
+        remove()
+        await clock.run(connection.async_set_persistent_connection_enabled(False))
+
+
+async def test_all_null_update_does_not_refresh_last_success_or_revoke_access(
+    hass, runtime_factory, bluetooth_io, transport, clock,
+):
+    _, connection, valve, lockout = await setup_valve(hass, runtime_factory, bluetooth_io, transport)
+    await connection.async_set_persistent_connection_enabled(True)
+    await clock.run(connection.async_poll())
+    valve.stream_enabled = False
+    owner = valve.clients[0]
+    last_success = connection.last_success
+    for frame in frames({"as": None, "dlf": None, "dwu": None}):
+        owner.notify(frame)
+    await clock.advance(6)
+    assert owner.is_connected
+    assert connection.last_success == last_success
+    assert hass.states.get(sensor_id(hass, "water_usage_today")).state == "5.67"
+    assert hass.states.get(lockout).state == "off"
+    await clock.run(connection.async_set_persistent_connection_enabled(False))

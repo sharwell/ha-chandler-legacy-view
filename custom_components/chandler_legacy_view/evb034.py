@@ -224,6 +224,11 @@ class Evb034Session:
         return packets
 
     def _publish_packet(self, packet: dict, serial: int) -> None:
+        # CsBlePacket.updatePacket skips JsonNull before interpreting any key.
+        # Filter before access validation and coalescing, not only at HA refresh.
+        packet = {key: value for key, value in packet.items() if value is not None}
+        if not packet:
+            return
         if self._authenticated and "as" in packet and (
             type(packet["as"]) is not int or packet["as"] != 2
         ):

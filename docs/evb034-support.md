@@ -95,6 +95,7 @@ changing configured credentials permits a new attempt. Reconnect always
 identifies and authenticates again. A connection-owned receiver ACKs
 notifications continuously, including while HA waits for its configured
 publication interval. Ordinary deltas coalesce within bounded storage;
+null fields are ignored before coalescing and access checks, and real
 authentication transitions stay ordered. An idle healthy stream preserves
 its readings and last-success time. Access loss or receiver failure wakes
 cleanup immediately rather than waiting up to the 300-second HA interval.
