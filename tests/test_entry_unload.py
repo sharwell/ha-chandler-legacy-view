@@ -1,200 +1,132 @@
-"""Config entry unload regressions, runnable without Home Assistant installed.
-
-Run with ``python -m unittest discover -s tests -v``. Framework services and
-manager classes are stubbed; the integration entry module and constants are real.
-"""
-
-from __future__ import annotations
+"""Entry lifecycle contracts with real platforms, entries, and managers."""
 
 import asyncio
-import importlib.util
-from pathlib import Path
-import sys
-from types import ModuleType, SimpleNamespace
-import unittest
-from unittest.mock import AsyncMock, patch
+import pytest
+from homeassistant.config_entries import ConfigEntryState, OperationNotAllowed
+from homeassistant.helpers import entity_registry as er
+from custom_components.chandler_legacy_view.const import DOMAIN, DATA_CONNECTION_MANAGER, DATA_DISCOVERY_MANAGER
 
 
-def _load_integration_module():
-    """Load the actual entry lifecycle without requiring Home Assistant."""
-
-    modules: dict[str, ModuleType] = {}
-
-    def module(name: str, **attributes) -> ModuleType:
-        if name not in modules:
-            modules[name] = ModuleType(name)
-            if "." in name:
-                parent, _, child = name.rpartition(".")
-                setattr(module(parent), child, modules[name])
-        vars(modules[name]).update(attributes)
-        return modules[name]
-
-    module("homeassistant.config_entries", ConfigEntry=object)
-    module(
-        "homeassistant.const",
-        EVENT_HOMEASSISTANT_STOP="homeassistant_stop",
-        Platform=SimpleNamespace(
-            BINARY_SENSOR="binary_sensor", NUMBER="number", SENSOR="sensor",
-            SWITCH="switch",
-        ),
-    )
-    module("homeassistant.core", HomeAssistant=object)
-    module("homeassistant.helpers.device_registry", DeviceEntryType=object)
-    module("homeassistant.helpers.typing", ConfigType=dict)
-
-    package = "_chandler_entry_tests"
-    component_path = (
-        Path(__file__).resolve().parents[1] / "custom_components/chandler_legacy_view"
-    )
-    spec = importlib.util.spec_from_file_location(
-        package, component_path / "__init__.py",
-        submodule_search_locations=[str(component_path)],
-    )
-    integration = importlib.util.module_from_spec(spec)
-    modules[package] = integration
-    module(f"{package}.connection", ValveConnectionManager=object)
-    module(f"{package}.discovery", ValveDiscoveryManager=object)
-    with patch.dict(sys.modules, modules):
-        spec.loader.exec_module(integration)
-    return integration
+async def test_failed_platform_unload_retains_runtime_and_blocks_retry(hass, runtime_factory, bluetooth_io, monkeypatch):
+    entry = await runtime_factory()
+    bluetooth_io.advertise()
+    await hass.async_block_till_done()
+    runtime = hass.data[DOMAIN][entry.entry_id]
+    presence = er.async_get(hass).async_get_entity_id("binary_sensor", DOMAIN, "valve-a")
+    advertisements = list(bluetooth_io.advertisement_callbacks)
+    unavailable = list(bluetooth_io.unavailable_callbacks)
+    async def refuse(entry, platforms):
+        assert entry.state is ConfigEntryState.UNLOAD_IN_PROGRESS
+        return False
+    # Platform refusal is the behavior this module must handle. The real HA
+    # entity platform catches entity-removal errors, so Bluetooth I/O cannot
+    # produce this return value; inject it only at this public API boundary.
+    with monkeypatch.context() as context:
+        context.setattr(hass.config_entries, "async_unload_platforms", refuse)
+        assert not await hass.config_entries.async_unload(entry.entry_id)
+    assert entry.state is ConfigEntryState.FAILED_UNLOAD
+    assert hass.data[DOMAIN][entry.entry_id] is runtime
+    assert hass.states.get(presence).state == "on"
+    assert bluetooth_io.advertisement_callbacks == advertisements
+    assert bluetooth_io.unavailable_callbacks == unavailable
+    # A direct integration call would bypass HA's failed-entry guard and imply
+    # users can retry an unload that the real config-entry API rejects.
+    with pytest.raises(OperationNotAllowed, match="non recoverable state"):
+        await hass.config_entries.async_unload(entry.entry_id)
+    assert entry.state is ConfigEntryState.FAILED_UNLOAD
+    assert hass.data[DOMAIN][entry.entry_id] is runtime
 
 
-integration = _load_integration_module()
+async def test_successful_unload_preserves_other_entry_and_discovery(hass, runtime_factory, bluetooth_io):
+    first = await runtime_factory("first")
+    other = await runtime_factory("other")
+    other_runtime = hass.data[DOMAIN][other.entry_id]
+    assert await hass.config_entries.async_unload(first.entry_id)
+    assert first.state is ConfigEntryState.NOT_LOADED
+    assert other.state is ConfigEntryState.LOADED
+    assert hass.data[DOMAIN] == {other.entry_id: other_runtime}
+    bluetooth_io.advertise()
+    await hass.async_block_till_done()
+    identifier = er.async_get(hass).async_get_entity_id("binary_sensor", DOMAIN, "valve-a")
+    assert hass.states.get(identifier).state == "on"
+    assert other_runtime[DATA_CONNECTION_MANAGER].get_connection("valve-a").available
 
 
-class EntryUnloadTests(unittest.IsolatedAsyncioTestCase):
-    """Preserve runtime until platforms unload, then finish all cleanup."""
-
-    def setUp(self) -> None:
-        self.entry = SimpleNamespace(entry_id="test-entry")
-        self.connection_manager = SimpleNamespace(async_unload=AsyncMock())
-        self.discovery_manager = SimpleNamespace(async_unload=AsyncMock())
-        self.entry_data = {
-            integration.DATA_CONNECTION_MANAGER: self.connection_manager,
-            integration.DATA_DISCOVERY_MANAGER: self.discovery_manager,
-        }
-        self.domain_data = {self.entry.entry_id: self.entry_data}
-        self.hass = SimpleNamespace(
-            data={integration.DOMAIN: self.domain_data},
-            config_entries=SimpleNamespace(
-                async_unload_platforms=AsyncMock(return_value=True)
-            ),
-        )
-
-    async def test_failed_unload_preserves_runtime_and_allows_retry(self) -> None:
-        unload_platforms = self.hass.config_entries.async_unload_platforms
-        unload_platforms.side_effect = [False, False, True]
-
-        for _ in range(2):
-            self.assertFalse(await integration.async_unload_entry(self.hass, self.entry))
-            self.assertIs(self.hass.data[integration.DOMAIN], self.domain_data)
-            self.assertIs(self.domain_data[self.entry.entry_id], self.entry_data)
-            self.assertIs(
-                self.entry_data[integration.DATA_CONNECTION_MANAGER],
-                self.connection_manager,
-            )
-            self.assertIs(
-                self.entry_data[integration.DATA_DISCOVERY_MANAGER],
-                self.discovery_manager,
-            )
-            self.connection_manager.async_unload.assert_not_called()
-            self.discovery_manager.async_unload.assert_not_called()
-
-        self.assertTrue(await integration.async_unload_entry(self.hass, self.entry))
-        self.assertEqual(unload_platforms.await_count, 3)
-        unload_platforms.assert_awaited_with(self.entry, integration.PLATFORMS)
-        self.connection_manager.async_unload.assert_awaited_once_with()
-        self.discovery_manager.async_unload.assert_awaited_once_with()
-        self.assertNotIn(integration.DOMAIN, self.hass.data)
-
-    async def test_successful_unload_preserves_other_entries(self) -> None:
-        other_connection = SimpleNamespace(async_unload=AsyncMock())
-        other_discovery = SimpleNamespace(async_unload=AsyncMock())
-        other_data = {
-            integration.DATA_CONNECTION_MANAGER: other_connection,
-            integration.DATA_DISCOVERY_MANAGER: other_discovery,
-        }
-        self.domain_data["other-entry"] = other_data
-
-        self.assertTrue(await integration.async_unload_entry(self.hass, self.entry))
-
-        self.assertIs(self.hass.data[integration.DOMAIN], self.domain_data)
-        self.assertNotIn(self.entry.entry_id, self.domain_data)
-        self.assertIs(self.domain_data["other-entry"], other_data)
-        self.connection_manager.async_unload.assert_awaited_once_with()
-        self.discovery_manager.async_unload.assert_awaited_once_with()
-        other_connection.async_unload.assert_not_called()
-        other_discovery.async_unload.assert_not_called()
-
-    async def test_cancelled_connection_cleanup_preserves_other_entries(self) -> None:
-        other_data = object()
-        self.domain_data["other-entry"] = other_data
-        self.connection_manager.async_unload.side_effect = asyncio.CancelledError
-
-        with self.assertRaises(asyncio.CancelledError):
-            await integration.async_unload_entry(self.hass, self.entry)
-
-        self.connection_manager.async_unload.assert_awaited_once_with()
-        self.discovery_manager.async_unload.assert_awaited_once_with()
-        self.assertIs(self.hass.data[integration.DOMAIN], self.domain_data)
-        self.assertNotIn(self.entry.entry_id, self.domain_data)
-        self.assertIs(self.domain_data["other-entry"], other_data)
-
-    async def test_connection_cleanup_error_still_unloads_discovery(self) -> None:
-        failure = RuntimeError("Connection cleanup failed")
-        self.connection_manager.async_unload.side_effect = failure
-
-        with self.assertRaises(RuntimeError) as raised:
-            await integration.async_unload_entry(self.hass, self.entry)
-
-        self.assertIs(raised.exception, failure)
-        self.discovery_manager.async_unload.assert_awaited_once_with()
-        self.assertNotIn(integration.DOMAIN, self.hass.data)
-
-    async def test_cancelled_platform_unload_preserves_runtime(self) -> None:
-        self.hass.config_entries.async_unload_platforms.side_effect = (
-            asyncio.CancelledError
-        )
-
-        with self.assertRaises(asyncio.CancelledError):
-            await integration.async_unload_entry(self.hass, self.entry)
-
-        self.assertIs(self.hass.data[integration.DOMAIN], self.domain_data)
-        self.assertIs(self.domain_data[self.entry.entry_id], self.entry_data)
-        self.connection_manager.async_unload.assert_not_called()
-        self.discovery_manager.async_unload.assert_not_called()
-
-    async def test_concurrent_unload_does_not_mask_cancellation(self) -> None:
-        connection_cleanup_started = asyncio.Event()
-
-        async def wait_for_cancellation() -> None:
-            connection_cleanup_started.set()
-            await asyncio.Future()
-
-        self.connection_manager.async_unload.side_effect = wait_for_cancellation
-        other_entry = SimpleNamespace(entry_id="other-entry")
-        other_discovery = SimpleNamespace(async_unload=AsyncMock())
-        self.domain_data[other_entry.entry_id] = {
-            integration.DATA_CONNECTION_MANAGER: SimpleNamespace(async_unload=AsyncMock()),
-            integration.DATA_DISCOVERY_MANAGER: other_discovery,
-        }
-        first_unload = asyncio.create_task(
-            integration.async_unload_entry(self.hass, self.entry)
-        )
-        try:
-            async with asyncio.timeout(1):
-                await connection_cleanup_started.wait()
-            self.assertTrue(await integration.async_unload_entry(self.hass, other_entry))
-            self.assertNotIn(integration.DOMAIN, self.hass.data)
-        finally:
-            first_unload.cancel()
-            results = await asyncio.gather(first_unload, return_exceptions=True)
-
-        self.assertIsInstance(results[0], asyncio.CancelledError)
-        self.discovery_manager.async_unload.assert_awaited_once_with()
-        other_discovery.async_unload.assert_awaited_once_with()
-        self.assertNotIn(integration.DOMAIN, self.hass.data)
+async def test_unexpected_connection_cleanup_error_still_releases_discovery(hass, runtime_factory, bluetooth_io, monkeypatch, caplog):
+    entry = await runtime_factory()
+    runtime = hass.data[DOMAIN][entry.entry_id]
+    manager = runtime[DATA_CONNECTION_MANAGER]
+    unload = manager.async_unload
+    async def unexpected_failure():
+        await unload()
+        raise RuntimeError("Unexpected cleanup failure")
+    # Transport errors are handled by the production manager. This regression
+    # specifically verifies the entry's finally block for an unexpected error.
+    monkeypatch.setattr(manager, "async_unload", unexpected_failure)
+    assert not await hass.config_entries.async_unload(entry.entry_id)
+    assert entry.state is ConfigEntryState.FAILED_UNLOAD
+    assert "Unexpected cleanup failure" in caplog.text
+    assert DOMAIN not in hass.data
+    assert runtime[DATA_DISCOVERY_MANAGER].devices == {}
+    assert bluetooth_io.advertisement_callbacks == []
+    assert bluetooth_io.unavailable_callbacks == []
 
 
-if __name__ == "__main__":
-    unittest.main()
+async def test_cancelled_platform_unload_retains_runtime_and_blocks_retry(hass, runtime_factory, bluetooth_io, monkeypatch):
+    entry = await runtime_factory()
+    bluetooth_io.advertise()
+    await hass.async_block_till_done()
+    runtime = hass.data[DOMAIN][entry.entry_id]
+    identifier = er.async_get(hass).async_get_entity_id("binary_sensor", DOMAIN, "valve-a")
+    advertisements = list(bluetooth_io.advertisement_callbacks)
+    unavailable = list(bluetooth_io.unavailable_callbacks)
+    async def cancelled(entry, platforms):
+        assert entry.state is ConfigEntryState.UNLOAD_IN_PROGRESS
+        raise asyncio.CancelledError
+    with monkeypatch.context() as context:
+        context.setattr(hass.config_entries, "async_unload_platforms", cancelled)
+        with pytest.raises(asyncio.CancelledError):
+            await hass.config_entries.async_unload(entry.entry_id)
+    assert entry.state is ConfigEntryState.UNLOAD_IN_PROGRESS
+    assert hass.data[DOMAIN][entry.entry_id] is runtime
+    assert hass.states.get(identifier).state == "on"
+    assert bluetooth_io.advertisement_callbacks == advertisements
+    assert bluetooth_io.unavailable_callbacks == unavailable
+    # Cancellation also leaves a non-recoverable entry; do not reset its state
+    # in the fixture to manufacture a successful unload retry.
+    with pytest.raises(OperationNotAllowed, match="non recoverable state"):
+        await hass.config_entries.async_unload(entry.entry_id)
+    assert entry.state is ConfigEntryState.UNLOAD_IN_PROGRESS
+    assert hass.data[DOMAIN][entry.entry_id] is runtime
+
+
+async def test_concurrent_entry_unloads_preserve_cancellation(hass, runtime_factory, bluetooth_io, transport, clock):
+    first = await runtime_factory("first")
+    bluetooth_io.advertise()
+    await hass.async_block_till_done()
+    manager = hass.data[DOMAIN][first.entry_id][DATA_CONNECTION_MANAGER]
+    connection = manager.get_connection("valve-a")
+    await connection.async_set_persistent_connection_enabled(True)
+    await connection.async_poll()
+    # The first valve stops advertising while its live session retains presence.
+    # A later entry sees no cached valve and therefore owns no duplicate entities.
+    bluetooth_io.expire()
+    other = await runtime_factory("other")
+    valve = transport.valve()
+    gate = valve.operations["disconnect"].block()
+    first_unload = asyncio.create_task(hass.config_entries.async_unload(first.entry_id))
+    try:
+        await clock.run(gate.started.wait())
+        assert await hass.config_entries.async_unload(other.entry_id)
+        first_unload.cancel()
+        await clock.drain()
+        assert not first_unload.done()
+        assert valve.clients[0].is_connected
+    finally:
+        gate.release.set()
+        results = await clock.run(asyncio.gather(first_unload, return_exceptions=True))
+    assert isinstance(results[0], asyncio.CancelledError)
+    assert DOMAIN not in hass.data
+    assert bluetooth_io.advertisement_callbacks == []
+    assert bluetooth_io.unavailable_callbacks == []
+    assert not valve.clients[0].is_connected

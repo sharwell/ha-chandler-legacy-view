@@ -45,7 +45,10 @@ device metadata. After an integration reload, firmware may remain unknown until
 a complete advertisement arrives; an old incorrect value such as `C0.00` is
 cleared. Clock and water-use polling can recover independently when a complete
 DeviceList response identifies counter-based authentication. A successful
-connection alone does not count as a successful dashboard update.
+connection alone does not count as a successful dashboard update. A complete,
+validated DeviceList response can also resolve the session's firmware and
+authentication format when advertisements are incomplete. Advertisement and
+device-registry firmware remain unknown until a complete advertisement arrives.
 
 This repository currently focuses on the scaffolding required for discovery and
 entity creation. Additional device metadata, richer entities, diagnostics, and
@@ -67,6 +70,31 @@ lookups and parent-device links by registry ID.
    integration options. Only one instance of the integration is required.
 
 ## Development
+
+### Tests
+
+Use Python 3.14 (validated with 3.14.2). Create and activate a virtual
+environment, then choose a requirements file for the HA version to test:
+
+| Home Assistant target | Test requirements |
+| --- | --- |
+| 2026.10.4 | `requirements-test.txt` |
+| 2026.8.0, the declared minimum | `requirements-test-min.txt` |
+
+Install the selected requirements and run the suite, for example:
+
+```console
+python -m pip install -r requirements-test.txt
+python -m pytest
+```
+
+The tests exercise production integration code with real HA objects and
+Bleak data objects. Bluetooth scanner and GATT I/O are simulated, external
+I/O is blocked, and HA storage uses per-test temporary directories.
+
+Both HA versions above have been validated on Windows. Simulated Bluetooth
+I/O does not establish physical disconnects, released proxy capacity, or
+live hardware recovery. Linux and macOS execution have not been validated.
 
 * `custom_components/chandler_legacy_view/discovery.py` implements the Bluetooth
   discovery logic.

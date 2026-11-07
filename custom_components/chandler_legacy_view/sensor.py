@@ -57,7 +57,9 @@ class ValveDashboardSensor(ChandlerValveEntity, SensorEntity):
         self._attr_unique_id = f"{advertisement.address}_{unique_id_suffix}"
         self._name_suffix = name_suffix
         self._connection = connection
+        self._bluetooth_available = True
         self._remove_dashboard_listener: CALLBACK_TYPE | None = None
+        self._remove_capability_listener: CALLBACK_TYPE | None = None
         self._attr_name = self._apply_name_suffix(base_name, advertisement)
         self._update_from_dashboard(connection.dashboard_data, write_state=False)
 
@@ -68,6 +70,9 @@ class ValveDashboardSensor(ChandlerValveEntity, SensorEntity):
         self._update_from_dashboard(self._connection.dashboard_data, write_state=False)
         self._remove_dashboard_listener = self._connection.add_dashboard_listener(
             self._handle_dashboard_update
+        )
+        self._remove_capability_listener = self._connection.add_capability_listener(
+            self._handle_capability_update
         )
 
     def _apply_name_suffix(
@@ -90,10 +95,11 @@ class ValveDashboardSensor(ChandlerValveEntity, SensorEntity):
         """Handle Bluetooth discovery updates for this valve."""
 
         if change is ValveDiscoveryChange.UNAVAILABLE:
-            self._attr_available = False
+            self._bluetooth_available = False
         else:
             self.async_update_from_advertisement(advertisement)
-            self._attr_available = True
+            self._bluetooth_available = True
+        self._update_availability()
 
         if self.hass is not None:
             self.async_write_ha_state()
@@ -114,6 +120,25 @@ class ValveDashboardSensor(ChandlerValveEntity, SensorEntity):
         if self._remove_dashboard_listener is not None:
             self._remove_dashboard_listener()
             self._remove_dashboard_listener = None
+        if self._remove_capability_listener is not None:
+            self._remove_capability_listener()
+            self._remove_capability_listener = None
+
+    def _is_supported(self) -> bool:
+        """Match setupValveOptions: common Dashboard rows have no firmware gate."""
+
+        return True
+
+    def _update_availability(self) -> None:
+        self._attr_available = self._bluetooth_available and self._is_supported()
+
+    @callback
+    def _handle_capability_update(self) -> None:
+        """Recheck support even when DeviceList cannot yield a Dashboard reading."""
+
+        self._update_availability()
+        if self.hass is not None:
+            self.async_write_ha_state()
 
     def _update_from_dashboard(
         self, dashboard: ValveDashboardData | None, *, write_state: bool
@@ -121,6 +146,7 @@ class ValveDashboardSensor(ChandlerValveEntity, SensorEntity):
         """Update the native value from dashboard data."""
 
         self._attr_native_value = self._extract_native_value(dashboard)
+        self._update_availability()
         if write_state and self.hass is not None:
             self.async_write_ha_state()
 
@@ -169,6 +195,11 @@ class ValveWaterHardnessSensor(ValveDashboardSensor):
 
     _attr_native_unit_of_measurement = WATER_HARDNESS_GRAINS_PER_GALLON
     _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def _is_supported(self) -> bool:
+        return super()._is_supported() and (
+            self._connection.entity_capabilities.is_metered_softener is not False
+        )
 
     def __init__(
         self, advertisement: ValveAdvertisement, connection: ValveConnection
@@ -235,6 +266,9 @@ class ValveBatteryCapacitySensor(ValveDashboardSensor):
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_device_class = SensorDeviceClass.BATTERY
 
+    def _is_supported(self) -> bool:
+        return super()._is_supported() and not _is_clack_valve(self._advertisement.name)
+
     def __init__(
         self, advertisement: ValveAdvertisement, connection: ValveConnection
     ) -> None:
@@ -259,6 +293,11 @@ class ValveSoftWaterRemainingSensor(ValveDashboardSensor):
     _attr_native_unit_of_measurement = UnitOfVolume.GALLONS
     _attr_state_class = SensorStateClass.MEASUREMENT
 
+    def _is_supported(self) -> bool:
+        return super()._is_supported() and (
+            self._connection.entity_capabilities.is_metered_softener is not False
+        )
+
     def __init__(
         self, advertisement: ValveAdvertisement, connection: ValveConnection
     ) -> None:
@@ -282,6 +321,11 @@ class ValveDaysUntilRegenerationSensor(ValveDashboardSensor):
 
     _attr_native_unit_of_measurement = UnitOfTime.DAYS
     _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def _is_supported(self) -> bool:
+        return super()._is_supported() and (
+            self._connection.entity_capabilities.is_metered_softener is not True
+        )
 
     def __init__(
         self, advertisement: ValveAdvertisement, connection: ValveConnection

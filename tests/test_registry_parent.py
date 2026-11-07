@@ -1,126 +1,69 @@
-"""Ensure setup retains the correct registry parent for each config entry."""
+"""Parent links validated by actual config-entry setup and device registration."""
 
-from __future__ import annotations
-
-from types import SimpleNamespace
-import unittest
-from unittest.mock import AsyncMock, Mock, call, patch
-
-from test_entry_unload import integration
+import pytest
+from homeassistant.helpers import device_registry as dr, entity_registry as er
+from custom_components.chandler_legacy_view.const import DOMAIN, DISCOVERY_VIA_DEVICE_ID
 
 
-class RegistryParentTests(unittest.IsolatedAsyncioTestCase):
-    """Use registry IDs without sharing a parent across config entries."""
-
-    def setUp(self) -> None:
-        self.hass = SimpleNamespace(
-            data={},
-            config_entries=SimpleNamespace(
-                async_update_entry=Mock(),
-                async_forward_entry_setups=AsyncMock(),
-            ),
-            bus=SimpleNamespace(async_listen_once=Mock(return_value=Mock())),
-        )
-        self.registry = SimpleNamespace(async_get_or_create=Mock())
-        self.enterContext(
-            patch.object(integration.dr, "async_get", return_value=self.registry, create=True)
-        )
-        self.enterContext(
-            patch.object(integration, "DeviceEntryType", SimpleNamespace(SERVICE="service"))
-        )
-        self.discovery_factory = self.enterContext(
-            patch.object(integration, "ValveDiscoveryManager")
-        )
-        self.connection_factory = self.enterContext(
-            patch.object(integration, "ValveConnectionManager")
-        )
-
-    def make_entry(self, entry_id: str) -> SimpleNamespace:
-        return SimpleNamespace(
-            entry_id=entry_id,
-            data={integration.CONF_DEFAULT_PASSCODE: integration.DEFAULT_VALVE_PASSCODE},
-            options={},
-            async_on_unload=Mock(),
-            add_update_listener=Mock(return_value=Mock()),
-        )
-
-    def make_managers(self) -> tuple[SimpleNamespace, SimpleNamespace]:
-        return (
-            SimpleNamespace(async_setup=AsyncMock()),
-            SimpleNamespace(async_setup=AsyncMock(), async_shutdown=AsyncMock()),
-        )
-
-    async def test_parent_registry_id_is_available_before_platform_setup(self) -> None:
-        entry = self.make_entry("first-entry")
-        parent_id = "registry-generated-parent-id"
-        self.registry.async_get_or_create.return_value = SimpleNamespace(id=parent_id)
-        discovery, connection = self.make_managers()
-        self.discovery_factory.return_value = discovery
-        self.connection_factory.return_value = connection
-
-        async def forward_platforms(forwarded_entry, platforms) -> None:
-            self.assertIs(forwarded_entry, entry)
-            self.assertEqual(platforms, integration.PLATFORMS)
-            runtime = self.hass.data[integration.DOMAIN][entry.entry_id]
-            self.assertEqual(runtime[integration.DATA_DISCOVERY_DEVICE_ID], parent_id)
-            self.assertIs(runtime[integration.DATA_DISCOVERY_MANAGER], discovery)
-            self.assertIs(runtime[integration.DATA_CONNECTION_MANAGER], connection)
-            discovery.async_setup.assert_awaited_once_with()
-            connection.async_setup.assert_awaited_once_with()
-
-        self.hass.config_entries.async_forward_entry_setups.side_effect = forward_platforms
-
-        self.assertTrue(await integration.async_setup_entry(self.hass, entry))
-
-        self.discovery_factory.assert_called_once_with(self.hass, entry.entry_id)
-        self.connection_factory.assert_called_once_with(self.hass, entry, discovery)
-        self.registry.async_get_or_create.assert_called_once_with(
-            config_entry_id=entry.entry_id,
-            identifiers={(integration.DOMAIN, integration.DISCOVERY_VIA_DEVICE_ID)},
-            manufacturer=integration.DEFAULT_MANUFACTURER,
-            model=integration.DISCOVERY_DEVICE_MODEL,
-            name=integration.DISCOVERY_DEVICE_NAME,
-            entry_type="service",
-        )
-        self.hass.config_entries.async_forward_entry_setups.assert_awaited_once_with(
-            entry, integration.PLATFORMS
-        )
-
-    async def test_entries_keep_distinct_parent_ids_with_the_same_identifier(self) -> None:
-        entries = (self.make_entry("first-entry"), self.make_entry("second-entry"))
-        parent_ids = ("first-registry-parent", "second-registry-parent")
-        managers = (self.make_managers(), self.make_managers())
-        self.registry.async_get_or_create.side_effect = [
-            SimpleNamespace(id=parent_id) for parent_id in parent_ids
-        ]
-        self.discovery_factory.side_effect = [pair[0] for pair in managers]
-        self.connection_factory.side_effect = [pair[1] for pair in managers]
-
-        for entry in entries:
-            self.assertTrue(await integration.async_setup_entry(self.hass, entry))
-
-        self.assertEqual(
-            self.discovery_factory.call_args_list,
-            [call(self.hass, entry.entry_id) for entry in entries],
-        )
-        for entry, parent_id, (discovery, connection) in zip(entries, parent_ids, managers):
-            runtime = self.hass.data[integration.DOMAIN][entry.entry_id]
-            self.assertEqual(runtime[integration.DATA_DISCOVERY_DEVICE_ID], parent_id)
-            self.assertIs(runtime[integration.DATA_DISCOVERY_MANAGER], discovery)
-            self.assertIs(runtime[integration.DATA_CONNECTION_MANAGER], connection)
-
-        parent_calls = self.registry.async_get_or_create.call_args_list
-        self.assertEqual(len(parent_calls), 2)
-        self.assertEqual(
-            [item.kwargs["config_entry_id"] for item in parent_calls],
-            [entry.entry_id for entry in entries],
-        )
-        for parent_call in parent_calls:
-            self.assertEqual(
-                parent_call.kwargs["identifiers"],
-                {(integration.DOMAIN, integration.DISCOVERY_VIA_DEVICE_ID)},
-            )
+def parent(hass, entry):
+    result = dr.async_get(hass).async_get_device_by_identifier((DOMAIN, DISCOVERY_VIA_DEVICE_ID), entry.entry_id)
+    assert result is not None
+    return result
 
 
-if __name__ == "__main__":
-    unittest.main()
+@pytest.mark.parametrize("cached", [True, False])
+async def test_parent_exists_when_valve_entities_are_registered(hass, runtime_factory, bluetooth_io, cached):
+    if cached:
+        bluetooth_io.advertise()
+    entry = await runtime_factory()
+    if not cached:
+        bluetooth_io.advertise()
+    await hass.async_block_till_done()
+    registered_parent = parent(hass, entry)
+    records = er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id)
+    assert {record.domain for record in records} == {"binary_sensor", "sensor", "number", "switch"}
+    for record in records:
+        device = dr.async_get(hass).async_get(record.device_id)
+        assert device is not None
+        assert device.via_device_id == registered_parent.id
+        assert device.config_entry_id == entry.entry_id
+        assert (DOMAIN, "valve-a") in device.identifiers
+
+
+async def test_same_parent_identifier_is_scoped_to_each_config_entry(hass, runtime_factory):
+    entries = [await runtime_factory(entry_id) for entry_id in ("first-entry", "second-entry")]
+    parents = [parent(hass, entry) for entry in entries]
+    assert parents[0].id != parents[1].id
+    for entry, device in zip(entries, parents):
+        assert device.config_entry_id == entry.entry_id
+        assert device.identifiers == {(DOMAIN, DISCOVERY_VIA_DEVICE_ID)}
+
+
+async def test_parent_link_survives_entry_reload(hass, runtime_factory, bluetooth_io, clock):
+    entry = await runtime_factory()
+    bluetooth_io.advertise()
+    await hass.async_block_till_done()
+    registry = dr.async_get(hass)
+    child = registry.async_get_device_by_identifier((DOMAIN, "valve-a"), entry.entry_id)
+    old_parent = parent(hass, entry)
+    assert await clock.run(hass.config_entries.async_reload(entry.entry_id))
+    assert parent(hass, entry).id == old_parent.id
+    assert registry.async_get(child.id).via_device_id == old_parent.id
+
+
+async def test_device_metadata_and_parent_link_survive_storage_restore(hass, hass_factory, runtime_factory, bluetooth_io):
+    entry = await runtime_factory()
+    bluetooth_io.advertise()
+    await hass.async_block_till_done()
+    registry = dr.async_get(hass)
+    child = registry.async_get_device_by_identifier((DOMAIN, "valve-a"), entry.entry_id)
+    registered_parent = parent(hass, entry)
+    registry.async_update_device(child.id, serial_number="SAVED-SERIAL")
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_stop(force=True)
+    restored = await hass_factory(hass.config.config_dir)
+    stored = dr.async_get(restored).async_get(child.id)
+    assert stored.serial_number == "SAVED-SERIAL"
+    assert stored.sw_version == "C4.22"
+    assert stored.via_device_id == registered_parent.id
+    assert stored.config_entry_id == entry.entry_id

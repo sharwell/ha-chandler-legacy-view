@@ -1,0 +1,8 @@
+-r requirements-test-common.txt
+homeassistant==2026.10.4
+# USB discovery imports Supervisor in this HA release.
+aiohasupervisor==0.6.0
+serialx==1.11.0
+bleak-retry-connector==4.7.1
+bluetooth-data-tools==1.29.24
+habluetooth==7.1.2
