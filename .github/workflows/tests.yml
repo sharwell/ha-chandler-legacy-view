@@ -1,0 +1,63 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  tests:
+    name: HA ${{ matrix.home_assistant }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        home_assistant: [minimum, current]
+        include:
+          - home_assistant: minimum
+            requirements: requirements-test-min.txt
+          - home_assistant: current
+            requirements: requirements-test.txt
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            ${{ matrix.requirements }}
+            requirements-test-common.txt
+
+      - name: Install test dependencies
+        run: python -m pip install --disable-pip-version-check -r "${{ matrix.requirements }}"
+
+      - name: Check installed dependencies
+        run: python -m pip check
+
+      - name: Run tests
+        run: python -m pytest -q --junitxml="${{ runner.temp }}/pytest-results.xml"
+
+      - name: Upload test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: pytest-${{ matrix.os }}-${{ matrix.home_assistant }}
+          path: ${{ runner.temp }}/pytest-results.xml
+          if-no-files-found: ignore
+          retention-days: 7

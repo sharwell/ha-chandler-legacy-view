@@ -26,6 +26,9 @@ async def test_malformed_response_retains_states_and_success_until_valid_recover
     valve = transport.valve()
     valve.dashboards.append(dashboard_frames(gallons=135))
     await clock.run(current.async_poll())
+    # State writes can precede event-listener delivery. Drain HA work before
+    # observing the next poll so the sequence describes completed publications.
+    await hass.async_block_till_done()
     usage = er.async_get(hass).async_get_entity_id("sensor", DOMAIN, "valve-a_water_usage_today")
     assert hass.states.get(usage).state == "135"
     original_data = current.dashboard_data
@@ -50,6 +53,7 @@ async def test_malformed_response_retains_states_and_success_until_valid_recover
         valve.dashboards.append(frames)
         await clock.advance(31)
         await clock.run(current.async_poll())
+        await hass.async_block_till_done()
         assert hass.states.get(usage).state == "135"
         assert current.dashboard_data == original_data
         assert current.last_success == original_success
@@ -57,6 +61,7 @@ async def test_malformed_response_retains_states_and_success_until_valid_recover
         valve.dashboards.append(dashboard_frames(gallons=246))
         await clock.advance(31)
         await clock.run(current.async_poll())
+        await hass.async_block_till_done()
         assert hass.states.get(usage).state == "246"
         assert current.last_success > original_success
         assert states == ["246"]
