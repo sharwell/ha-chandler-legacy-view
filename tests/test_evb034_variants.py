@@ -188,6 +188,38 @@ async def test_missing_variant_on_reconnect_keeps_confirmed_clack_conversion_and
     assert b'{"gbre":1}' not in valve.packet_requests
 
 
+@pytest.mark.parametrize("delivery,clack", [
+    ("auth-reply", 1), ("split-identification", 1), ("auth-reply", 0),
+])
+async def test_metadata_received_during_authentication_controls_battery_sampling(
+    hass, entry_factory, runtime_factory, bluetooth_io, transport, clock, delivery, clack,
+):
+    _, connection, valve = await setup_readings(
+        hass, entry_factory, runtime_factory, bluetooth_io, transport, 608, dlic=None, gbre=0,
+    )
+    if delivery == "split-identification":
+        valve.identification_packets.clear()
+        valve.identification_packets.append(
+            frames({"dlf": 608, "dlc": 23})
+            + frames({"as": 1, "dlic": clack, "dlvt": 1, "gbre": 0})
+        )
+    else:
+        valve.auth_replies.append(frames({"as": 2, "dlic": clack, "gbre": 0}))
+    if clack:
+        # Clack must read successfully even when unsupported battery writes
+        # would be rejected by the external valve boundary.
+        valve.chunk_acknowledgements.extend([b"\xc8", b"\xc8"])
+    valve.dashboards.append(frames({"dwu": 12345, "dbl": 9500}))
+    await clock.run(connection.async_poll())
+    await hass.async_block_till_done()
+    assert connection.last_success is not None
+    assert valve.packet_requests == ([] if clack else [b'{"gbre":1}'])
+    assert float(hass.states.get(sensor_id(hass, "water_usage_today")).state) == (123.45 if clack else 12345)
+    assert hass.states.get(sensor_id(hass, "battery")).state == ("unavailable" if clack else "100")
+    presence = er.async_get(hass).async_get_entity_id("binary_sensor", DOMAIN, "valve-a")
+    assert hass.states.get(presence).attributes["firmware_version"] == ("L6.08" if clack else "C6.08")
+
+
 async def test_remaining_volume_rounding_saturates_at_the_reference_integer_limit(
     hass, entry_factory, runtime_factory, bluetooth_io, transport, clock,
 ):

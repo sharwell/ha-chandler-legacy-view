@@ -1150,6 +1150,9 @@ class ValveConnection:
                     if attempt == 1:
                         self._record_authentication_failure(passcode)
                         return False
+            # Identity can arrive in split updates or the authentication reply.
+            # processPacketEvb034 uses that current identity for battery gating.
+            self._publish_evb034_metadata()
             self._set_authentication_failed(False)
             self._device_list_authentication_state = ValveAuthenticationState.AUTHENTICATED
             session.mark_authenticated()

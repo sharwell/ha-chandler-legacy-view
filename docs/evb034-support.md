@@ -132,6 +132,8 @@ The packet flag also controls `CsBlePacket$Companion.getFloatDivisor` and
 remaining volume and a 24-hour clock. The battery row and battery-sampling
 write are excluded for Clack. `dtgr` follows JVM float division and integer
 truncation, including large-counter rounding and signed-integer saturation.
+Metadata received in split identification updates or authentication replies is
+published before deciding whether to enable battery sampling.
 
 `CsValveType$Companion.fromValveType` maps Clack types 1/4/6/8 to metered
 softener, 2/5/7/9 to backwashing filter, and 3 to Clack aeration. Standard
