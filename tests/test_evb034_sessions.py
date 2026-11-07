@@ -65,7 +65,7 @@ async def test_notification_transport_boundaries_preserve_identification(
         assert b"\xf0" in [payload for _, payload in valve.writes]
 
 
-@pytest.mark.parametrize("damage", ["crc", "json", "missing", "duplicate", "stale", "wrong-family", "empty"])
+@pytest.mark.parametrize("damage", ["crc", "json", "missing", "stale", "wrong-family", "empty"])
 async def test_invalid_or_incomplete_packets_cannot_establish_identification(
     connection_factory, bluetooth_io, transport, clock, damage,
 ):
@@ -77,8 +77,6 @@ async def test_invalid_or_incomplete_packets_cannot_establish_identification(
         reply = frames(b'{"dlf":622,broken}')
     elif damage == "missing":
         reply = reply[:-1]
-    elif damage == "duplicate":
-        reply.insert(1, reply[0])
     elif damage == "stale":
         reply = reply[1:]
     elif damage == "wrong-family":
@@ -90,6 +88,26 @@ async def test_invalid_or_incomplete_packets_cannot_establish_identification(
     assert connection.evb034_packet is None
     assert connection.last_success is None
     assert not valve.clients[0].is_connected
+
+
+@pytest.mark.parametrize("restart", ["repeat", "replace"])
+async def test_valid_first_marker_restarts_identification_assembly(
+    connection_factory, bluetooth_io, transport, clock, restart,
+):
+    connection, valve = newer_connection(connection_factory, bluetooth_io, transport)
+    identity = {"dlf": 622, "dlc": 23, "as": 1, "gbre": 1}
+    reply = frames(identity)
+    abandoned = frames({"dlf": 999, "obsolete": 111, "as": 1})
+    # A repeated first frame (lost ACK) or a replacement transfer discards
+    # the partial JSON, as processDataPacket does for every first marker.
+    first = reply[0] if restart == "repeat" else abandoned[0]
+    valve.identification_packets.append([first, *reply])
+    await clock.run(connection.async_poll())
+    assert connection.last_success is not None
+    assert connection.evb034_packet["dlf"] == 622
+    assert connection.evb034_packet["dwu"] == 567
+    assert "obsolete" not in connection.evb034_packet
+    assert not connection.authentication_lockout
 
 
 @pytest.mark.parametrize("replies,successful", [([b"\xc8", b"\xcc"], True), ([b"\xc8"] * 2, False)])

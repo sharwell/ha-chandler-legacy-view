@@ -185,6 +185,12 @@ overflow/access-loss cleanup, bounded framing/command failures, stale
 pre-write authentication states, and cancellation/unload with pending
 notifications. Simulated cleanup is distinct from physical release evidence.
 
+During correction 2 validation, one existing Evb019 event-list assertion ran
+before the last HA event listener completed, despite the final state already
+being correct. The focused check and a subsequent full current-HA run passed;
+the C6.x-only change does not modify that path. This remains a test-timing
+observation rather than evidence of valve or transport behavior.
+
 The corrected lifecycle is recorded in commit `86af040`. With #60 variant
 interpretation and support records, the repository implements the existing
 entity coverage planned in #57–60. The remaining step is #61 hardware evidence
@@ -196,7 +202,8 @@ rather than inferred from simulated tests.
 
 The reference's chunks have no sequence number, message ID or payload length.
 First/last markers, CRC, JSON validation and request ownership detect malformed
-or overlapping deliveries, but cannot prove that an otherwise valid JSON
+deliveries; a valid first marker restarts assembly, as in Legacy View. These
+checks cannot prove that an otherwise valid JSON
 value was never duplicated or delayed by the valve. Do not invent sequence
 fields or claim stronger replay detection than the wire protocol provides.
 Hardware reports remain necessary for actual notification ordering, connection

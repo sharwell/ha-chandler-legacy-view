@@ -309,8 +309,8 @@ class Evb034Session:
             if header not in (0, 0x40, 0x80, 0xC0):
                 raise Evb034ProtocolError("Invalid data flags")
             if header & 0x80:
-                if self._buffer is not None:
-                    raise Evb034ProtocolError("Overlapping first chunks")
+                # processDataPacket resets the receive buffer on every first
+                # marker, including a retransmission after an ACK was lost.
                 self._buffer = bytearray()
             if self._buffer is None:
                 await self._send(NAK)
