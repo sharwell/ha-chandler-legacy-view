@@ -39,7 +39,7 @@ async def test_only_explicit_rejection_locks_out_credentials(
     await hass.async_block_till_done()
     assert hass.states.get(lockout).state == ("on" if locked else "off")
     assert connection.last_success is None
-    assert valve.dashboard_requests == 0
+    assert valve.dashboard_notifications == 0
     assert not valve.clients[0].is_connected
 
 
@@ -52,7 +52,7 @@ async def test_lockout_clear_and_reconnect_use_a_new_counter(
     assert connection.authentication_lockout
     await clock.advance(61)
     await clock.run(connection.async_poll())
-    assert len(valve.authentication_payloads) == 1
+    assert len(valve.authentication_payloads) == 2
     valve.pin = "1234"
     await hass.services.async_call("switch", "turn_off", {"entity_id": lockout}, blocking=True)
     await clock.advance(61)
@@ -60,7 +60,7 @@ async def test_lockout_clear_and_reconnect_use_a_new_counter(
     assert connection.last_success is not None
     assert connection.evb034_packet["dlc"] == 25
     assert not connection.authentication_lockout
-    assert len(valve.authentication_payloads) == 2
+    assert len(valve.authentication_payloads) == 3
 
 
 @pytest.mark.parametrize("mtu,pin", [(23, "1234"), (64, "1357"), (247, "0000"), (517, "9999")])
@@ -162,7 +162,7 @@ async def test_lost_authentication_stops_persistent_reads_and_reauthenticates(
     valve.dashboards.append(frames({"as": 1}))
     await clock.until(lambda: len(valve.clients) > 1 or not valve.clients[0].is_connected)
     assert not connection.authentication_lockout
-    await clock.until(lambda: len(valve.clients) == 2 and valve.dashboard_requests >= 3)
+    await clock.until(lambda: len(valve.clients) == 2 and valve.dashboard_notifications >= 3)
     assert len(valve.authentication_payloads) == 2
     assert connection.evb034_packet["dlc"] == 24
     await clock.run(connection.async_set_persistent_connection_enabled(False))

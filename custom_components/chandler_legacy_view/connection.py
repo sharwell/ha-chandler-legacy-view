@@ -765,9 +765,15 @@ class ValveConnection:
                 )
 
                 try:
-                    await asyncio.sleep(interval)
+                    if client is self._evb034_client and self._evb034_session is not None:
+                        await self._evb034_session.wait_interval(interval)
+                    else:
+                        await asyncio.sleep(interval)
                 except asyncio.CancelledError:
                     raise
+                except Evb034ProtocolError as exc:
+                    _LOGGER.debug("Evb034 stream for valve %s ended: %s", self._address, exc)
+                    break
 
                 if (
                     not self._persistent_connection_enabled
@@ -777,11 +783,21 @@ class ValveConnection:
                     break
 
                 try:
+                    if client is self._evb034_client and self._evb034_session is not None:
+                        refreshed = False
+                        for packet in self._evb034_session.pending_packets():
+                            refreshed = self._handle_evb034_update(packet) or refreshed
+                        if refreshed:
+                            self._last_success = dt_util.utcnow()
+                        continue
                     request_sent, response_received = (
                         await self._async_request_dashboard(client)
                     )
                 except asyncio.CancelledError:
                     raise
+                except Evb034ProtocolError as exc:
+                    _LOGGER.debug("Evb034 stream for valve %s ended: %s", self._address, exc)
+                    break
                 except Exception:  # pragma: no cover - unexpected protocol errors
                     _LOGGER.exception(
                         "Unexpected error while refreshing dashboard data for valve %s",
@@ -1095,33 +1111,47 @@ class ValveConnection:
             if self._authentication_failed:
                 return False
             state = identification.get("as")
+            async with asyncio.timeout(9):
+                while state is None:
+                    identification.update(await session.next_packet())
+                    state = identification.get("as")
             if type(state) is not int or state not in (1, 2):
                 return False
             if state == 1:
-                counter = identification.get("dlc")
                 value = self._parse_passcode(passcode)
-                if type(counter) is not int or not 0 <= counter <= 0x7FFFFFFF or value is None:
+                if value is None:
                     return False
-                reply = await session.request(self._create_evb034_password_buffer(
-                    session.write_size, counter, value
-                ))
-                state = reply.get("as")
-                if type(state) is not int:
-                    return False
-                if state == 1:
-                    self._record_authentication_failure(passcode)
-                    return False
-                if state != 2:
-                    return False
-                self._evb034_packet.update(reply)
+                # Initial authentication is a direct write, not a queued framed
+                # command (CsBleViewModel.write while authenticated == false).
+                # onPacketUpdated allows two PIN attempts with packet counters.
+                for attempt in range(2):
+                    counter = identification.get("dlc")
+                    if type(counter) is not int or not 0 <= counter <= 0x7FFFFFFF:
+                        return False
+                    reply = await session.authenticate(self._create_evb034_password_buffer(
+                        session.write_size, counter, value
+                    ))
+                    state = reply.get("as")
+                    if type(state) is not int or state not in (1, 2):
+                        return False
+                    if state == 2:
+                        # Pre-authentication readings cannot become a successful
+                        # read merely because a later access response arrived.
+                        identification = {key: val for key, val in identification.items()
+                                          if key not in READING_KEYS}
+                        identification.update({key: val for key, val in reply.items() if val is not None})
+                        self._evb034_packet = identification
+                        break
+                    identification.update({key: val for key, val in reply.items() if val is not None})
+                    if attempt == 1:
+                        self._record_authentication_failure(passcode)
+                        return False
             self._set_authentication_failed(False)
             self._device_list_authentication_state = ValveAuthenticationState.AUTHENTICATED
-            if identification.get("dlic") != 1 and identification.get("gbre") != 1:
-                reply = await session.request(b'{"gbre":1}')
-                if "as" in reply and (type(reply["as"]) is not int or reply["as"] != 2):
-                    return False
-                self._evb034_packet.update(reply)
-            return await self._async_refresh_evb034_dashboard(client)
+            session.mark_authenticated()
+            if integer(identification, "dlic") != 1 and integer(identification, "gbre") != 1:
+                await session.send_command(b'{"gbre":1}')
+            return await self._async_refresh_evb034_dashboard(client, initial=True)
         except (TimeoutError, Evb034ProtocolError) as exc:
             _LOGGER.debug("Evb034 exchange for valve %s failed: %s", self._address, exc)
             return False
@@ -1142,30 +1172,42 @@ class ValveConnection:
             buffer[index] = previous
         return bytes(buffer)
 
-    async def _async_refresh_evb034_dashboard(self, client: BaseBleakClient) -> bool:
-        """Require fresh Dashboard fields from the authenticated owning client."""
+    async def _async_refresh_evb034_dashboard(
+        self, client: BaseBleakClient, *, initial: bool = False
+    ) -> bool:
+        """Receive fresh readings without inventing an Evb019 Dashboard request."""
         session = self._evb034_session
         if session is None or client is not self._evb034_client:
             return False
-        packet = await session.request(b"u" * 20)
+        async with asyncio.timeout(9):
+            if initial and READING_KEYS.intersection(self._evb034_packet):
+                if self._handle_evb034_update(self._evb034_packet):
+                    return True
+            while True:
+                if self._handle_evb034_update(await session.next_packet()):
+                    return True
+
+    def _handle_evb034_update(self, packet: dict) -> bool:
+        """Apply one authenticated stream update; return whether a reading changed."""
         if "as" in packet and (type(packet["as"]) is not int or packet["as"] != 2):
             self._device_list_authentication_state = ValveAuthenticationState.UNKNOWN
-            return False
-        if not READING_KEYS.intersection(packet):
-            return False
+            raise Evb034ProtocolError("Session lost authentication")
         updated = {**self._evb034_packet, **{key: value for key, value in packet.items()
                                            if value is not None}}
         firmware = integer(updated, "dlf")
         if firmware is None or not 600 <= firmware <= 9999:
             raise Evb034ProtocolError("Invalid updated firmware identity")
-        data = decode_dashboard(updated, firmware, clack=updated.get("dlic") == 1)
+        is_clack = integer(updated, "dlic") == 1
+        self._evb034_packet = updated
+        self._publish_evb034_metadata()
+        if not READING_KEYS.intersection(packet):
+            return False
+        data = decode_dashboard(updated, firmware, clack=is_clack)
         if not any(getattr(data, field) is not None for field in (
             "time_hour", "battery_capacity", "present_flow", "water_usage", "peak_flow",
             "water_hardness", "water_remaining_until_regeneration", "air_recharge",
         )):
             return False
-        self._evb034_packet = updated
-        self._publish_evb034_metadata()
         self._dashboard_data = data
         self._notify_dashboard_listeners(data)
         return True
@@ -1451,7 +1493,7 @@ class ValveConnection:
                 if self._evb034_client is client:
                     session = self._evb034_session
                     if session is not None:
-                        session.close()
+                        await session.close()
                     await self._async_unsubscribe_notifications(
                         client, self._evb034_subscriptions
                     )

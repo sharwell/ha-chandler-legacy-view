@@ -23,8 +23,9 @@ async def test_identifies_newer_valves_with_negotiated_packet_sizes(
     await clock.run(connection.async_poll())
     assert connection.evb034_packet["dlf"] == 622
     assert connection.evb034_packet["dlc"] == 23
-    assert valve.packet_requests[0] == b"t" * 20
-    assert valve.packet_requests[-1] == b"u" * 20
+    assert valve.packet_requests == []
+    assert all(payload not in (b"t" * 20, b"u" * 20) for _, payload in valve.writes)
+    assert valve.authentication_payloads[0] in [payload for _, payload in valve.writes]
     assert connection.last_success is not None
     assert valve.clients[0].notifications == {}
     assert not valve.clients[0].is_connected
@@ -81,10 +82,13 @@ async def test_negative_acknowledgements_retry_only_within_the_packet_budget(
     connection_factory, bluetooth_io, transport, clock, replies, successful,
 ):
     connection, valve = newer_connection(connection_factory, bluetooth_io, transport)
+    valve.identification_packets.append(frames({
+        "dlf": 622, "dlc": 23, "as": 1, "dlic": 0, "gbre": 0,
+    }))
     valve.chunk_acknowledgements.extend(replies)
     await clock.run(connection.async_poll())
-    assert (connection.evb034_packet is not None) == successful
-    chunks = [payload for _, payload in valve.writes if len(payload) > 1]
+    assert (connection.last_success is not None) == successful
+    chunks = [payload for _, payload in valve.writes if payload[:2] == b"\xc0{"]
     assert chunks[0] == chunks[1]
     if not successful:
         assert len(chunks) == 2
@@ -129,10 +133,13 @@ async def test_missing_or_rejected_acknowledgement_has_a_bounded_failure(
 ):
     connection, valve = newer_connection(connection_factory, bluetooth_io, transport)
     if failure == "missing-ack":
-        valve.chunk_acknowledgements.append(b"")
+        valve.identification_packets.append(frames({
+            "dlf": 622, "dlc": 23, "as": 1, "dlic": 0, "gbre": 0,
+        }))
+        valve.chunk_acknowledgements.extend([b""] * 2)
     else:
         valve.id_acknowledgements.extend([b"\xc8"] * 2)
     await clock.run(connection.async_poll(), budget=30)
-    assert connection.evb034_packet is None
+    assert connection.last_success is None
     assert not valve.clients[0].is_connected
-    assert len(valve.writes) < 10
+    assert len(valve.writes) < 20
