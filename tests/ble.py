@@ -1,12 +1,14 @@
 """Simulated GATT transport; production connection and protocol code run unchanged."""
 
 import asyncio
+import json
 from collections import deque
 
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.service import BleakGATTService, BleakGATTServiceCollection
 
 from packets import dashboard_frames, device_list_frame
+from evb034_packets import crc16, frames, password_pin
 
 SERVICE = "00001000-0000-1000-8000-00805f9b34fb"
 WRITE = "00001001-0000-1000-8000-00805f9b34fb"
@@ -82,8 +84,16 @@ class Valve:
         self.dashboard_requests = 0
         self.writes = []
         self.clients = []
+        self.mtu_size = 23
+        self.identification_packets = deque()
+        self.chunk_acknowledgements = deque()
+        self.id_acknowledgements = deque()
+        self.timeout_responses = deque()
+        self.packet_requests = []
+        self.dashboard_notifications = 0
+        self.stream_enabled = True
         self.operations = {name: Operation() for name in
-                           ("connect", "device_list", "authenticate", "dashboard", "reset", "disconnect")}
+                           ("connect", "identify", "device_list", "authenticate", "dashboard", "reset", "disconnect", "timeout")}
 
     def authenticated(self, counter=23):
         self.device_lists.append([device_list_frame(status=0, counter=counter)])
@@ -100,6 +110,15 @@ class Client:
         self.connection_counter = valve.connection_counter
         valve.connection_counter = (valve.connection_counter + 1) & 255
         self.challenge = None
+        self.mtu_size = valve.mtu_size
+        self.packet_buffer = bytearray()
+        self.peer_tasks = []
+        self.peer_ack = asyncio.Queue()
+        self.peer_outgoing = asyncio.Queue()
+        self.peer_access = asyncio.Event()
+        self.peer_latest_data = {"dwu": 567}
+        if not valve.authentication_required:
+            self.peer_access.set()
         self.dashboard_access = not valve.authentication_required
         # These Bleak data objects perform no host I/O. Keep the real service
         # representation so polling cannot rely on a test-only list contract.
@@ -166,6 +185,12 @@ class Client:
         assert uuid == WRITE and response
         payload = bytes(payload)
         self.valve.writes.append((self, payload))
+        if self.valve.firmware_version is not None and self.valve.firmware_version >= 600:
+            await self.write_evb034(payload)
+            return
+        if payload == b"\xea":
+            # Evb019 firmware does not understand the newer-family probe.
+            return
         if payload[:4] == b"ttPA":
             operation = "authenticate"
             self.valve.authentication_payloads.append(payload)
@@ -193,8 +218,149 @@ class Client:
         for packet in replies:
             self.notify(packet)
 
+    async def write_evb034(self, payload):
+        """Reference peer: EA starts notifications; raw PIN precedes framed JSON."""
+        if payload in (b"t" * 20, b"u" * 20, b"r" * 20):
+            # Legacy probing is allowed only before identifying this peer.
+            assert not self.peer_tasks, "C6.x never polls with Evb019 opcodes"
+            return
+        if payload == b"\xea":
+            await self.valve.operations["identify"].run()
+            ack = (self.valve.id_acknowledgements.popleft()
+                   if self.valve.id_acknowledgements else b"\xcc")
+            if ack:
+                self.notify(ack)
+            if ack != b"\xcc" or self.peer_tasks:
+                return
+            self.challenge = self.connection_counter
+            self.peer_tasks = [asyncio.create_task(self._peer_sender()),
+                               asyncio.create_task(self._peer_stream())]
+            return
+        if payload in (b"\xcc", b"\xc8"):
+            self.peer_ack.put_nowait(payload)
+            return
+        if payload in (b"\xe0", b"\xf0"):
+            return
+        if payload in (b"\xc2", b"\xc3"):
+            await self.valve.operations["timeout"].run()
+            # A scripted timeout exchange supplies each peer status explicitly;
+            # do not manufacture an unbounded C2/C3 echo conversation.
+            if self.valve.timeout_responses:
+                reply = self.valve.timeout_responses.popleft()
+                if reply:
+                    self.notify(reply)
+            return
+        if not self.dashboard_access:
+            assert len(payload) == 20, "Initial password is a direct ATT write"
+            await self.valve.operations["authenticate"].run()
+            self.valve.authentication_payloads.append(payload)
+            pin = password_pin(payload, self.challenge)
+            accepted = pin == self.valve.pin
+            scripted = bool(self.valve.auth_replies)
+            reply = (self.valve.auth_replies.popleft() if scripted else
+                     frames({"as": 2 if accepted else 1}, min(512, self.mtu_size - 3)))
+            state = self._peer_packet(reply).get("as")
+            self.dashboard_access = accepted and state == 2
+            await self.peer_outgoing.put((reply, scripted))
+            if self.dashboard_access:
+                self.peer_access.set()
+            return
+        assert len(payload) <= min(512, self.mtu_size - 3)
+        assert int.from_bytes(payload[-2:], "little") == crc16(payload[:-2])
+        ack = (self.valve.chunk_acknowledgements.popleft()
+               if self.valve.chunk_acknowledgements else b"\xcc")
+        if ack != b"\xcc":
+            if ack:
+                self.notify(ack)
+            return
+        if payload[0] & 0x80:
+            self.packet_buffer.clear()
+        self.packet_buffer.extend(payload[1:-2])
+        self.notify(ack)
+        if not payload[0] & 0x40:
+            return
+        request = bytes(self.packet_buffer)
+        self.packet_buffer.clear()
+        self.valve.packet_requests.append(request)
+        command = json.loads(request)
+        # Packet-session tests can send several app configuration fields in one
+        # JSON message; only battery sampling needs a modeled setting response.
+        if command.get("gbre") == 1:
+            await self.peer_outgoing.put((frames({"gbre": 1}, min(512, self.mtu_size - 3)), False))
+
+    @staticmethod
+    def _peer_packet(reply):
+        try:
+            return json.loads(b"".join(frame[1:-2] for frame in reply))
+        except (ValueError, TypeError, UnicodeError):
+            return {}
+
+    async def _peer_sender(self):
+        try:
+            while True:
+                reply, scripted = await self.peer_outgoing.get()
+                fault_delivery = scripted and any(
+                    len(frame) < 3 or len(frame) > min(512, self.mtu_size - 3)
+                    or int.from_bytes(frame[-2:], "little") != crc16(frame[:-2])
+                    for frame in reply
+                )
+                for frame in reply:
+                    if fault_delivery:
+                        # Fault scripts can deliberately violate framing/ordering
+                        # at the external notification boundary.
+                        self.notify(frame)
+                        await asyncio.sleep(0)
+                        continue
+                    while not self.peer_ack.empty():
+                        self.peer_ack.get_nowait()
+                    for attempt in range(2):
+                        self.notify(frame)
+                        try:
+                            async with asyncio.timeout(3):
+                                ack = await self.peer_ack.get()
+                        except TimeoutError:
+                            ack = b"\xc8"
+                        if ack == b"\xcc":
+                            break
+                        if attempt == 1:
+                            self.is_connected = False
+                            return
+        except asyncio.CancelledError:
+            raise
+
+    async def _peer_stream(self):
+        # CsDeviceListFragment.lambda$writeData$8 skips C6.x DeviceList writes.
+        # EA therefore produces identification without any client read request.
+        await self.valve.operations["device_list"].run()
+        default = {"dlf": self.valve.firmware_version, "dlc": self.connection_counter,
+                   "as": 1 if self.valve.authentication_required else 2,
+                   "dlvt": 1, "dli": 0, "dlic": 0, "gbre": 1}
+        scripted = bool(self.valve.identification_packets)
+        reply = (self.valve.identification_packets.popleft() if scripted
+                 else frames(default, min(512, self.mtu_size - 3)))
+        await self.peer_outgoing.put((reply, scripted))
+        while True:
+            await self.peer_access.wait()
+            await self.valve.operations["dashboard"].run()
+            if self.valve.stream_enabled:
+                scripted = bool(self.valve.dashboards)
+                reply = (self.valve.dashboards.popleft() if scripted else
+                         frames(self.peer_latest_data, min(512, self.mtu_size - 3)))
+                values = self._peer_packet(reply)
+                self.peer_latest_data.update({key: value for key, value in values.items() if key != "as"})
+                if values.get("as") == 1:
+                    self.dashboard_access = False
+                    self.peer_access.clear()
+                self.valve.dashboard_notifications += 1
+                await self.peer_outgoing.put((reply, scripted))
+            await asyncio.sleep(1)
+
     async def disconnect(self):
         self.disconnects += 1
+        for task in self.peer_tasks:
+            task.cancel()
+        if self.peer_tasks:
+            await asyncio.gather(*self.peer_tasks, return_exceptions=True)
         await self.valve.operations["disconnect"].run()
         self.notifications.clear()
         self.is_connected = False

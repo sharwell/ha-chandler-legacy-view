@@ -108,6 +108,13 @@ def _is_clack_valve(advertised_name: str | None) -> bool:
     return advertised_name.strip().casefold().startswith(_CLACK_NAME_PREFIX)
 
 
+def advertisement_is_clack_valve(advertisement: ValveAdvertisement) -> bool:
+    """Prefer confirmed packet identity to the discovery name heuristic."""
+    if advertisement.is_clack_valve is not None:
+        return advertisement.is_clack_valve
+    return _is_clack_valve(advertisement.name)
+
+
 def _can_report_low_salt(advertised_name: str | None) -> bool:
     """Return ``True`` if the valve can report a low salt condition."""
 
@@ -207,7 +214,7 @@ def format_firmware_version(advertisement: ValveAdvertisement) -> str | None:
         return None
 
     return _convert_version_number_to_string(
-        firmware_version, _is_clack_valve(advertisement.name)
+        firmware_version, advertisement_is_clack_valve(advertisement)
     )
 
 

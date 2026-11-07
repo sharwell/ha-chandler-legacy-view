@@ -22,6 +22,7 @@ class ValveCapabilities:
 
     is_twin_valve: bool | None = None
     valve_type: str | None = None
+    is_clack_valve: bool | None = None
 
     @property
     def is_metered_softener(self) -> bool | None:
@@ -66,6 +67,8 @@ class ValveAdvertisement:
     bootloader_version: int | None = None
     radio_protocol_version: int | None = None
     authentication_required: bool | None = None
+    is_clack_valve: bool | None = None
+    clack_firmware_version: str | None = None
 
     @property
     def is_metered_softener(self) -> bool:
@@ -83,17 +86,17 @@ class ValveAdvertisement:
 
 @dataclass(slots=True)
 class ValveDashboardData:
-    """Parsed data returned by the EVB019 Dashboard request."""
+    """Normalized Dashboard readings; absent Evb034 fields remain unknown."""
 
-    time_hour: int
-    time_minute: int
-    is_pm: bool
-    battery_capacity: int
-    present_flow: float
-    water_remaining_until_regeneration: int
-    water_usage: int
-    peak_flow: float
-    water_hardness: int
+    time_hour: int | None
+    time_minute: int | None
+    is_pm: bool | None
+    battery_capacity: int | None
+    present_flow: float | None
+    water_remaining_until_regeneration: int | None
+    water_usage: float | None
+    peak_flow: float | None
+    water_hardness: int | None
     regeneration_time_hour: int
     regeneration_time_is_pm: bool
     shutoff_setting_enabled: bool
@@ -102,7 +105,7 @@ class ValveDashboardData:
     bypass_active: bool
     display_off: bool
     filter_backwash: int
-    air_recharge: int
+    air_recharge: int | None
     pos_time: int
     pos_option_seconds: int
     regen_cycle_position: int

@@ -19,7 +19,7 @@ from homeassistant.components.bluetooth import (
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant
 
 from .const import CSI_MANUFACTURER_ID, VALVE_MATCHERS, VALVE_NAME_PREFIXES
-from .device_registry import async_update_device_sw_version
+from .device_registry import async_update_device_sw_version, async_update_device_model
 from .entity import _is_clack_valve, format_firmware_version
 from .models import ValveAdvertisement
 
@@ -611,6 +611,22 @@ class ValveDiscoveryManager:
 
         return _remove_listener
 
+    def async_set_device_metadata(self, advertisement: ValveAdvertisement) -> None:
+        """Publish metadata learned from validated active identification."""
+        address = advertisement.address
+        if self._unloaded or address not in self._devices:
+            return
+        self._devices[address] = advertisement
+        if advertisement.model is not None:
+            async_update_device_model(
+                self._hass, self._config_entry_id, address, advertisement.model
+            )
+        async_update_device_sw_version(
+            self._hass, self._config_entry_id, address, format_firmware_version(advertisement)
+        )
+        if self._is_available(address):
+            self._notify_listeners(advertisement, ValveDiscoveryChange.AVAILABLE)
+
     def _async_handle_bluetooth_event(
         self, service_info: BluetoothServiceInfoBleak, change: BluetoothChange
     ) -> None:
@@ -720,6 +736,17 @@ class ValveDiscoveryManager:
                 radio_protocol_version=classification.radio_protocol_version,
             )
             previous_advertisement = self._devices.get(service_info.address)
+            if previous_advertisement is not None and previous_advertisement.is_clack_valve is not None:
+                # C6.x advertisement layouts do not carry the packet's dlic/dli
+                # identity. They must not erase confirmed variant information.
+                advertisement = replace(
+                    advertisement,
+                    is_clack_valve=previous_advertisement.is_clack_valve,
+                    clack_firmware_version=previous_advertisement.clack_firmware_version,
+                    is_twin_valve=previous_advertisement.is_twin_valve,
+                    valve_type=previous_advertisement.valve_type,
+                    valve_type_full=previous_advertisement.valve_type_full,
+                )
             if (
                 previous_advertisement is not None
                 and not advertisement.manufacturer_data_complete

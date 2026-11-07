@@ -7,6 +7,7 @@ from custom_components.chandler_legacy_view.const import DOMAIN
 from packets import device_list_frame
 
 UPDATES = [
+    (helpers.async_update_device_model, "model", "Evb034"),
     (helpers.async_update_device_serial_number, "serial_number", "SERIAL-NEW"),
     (helpers.async_update_device_sw_version, "sw_version", "C4.22"),
 ]
@@ -18,7 +19,7 @@ def devices(hass, entry_factory):
     def create(entry_id, value="old"):
         entry = entry_factory(entry_id)
         return registry.async_get_or_create(config_entry_id=entry.entry_id,
-            identifiers={(DOMAIN, "valve-a")}, serial_number=value, sw_version=value)
+            identifiers={(DOMAIN, "valve-a")}, serial_number=value, sw_version=value, model=value)
     return registry, create
 
 
