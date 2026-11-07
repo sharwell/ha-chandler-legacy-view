@@ -4,7 +4,7 @@ import asyncio
 import logging
 
 import pytest
-from homeassistant.const import EVENT_STATE_CHANGED
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, EVENT_STATE_CHANGED
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
@@ -132,15 +132,25 @@ async def test_mode_and_interval_changes_recalculate_without_reviving_expired_va
     assert hass.states.get(usage).state == "987"
 
 
+@pytest.mark.parametrize("observation_delay", [0, 2])
 async def test_no_confirmation_expires_after_startup_recovery_allowance(
-    hass, runtime_factory, bluetooth_io, transport, clock, refresh_action,
+    hass, runtime_factory, bluetooth_io, transport, clock, refresh_action, observation_delay,
 ):
-    entry, connection, usage = await setup_readings(hass, runtime_factory, bluetooth_io)
+    entry, _, usage = await setup_readings(hass, runtime_factory, bluetooth_io)
     hass.config_entries.async_update_entry(entry, pref_disable_polling=True)
+    acquisition_started = hass.loop.create_future()
+    @callback
+    def record_started(_):
+        acquisition_started.set_result(hass.loop.time())
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, record_started)
     await clock.run(hass.async_start())
-    await clock.advance(299)
+    started_at = await acquisition_started
+    # Startup dispatch and delayed observation consume the same allowance.
+    # Adding 299 seconds after observing startup can cross the real deadline.
+    await clock.advance(observation_delay)
+    await clock.advance(max(0, started_at + 299 - hass.loop.time()))
     assert hass.states.get(usage).state == "unknown"
-    await clock.advance(1.1)
+    await clock.advance(max(0, started_at + 300.1 - hass.loop.time()))
     assert hass.states.get(usage).state == "unavailable"
     assert transport.attempts == []
     transport.valve().dashboards.append(dashboard_frames(gallons=0))
