@@ -12,6 +12,9 @@ from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.selector import (
     BooleanSelector,
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
@@ -31,6 +34,10 @@ from .const import (
     DOMAIN,
 )
 from .entity import friendly_name_from_advertised_name
+from .preferences import (
+    PERSISTENT_INTERVAL, VALVE_PREFERENCES, INHERIT_PERSISTENT_INTERVAL,
+    default_interval, persistent_interval, valve_preferences,
+)
 
 
 PASSCODE_PATTERN = re.compile(r"^\d{4}$")
@@ -133,13 +140,21 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
                 )
                 seen_addresses.add(address)
 
-        for address in existing_overrides:
+        saved_valves = self._config_entry.options.get(VALVE_PREFERENCES, {})
+        if not isinstance(saved_valves, dict):
+            saved_valves = {}
+        for address in sorted(set(existing_overrides) | set(saved_valves)):
             if address in seen_addresses:
                 continue
             device_options.append({"value": address, "label": address})
 
         if user_input is not None:
             updated_options = dict(self._config_entry.options)
+            if PERSISTENT_INTERVAL in user_input:
+                try:
+                    updated_options[PERSISTENT_INTERVAL] = persistent_interval(user_input[PERSISTENT_INTERVAL])
+                except (ValueError, TypeError, OverflowError):
+                    errors[PERSISTENT_INTERVAL] = "invalid_interval"
 
             default_passcode_input = _coerce_passcode(
                 user_input.get(CONF_DEFAULT_PASSCODE)
@@ -147,19 +162,6 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
             if default_passcode_input is not None:
                 if not _is_valid_passcode(default_passcode_input):
                     errors[CONF_DEFAULT_PASSCODE] = "invalid_passcode"
-                elif (
-                    default_passcode_input
-                    != self._config_entry.data.get(
-                        CONF_DEFAULT_PASSCODE, DEFAULT_VALVE_PASSCODE
-                    )
-                ):
-                    hass.config_entries.async_update_entry(
-                        self._config_entry,
-                        data={
-                            **self._config_entry.data,
-                            CONF_DEFAULT_PASSCODE: default_passcode_input,
-                        },
-                    )
 
             remove_override = bool(user_input.get(CONF_REMOVE_OVERRIDE))
             selected_device = user_input.get(CONF_DEVICE_ADDRESS)
@@ -167,7 +169,11 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
                 user_input.get(CONF_DEVICE_PASSCODE)
             )
 
+            interval_input = user_input.get("device_persistent_interval")
+            inherit_interval = bool(user_input.get(INHERIT_PERSISTENT_INTERVAL))
             if selected_device is None:
+                if interval_input is not None or inherit_interval:
+                    errors["base"] = "device_required"
                 if device_passcode_input is not None or remove_override:
                     errors["base"] = "device_required"
             else:
@@ -185,10 +191,32 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
                             existing_overrides.get(selected_device) != device_passcode_input
                         )
                         updated_overrides[selected_device] = device_passcode_input
-                else:
+                elif interval_input is None and not inherit_interval:
                     errors[CONF_DEVICE_PASSCODE] = "passcode_required"
 
+                values = valve_preferences(updated_options, selected_device)
+                if inherit_interval:
+                    if interval_input is not None:
+                        errors["device_persistent_interval"] = "interval_not_expected"
+                    else:
+                        values.pop(PERSISTENT_INTERVAL, None)
+                elif interval_input is not None:
+                    try:
+                        values[PERSISTENT_INTERVAL] = persistent_interval(interval_input)
+                    except (ValueError, TypeError, OverflowError):
+                        errors["device_persistent_interval"] = "invalid_interval"
+                if interval_input is not None or inherit_interval:
+                    original = updated_options.get(VALVE_PREFERENCES, {})
+                    valves = dict(original) if isinstance(original, dict) else {}
+                    valves[selected_device] = values
+                    updated_options[VALVE_PREFERENCES] = valves
+
             if not errors:
+                if default_passcode_input is not None:
+                    hass.config_entries.async_update_entry(
+                        self._config_entry,
+                        data={**self._config_entry.data, CONF_DEFAULT_PASSCODE: default_passcode_input},
+                    )
                 if overrides_changed:
                     if updated_overrides:
                         updated_options[CONF_DEVICE_PASSCODES] = updated_overrides
@@ -199,6 +227,9 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
                 return self.async_create_entry(title="", data=updated_options)
 
         schema_dict: dict[vol.Marker, object] = {
+            vol.Optional(PERSISTENT_INTERVAL, default=default_interval(self._config_entry.options)): NumberSelector(
+                NumberSelectorConfig(min=5, max=300, step=1, unit_of_measurement="s", mode=NumberSelectorMode.BOX)
+            ),
             vol.Optional(
                 CONF_DEFAULT_PASSCODE,
                 default=self._config_entry.data.get(
@@ -215,6 +246,10 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
                 )
             )
             schema_dict[vol.Optional(CONF_DEVICE_PASSCODE)] = PASSCODE_SELECTOR
+            schema_dict[vol.Optional("device_persistent_interval")] = NumberSelector(
+                NumberSelectorConfig(min=5, max=300, step=1, unit_of_measurement="s", mode=NumberSelectorMode.BOX)
+            )
+            schema_dict[vol.Optional(INHERIT_PERSISTENT_INTERVAL, default=False)] = BooleanSelector()
             schema_dict[vol.Optional(CONF_REMOVE_OVERRIDE, default=False)] = (
                 BooleanSelector()
             )
@@ -223,4 +258,10 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
             step_id="init",
             data_schema=vol.Schema(schema_dict),
             errors=errors,
+            description_placeholders={"persistent_overrides": "; ".join(
+                f"{address}: {values[PERSISTENT_INTERVAL]} s"
+                for address in sorted(saved_valves)
+                for values in [valve_preferences(self._config_entry.options, address)]
+                if PERSISTENT_INTERVAL in values
+            ) or "None"},
         )

@@ -119,3 +119,28 @@ Real HA lifecycle tests with simulated GATT cover cooperative reload and
 fresh published values, resistant late connect/read/disconnect, retryable
 replacement setup, another entry, unsubscribe failure, repeated cancellation
 and queued/running handoffs. No physical adapter/proxy evidence is available.
+
+## Durable settings and evidence (#104)
+
+Entry options own the persistent default and address-specific mode/interval
+preferences. Constructors read them before scheduling any connection; entity
+enablement is irrelevant to restoration. Preference edits update live controls
+and reschedule publication without reloading valves or restarting a healthy
+stream. Credential changes retain their existing reload behavior.
+
+The existing interval number keeps its registry identity and enablement.
+Every valid write saves an explicit override, even if equal to the inherited
+default, and it remains available as local configuration when the radio is
+unavailable. Options can inspect, edit and clear overrides. No deprecation
+notice, entity removal or new entity is introduced.
+
+Migration runs once before entity creation. Valid non-default historical HA
+states can recover an old selection; authoritative options win. Old off/10
+defaults and unavailable/unknown states do not prove a saved selection. Old
+releases did not persist these controls, so previously lost choices cannot
+be reconstructed. Existing startup number actions now capture durable values.
+
+Real HA actions, options, registries and storage-backed fresh runtimes verify
+inheritance, explicit writes, offline edits, migration, invalid values, saved
+on/off, disabled controls and restored publication cadence. Bluetooth I/O is
+simulated; storage and HA lifecycle are real.

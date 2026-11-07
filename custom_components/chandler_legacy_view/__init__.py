@@ -156,4 +156,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Handle a config entry reload request."""
 
-    await hass.config_entries.async_reload(entry.entry_id)
+    runtime = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    manager = runtime[DATA_CONNECTION_MANAGER] if runtime else None
+    if manager is not None and not manager.authentication_configuration_changed():
+        await manager.async_apply_preferences()
+    else:
+        await hass.config_entries.async_reload(entry.entry_id)

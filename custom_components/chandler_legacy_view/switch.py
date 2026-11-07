@@ -39,6 +39,16 @@ class ValvePersistentConnectionSwitch(ChandlerValveEntity, SwitchEntity):
         self._attr_available = True
         self._attr_is_on = connection.persistent_connection_enabled
 
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self.async_on_remove(self._connection.add_preference_listener(self._handle_preferences))
+        self._handle_preferences()
+
+    @callback
+    def _handle_preferences(self) -> None:
+        self._attr_is_on = self._connection.persistent_connection_enabled
+        self.async_write_ha_state()
+
     @callback
     def async_handle_bluetooth_update(
         self, advertisement: ValveAdvertisement, change: ValveDiscoveryChange

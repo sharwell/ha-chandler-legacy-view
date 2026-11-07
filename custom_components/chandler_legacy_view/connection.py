@@ -48,6 +48,7 @@ from .discovery import ValveDiscoveryChange, ValveDiscoveryManager, _map_valve_t
 from .models import ValveAdvertisement, ValveCapabilities, ValveDashboardData
 from .evb034 import Evb034ProtocolError, Evb034Session
 from .evb034_data import READING_KEYS, decode_dashboard, integer
+from .preferences import ValvePreferences, PERSISTENT_ENABLED, PERSISTENT_INTERVAL, persistent_interval
 from .protocol_compatibility import (
     PreviousProtocol,
     password_digits,
@@ -252,6 +253,7 @@ class ValveConnection:
         passcode_getter: Callable[[str], ValvePasscodeConfiguration] | None = None,
         connection_state_callback: Callable[[str, bool], None] | None = None,
         metadata_callback: Callable[[ValveAdvertisement], None] | None = None,
+        preferences: ValvePreferences | None = None,
     ) -> None:
         """Initialize the valve connection handler."""
 
@@ -289,8 +291,11 @@ class ValveConnection:
         self._metadata_callback = metadata_callback
         self._crc8 = _ChandlerCrc8()
         self._previous_protocol = PreviousProtocol()
-        self._persistent_connection_enabled = False
-        self._persistent_poll_interval = DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS
+        self._preferences = preferences
+        self._preference_listeners: list[Callable[[], None]] = []
+        self._interval_changed = asyncio.Event()
+        self._persistent_connection_enabled = preferences.enabled(address) if preferences else False
+        self._persistent_poll_interval = preferences.interval(address) if preferences else DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS
         self._persistent_task: asyncio.Task[None] | None = None
         self._pending_persistent_client: BaseBleakClient | None = None
         self._persistent_stop_task: asyncio.Task[None] | None = None
@@ -454,9 +459,30 @@ class ValveConnection:
         )
         self._set_authentication_failed(False)
 
-    async def async_set_persistent_connection_enabled(self, enabled: bool) -> None:
+    def add_preference_listener(self, listener: Callable[[], None]) -> CALLBACK_TYPE:
+        """Subscribe enabled local controls to effective configuration changes."""
+        self._preference_listeners.append(listener)
+        return lambda: self._preference_listeners.remove(listener)
+
+    def _notify_preferences(self) -> None:
+        for listener in list(self._preference_listeners):
+            listener()
+
+    async def async_apply_preferences(self) -> None:
+        """Apply saved options without restarting a healthy live session."""
+        if self._preferences is None or self._unloaded:
+            return
+        await self.async_set_persistent_poll_interval(self._preferences.interval(self._address), persist=False)
+        enabled = self._preferences.enabled(self._address)
+        if enabled != self._persistent_connection_enabled:
+            await self.async_set_persistent_connection_enabled(enabled, persist=False)
+        self._notify_preferences()
+
+    async def async_set_persistent_connection_enabled(self, enabled: bool, *, persist: bool = True) -> None:
         """Enable or disable persistent connections for this valve."""
 
+        if persist and self._preferences is not None:
+            self._preferences.set(self._address, PERSISTENT_ENABLED, bool(enabled))
         if enabled:
             if self._persistent_connection_enabled:
                 return
@@ -464,6 +490,7 @@ class ValveConnection:
                 "Persistent connection requested for valve %s", self._address
             )
             self._persistent_connection_enabled = True
+            self._notify_preferences()
             self._cancel_cooldown()
             self._next_connection_time = None
             self.schedule_poll()
@@ -479,6 +506,7 @@ class ValveConnection:
             "Persistent connection disabled for valve %s", self._address
         )
         self._persistent_connection_enabled = False
+        self._notify_preferences()
         await self._async_stop_persistent_session()
         self._raise_if_cleanup_pending()
 
@@ -490,18 +518,16 @@ class ValveConnection:
                 "or proxy reports release. Check the Bluetooth logs."
             )
 
-    async def async_set_persistent_poll_interval(self, seconds: float) -> None:
+    async def async_set_persistent_poll_interval(self, seconds: float, *, persist: bool = True) -> None:
         """Update the poll interval used during persistent connections."""
 
         try:
-            value = float(seconds)
-        except (TypeError, ValueError):
-            value = DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS
+            value = persistent_interval(seconds)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise HomeAssistantError(str(exc)) from exc
 
-        value = max(
-            MIN_PERSISTENT_POLL_INTERVAL_SECONDS,
-            min(value, MAX_PERSISTENT_POLL_INTERVAL_SECONDS),
-        )
+        if persist and self._preferences is not None:
+            self._preferences.set(self._address, PERSISTENT_INTERVAL, value)
 
         if self._persistent_poll_interval == value:
             return
@@ -512,6 +538,8 @@ class ValveConnection:
             value,
         )
         self._persistent_poll_interval = value
+        self._interval_changed.set()
+        self._notify_preferences()
 
     def _get_passcode_configuration(self) -> ValvePasscodeConfiguration:
         """Return the stored passcode configuration for this valve."""
@@ -844,10 +872,8 @@ class ValveConnection:
                 )
 
                 try:
-                    if client is self._evb034_client and self._evb034_session is not None:
-                        await self._evb034_session.wait_interval(interval)
-                    else:
-                        await asyncio.sleep(interval)
+                    if not await self._async_wait_persistent_interval(client, interval):
+                        continue
                 except asyncio.CancelledError:
                     raise
                 except Evb034ProtocolError as exc:
@@ -924,6 +950,27 @@ class ValveConnection:
                 ):
                     self._set_connection_cooldown()
                     self.schedule_poll()
+
+    async def _async_wait_persistent_interval(self, client, interval) -> bool:
+        """Wake for live preference edits without interrupting the receiver."""
+        self._interval_changed.clear()
+        changed = asyncio.create_task(self._interval_changed.wait())
+        wait = (
+            self._evb034_session.wait_interval(interval)
+            if client is self._evb034_client and self._evb034_session is not None
+            else asyncio.sleep(interval)
+        )
+        timer = asyncio.create_task(wait)
+        try:
+            done, _ = await asyncio.wait({changed, timer}, return_when=asyncio.FIRST_COMPLETED)
+            if timer in done:
+                timer.result()
+                return True
+            return False
+        finally:
+            changed.cancel()
+            timer.cancel()
+            await asyncio.gather(changed, timer, return_exceptions=True)
 
     async def async_unload(self) -> None:
         """Prevent future polls and wait for any active poll to finish."""
@@ -2930,6 +2977,20 @@ class ValveConnectionManager:
         self._cancel_interval: CALLBACK_TYPE | None = None
         self._startup_unsub: CALLBACK_TYPE | None = None
         self._unload_task: asyncio.Task | None = None
+        self.preferences = ValvePreferences(hass, config_entry)
+        self.preferences.migrate()
+        self._auth_configuration = self._current_auth_configuration()
+
+    def _current_auth_configuration(self):
+        return (self._config_entry.data.get(CONF_DEFAULT_PASSCODE),
+                dict(self._config_entry.options.get(CONF_DEVICE_PASSCODES, {})))
+
+    def authentication_configuration_changed(self) -> bool:
+        """Separate credential reloads from live local preference edits."""
+        return self._auth_configuration != self._current_auth_configuration()
+
+    async def async_apply_preferences(self) -> None:
+        await asyncio.gather(*(connection.async_apply_preferences() for connection in self._connections.values()))
 
     async def async_setup(self) -> None:
         """Begin tracking valves for periodic polling."""
@@ -3040,6 +3101,7 @@ class ValveConnectionManager:
                 self.get_passcode,
                 self._discovery_manager.async_set_connection_state,
                 self._discovery_manager.async_set_device_metadata,
+                self.preferences,
             )
             self._connections[advertisement.address] = connection
         connection.update_from_advertisement(advertisement)

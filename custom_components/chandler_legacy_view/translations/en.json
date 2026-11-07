@@ -20,16 +20,21 @@
     "step": {
       "init": {
         "title": "Chandler Legacy View options",
-        "description": "Update the default passcode or configure per-device overrides.",
+        "description": "Update integration defaults or configure a selected valve. Leave an override blank to keep it; select Use integration default to clear its interval override. Persistent intervals are in seconds (5–300). The existing interval number also saves a valve override. Current persistent overrides: {persistent_overrides}.",
         "data": {
           "default_passcode": "Default valve passcode",
           "device_address": "Valve to configure",
           "device_passcode": "Override passcode",
+          "persistent_poll_interval": "Default persistent interval (seconds)",
+          "device_persistent_interval": "Override persistent interval (seconds)",
+          "inherit_persistent_interval": "Use integration default for persistent interval",
           "remove_override": "Remove override"
         }
       }
     },
     "error": {
+      "invalid_interval": "Enter a finite interval between 5 and 300 seconds.",
+      "interval_not_expected": "Clear the interval field before choosing Use integration default.",
       "device_required": "Select a valve before changing overrides.",
       "invalid_passcode": "Passcode must be exactly four digits.",
       "passcode_not_expected": "Clear the passcode field before removing an override.",
