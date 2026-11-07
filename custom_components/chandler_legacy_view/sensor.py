@@ -44,6 +44,20 @@ class ValveDashboardSensor(ChandlerValveEntity, SensorEntity):
 
     _attr_available = True
 
+    async def async_update(self) -> None:
+        """A selected reading refreshes all shared valve readings."""
+        await self._connection.async_refresh()
+
+    async def async_update_ha_state(self, force_refresh: bool = False) -> None:
+        # HA's default implementation catches async_update errors and only
+        # logs them. The explicit action must report an unsuccessful refresh
+        # to the calling automation instead of implying that it completed.
+        if force_refresh:
+            await self.async_update()
+            self.async_write_ha_state()
+        else:
+            await super().async_update_ha_state(force_refresh)
+
     def __init__(
         self,
         advertisement: ValveAdvertisement,
@@ -56,6 +70,7 @@ class ValveDashboardSensor(ChandlerValveEntity, SensorEntity):
         base_name = self._attr_name
         self._attr_unique_id = f"{advertisement.address}_{unique_id_suffix}"
         self._name_suffix = name_suffix
+        self._freshness_key = unique_id_suffix
         self._connection = connection
         self._bluetooth_available = True
         self._remove_dashboard_listener: CALLBACK_TYPE | None = None
@@ -74,6 +89,7 @@ class ValveDashboardSensor(ChandlerValveEntity, SensorEntity):
         self._remove_capability_listener = self._connection.add_capability_listener(
             self._handle_capability_update
         )
+        self.async_on_remove(self._connection.add_freshness_listener(self._handle_capability_update))
 
     def _apply_name_suffix(
         self, base_name: str, advertisement: ValveAdvertisement
@@ -130,7 +146,10 @@ class ValveDashboardSensor(ChandlerValveEntity, SensorEntity):
         return True
 
     def _update_availability(self) -> None:
-        self._attr_available = self._bluetooth_available and self._is_supported()
+        self._attr_available = (
+            self._bluetooth_available and self._is_supported()
+            and self._connection.reading_is_current(self._freshness_key)
+        )
 
     @callback
     def _handle_capability_update(self) -> None:

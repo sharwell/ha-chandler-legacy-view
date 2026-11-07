@@ -110,9 +110,9 @@ async def test_concurrent_pending_stops_share_cleanup_after_cancellation(connect
     await connection.async_set_persistent_connection_enabled(True)
     valve = transport.valve()
     gate = valve.operations["disconnect"].block()
+    await connection.async_poll()
     disable = asyncio.create_task(connection.async_set_persistent_connection_enabled(False))
     unload = asyncio.create_task(connection.async_unload())
-    await connection.async_poll()
     try:
         await clock.run(gate.started.wait())
         disable.cancel()
@@ -194,7 +194,7 @@ async def test_cancelled_unload_waits_for_active_poll(connection_factory, transp
         gate.release.set()
         tasks = [poll] if unload is None else [poll, unload]
         results = await clock.run(asyncio.gather(*tasks, return_exceptions=True))
-    assert results[0] is None
+    assert isinstance(results[0], asyncio.CancelledError)
     assert isinstance(results[1], asyncio.CancelledError)
     assert_closed(valve)
 

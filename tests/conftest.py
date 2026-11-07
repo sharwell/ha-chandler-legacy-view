@@ -122,7 +122,13 @@ def transport(bluetooth_io, monkeypatch):
     simulated = Transport(bluetooth_io)
     monkeypatch.setattr(connection, "establish_connection", simulated.connect)
     monkeypatch.setattr(connection.bluetooth, "async_ble_device_from_address", simulated.resolve)
-    return simulated
+    yield simulated
+    # Tests can deliberately model a backend that ignores cancellation. Do
+    # not leave its artificial gate closed if an assertion fails: the event
+    # loop's final task drain would then hang instead of reporting the failure.
+    for valve in simulated.valves.values():
+        for operation in valve.operations.values():
+            operation.release.set()
 
 
 @pytest.fixture

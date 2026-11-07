@@ -78,7 +78,7 @@ async def test_non_metered_days_uses_current_countdown_instead_of_configured_fre
     assert hardness is None or hass.states.get(hardness).state == "unavailable"
 
 
-async def test_partial_startup_learns_identity_and_preserves_missing_values_as_unknown(
+async def test_partial_startup_learns_identity_and_keeps_unseen_fields_unavailable(
     hass, entry_factory, runtime_factory, bluetooth_io, transport, clock,
 ):
     entry, connection, valve = await setup_readings(
@@ -93,7 +93,8 @@ async def test_partial_startup_learns_identity_and_preserves_missing_values_as_u
     assert sensor_id(hass, "water_usage_today") == usage
     assert float(hass.states.get(usage).state) == 125
     for suffix in ("present_flow", "time_of_day", "water_hardness", "battery", "soft_water_remaining"):
-        assert hass.states.get(sensor_id(hass, suffix)).state == "unknown"
+        # A healthy usage stream cannot enable fields without a session baseline.
+        assert hass.states.get(sensor_id(hass, suffix)).state == "unavailable"
     device = dr.async_get(hass).async_get_device_by_identifier((DOMAIN, "valve-a"), entry.entry_id)
     assert device.serial_number == "1234ABCD"
     assert device.sw_version == "C6.22"
@@ -128,7 +129,7 @@ async def test_persistent_partial_updates_retain_session_values_but_reconnect_do
         await clock.advance(61)
         valve.dashboards.append(frames({"gpf": 375}))
         await clock.run(connection.async_poll())
-        assert hass.states.get(usage).state == "unknown"
+        assert hass.states.get(usage).state == "unavailable"
         assert float(hass.states.get(sensor_id(hass, "present_flow")).state) == 3.75
     finally:
         remove()
@@ -153,7 +154,7 @@ async def test_missing_or_invalid_reading_is_not_published_as_a_real_zero(
     _, connection, valve = await setup_readings(hass, entry_factory, runtime_factory, bluetooth_io, transport)
     valve.dashboards.append(frames({"dwu": invalid, "gpf": 250}))
     await clock.run(connection.async_poll())
-    assert hass.states.get(sensor_id(hass, "water_usage_today")).state == "unknown"
+    assert hass.states.get(sensor_id(hass, "water_usage_today")).state == "unavailable"
     assert float(hass.states.get(sensor_id(hass, "present_flow")).state) == 2.5
 
 

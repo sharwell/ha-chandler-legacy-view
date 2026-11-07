@@ -52,7 +52,9 @@ async def test_all_platforms_publish_loss_and_recovery(hass, runtime_factory, bl
             not transport.valve(address).clients[-1].is_connected for address in ("softener", "filter")))
         bluetooth_io.expire("softener")
         await hass.async_block_till_done()
-        assert all(hass.states.get(record.entity_id).state == "unavailable" for record in softener)
+        # The interval number saves local options and remains usable offline.
+        assert all(hass.states.get(record.entity_id).state == "unavailable" for record in softener if record.domain != "number")
+        assert all(hass.states.get(record.entity_id).state != "unavailable" for record in softener if record.domain == "number")
         assert all(hass.states.get(record.entity_id).state != "unavailable" for record in water_filter)
         await clock.advance(901)
         await clock.until(lambda: len(transport.valve("filter").clients) == 2 and

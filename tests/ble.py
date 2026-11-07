@@ -50,6 +50,7 @@ class Operation:
         self.release.set()
         self.cancelled = False
         self.failure = None
+        self.ignore_cancellation = False
 
     def block(self):
         self.release.clear()
@@ -57,13 +58,16 @@ class Operation:
 
     async def run(self):
         self.started.set()
-        try:
-            await self.release.wait()
-            if self.failure is not None:
-                raise self.failure
-        except asyncio.CancelledError:
-            self.cancelled = True
-            raise
+        while True:
+            try:
+                await self.release.wait()
+                break
+            except asyncio.CancelledError:
+                self.cancelled = True
+                if not self.ignore_cancellation:
+                    raise
+        if self.failure is not None:
+            raise self.failure
 
 
 class Valve:
@@ -92,8 +96,10 @@ class Valve:
         self.packet_requests = []
         self.dashboard_notifications = 0
         self.stream_enabled = True
+        self.legacy_service_discovery = False
         self.operations = {name: Operation() for name in
-                           ("connect", "identify", "device_list", "authenticate", "dashboard", "reset", "disconnect", "timeout")}
+                           ("connect", "identify", "device_list", "authenticate", "dashboard", "reset", "disconnect", "timeout",
+                            "start_notify", "stop_notify", "services")}
 
     def authenticated(self, counter=23):
         self.device_lists.append([device_list_frame(status=0, counter=counter)])
@@ -141,12 +147,16 @@ class Client:
 
     async def start_notify(self, uuid, callback):
         self.require_connected()
+        await self.valve.operations["start_notify"].run()
+        self.require_connected()
         assert uuid == NOTIFY
         assert uuid not in self.notifications
         self.notifications[uuid] = callback
         self.notification_history.append(callback)
 
     async def stop_notify(self, uuid):
+        self.require_connected()
+        await self.valve.operations["stop_notify"].run()
         self.require_connected()
         del self.notifications[uuid]
 
@@ -389,6 +399,27 @@ class Transport:
         if any(client.is_connected for client in valve.clients):
             raise OSError("Previous simulated session still owns the connection")
         await valve.operations["connect"].run()
-        client = Client(valve)
+        client = LegacyServiceClient(valve) if valve.legacy_service_discovery else Client(valve)
         valve.clients.append(client)
         return client
+
+
+class LegacyServiceClient(Client):
+    """Model older Bleak's asynchronous service discovery API."""
+
+    services = None
+
+    async def get_services(self):
+        await self.valve.operations["services"].run()
+        self.require_connected()
+        return self._services
+
+    def notify(self, packet):
+        # Wire delivery still uses the external service graph, independent of
+        # how the client exposes asynchronous discovery to its caller.
+        services = self._services
+        self.services = services
+        try:
+            super().notify(packet)
+        finally:
+            self.services = None

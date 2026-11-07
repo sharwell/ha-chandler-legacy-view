@@ -91,11 +91,25 @@ def connection(hass, entry):
     (422, 2, True, False),
 ])
 async def test_existing_entities_follow_apk_display_conditions(
-    hass, runtime_factory, bluetooth_io, firmware, valve_type, clack, metered,
+    hass, runtime_factory, bluetooth_io, transport, clock, firmware, valve_type, clack, metered,
 ):
-    _, identifiers = await existing_dashboard_entities(hass, runtime_factory, bluetooth_io)
+    entry, identifiers = await existing_dashboard_entities(hass, runtime_factory, bluetooth_io)
     advertise(bluetooth_io, firmware, valve_type, clack=clack)
     await hass.async_block_till_done()
+    if firmware >= 600:
+        from evb034_packets import frames
+        valve = transport.valve()
+        valve.firmware_version = firmware
+        valve.identification_packets.append(frames({
+            "dlf": firmware, "dlc": 23, "as": 1, "gbre": 1,
+            "dlvt": valve_type, "dlic": int(clack), "dli": 0,
+        }))
+        valve.dashboards.append(frames({
+            "dh": 12, "dm": 30, "da": 0, "dbl": 9500,
+            "gpf": 0, "dwu": 0, "dpfd": 0, "dtgr": 0, "dwh": 0, "dcdo": 0,
+        }))
+        # Applicability still takes precedence once freshness has a baseline.
+        await clock.run(connection(hass, entry).async_poll())
 
     expected = {
         "time_of_day": True, "present_flow": True, "water_usage_today": True,

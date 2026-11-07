@@ -56,6 +56,9 @@ configuration options will follow as device details become available.
 
 ## Installation
 
+See [Polling and refreshing readings](docs/polling.md) for interval options,
+`homeassistant.update_entity`, custom polling automations and refresh scripts.
+
 Requires Home Assistant 2026.8.0 or later for config-entry-scoped device registry
 lookups and parent-device links by registry ID.
 

@@ -8,7 +8,7 @@ import inspect
 import logging
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, fields, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum, IntEnum
 from random import SystemRandom
 
@@ -22,25 +22,34 @@ from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import CALLBACK_TYPE, CoreState, HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    BLE_OPERATION_TIMEOUT_SECONDS,
     CONF_DEFAULT_PASSCODE,
     CONF_DEVICE_PASSCODES,
     CONNECTION_MIN_RETRY_INTERVAL,
     CONNECTION_POLL_INTERVAL,
     CONNECTION_TIMEOUT_SECONDS,
+    CONNECTION_TEARDOWN_BUDGET_SECONDS,
+    DATA_BLUETOOTH_OWNERS,
     DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS,
     DEFAULT_VALVE_PASSCODE,
     MAX_PERSISTENT_POLL_INTERVAL_SECONDS,
     MIN_PERSISTENT_POLL_INTERVAL_SECONDS,
+    POLL_EXCHANGE_TIMEOUT_SECONDS,
+    PERSISTENT_EXCHANGE_TIMEOUT_SECONDS,
 )
+from .ble_operations import OwnedBluetoothOperations
 from .device_registry import async_update_device_serial_number
 from .discovery import ValveDiscoveryChange, ValveDiscoveryManager, _map_valve_type
 from .models import ValveAdvertisement, ValveCapabilities, ValveDashboardData
 from .evb034 import Evb034ProtocolError, Evb034Session
-from .evb034_data import READING_KEYS, decode_dashboard, integer
+from .evb034_data import READING_KEYS, READING_FIELDS, decode_dashboard, integer, valid_reading_keys
+from .freshness import FreshnessPolicy, ReadingFreshness, READINGS, RECOVERY_ALLOWANCE
+from .preferences import ValvePreferences, PERSISTENT_ENABLED, PERSISTENT_INTERVAL, persistent_interval
 from .protocol_compatibility import (
     PreviousProtocol,
     password_digits,
@@ -113,10 +122,16 @@ async def _async_wait_for_cleanup(task: asyncio.Task[None]) -> None:
     """Finish cleanup before propagating cancellation of its caller."""
 
     cancelled: asyncio.CancelledError | None = None
+    deadline = asyncio.get_running_loop().time() + CONNECTION_TEARDOWN_BUDGET_SECONDS
     try:
         while not task.done():
             try:
-                await asyncio.shield(task)
+                remaining = max(0, deadline - asyncio.get_running_loop().time())
+                done, _ = await asyncio.wait({task}, timeout=remaining)
+                if not done:
+                    # The caller retains this worker; a deadline never means
+                    # that old transport work or cleanup can be forgotten.
+                    raise TimeoutError("Bluetooth cleanup exceeded 45 seconds")
             except asyncio.CancelledError as exc:
                 # Keep a strong reference and drain the same task, even when
                 # shutdown requests cancellation more than once.
@@ -239,6 +254,7 @@ class ValveConnection:
         passcode_getter: Callable[[str], ValvePasscodeConfiguration] | None = None,
         connection_state_callback: Callable[[str, bool], None] | None = None,
         metadata_callback: Callable[[ValveAdvertisement], None] | None = None,
+        preferences: ValvePreferences | None = None,
     ) -> None:
         """Initialize the valve connection handler."""
 
@@ -249,6 +265,15 @@ class ValveConnection:
         self._available = False
         self._last_seen: datetime | None = None
         self._last_success: datetime | None = None
+        self._last_confirmation_time: float | None = None
+        self._reading_revision = 0
+        self._recovery_requested = True
+        self._last_attempt_failed = False
+        self._due_cancel: CALLBACK_TYPE | None = None
+        self._refresh_task: asyncio.Task | None = None
+        self._session_read_task: asyncio.Task | None = None
+        self._session_read_start_revision = 0
+        self._poll_start_revision = 0
         self._lock = asyncio.Lock()
         self._unloaded = False
         self._next_connection_time: datetime | None = None
@@ -276,8 +301,11 @@ class ValveConnection:
         self._metadata_callback = metadata_callback
         self._crc8 = _ChandlerCrc8()
         self._previous_protocol = PreviousProtocol()
-        self._persistent_connection_enabled = False
-        self._persistent_poll_interval = DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS
+        self._preferences = preferences
+        self._preference_listeners: list[Callable[[], None]] = []
+        self._interval_changed = asyncio.Event()
+        self._persistent_connection_enabled = preferences.enabled(address) if preferences else False
+        self._persistent_poll_interval = preferences.interval(address) if preferences else DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS
         self._persistent_task: asyncio.Task[None] | None = None
         self._pending_persistent_client: BaseBleakClient | None = None
         self._persistent_stop_task: asyncio.Task[None] | None = None
@@ -285,6 +313,64 @@ class ValveConnection:
         self._evb034_client: BaseBleakClient | None = None
         self._evb034_subscriptions: list[str] = []
         self._evb034_packet: dict | None = None
+        self._evb034_eligible: set[str] = set()
+        self._evb034_received_readings: dict = {}
+        self._evb034_received_times: dict[str, float] = {}
+        self._evb034_last_update_time: float | None = None
+        self._evb034_published_time: float | None = None
+        self._evb034_reading_ready = False
+        self._transport: OwnedBluetoothOperations | None = None
+        self._poll_task: asyncio.Task | None = None
+        self._unload_task: asyncio.Task | None = None
+        self._freshness_listeners: list[Callable[[], None]] = []
+        self._freshness = ReadingFreshness(hass, address, self._freshness_policy, self._notify_freshness)
+
+    @property
+    def config_entry_id(self) -> str:
+        """Identify the runtime retaining this connection's ownership."""
+        return self._config_entry_id
+
+    @property
+    def cleanup_pending(self) -> bool:
+        """Report an old owner whose external work/release is not confirmed."""
+
+        owner = self._transport
+        return owner is not None and owner.retired and not owner.released
+
+    def _transport_changed(self) -> None:
+        """Reap an expired owner only after every external operation settles."""
+
+        owner = self._transport
+        if owner is None or not owner.retired:
+            return
+        if owner.released:
+            self._transport = None
+            owners = self._hass.data.get(DATA_BLUETOOTH_OWNERS, {})
+            if owners.get(self._address) is self:
+                owners.pop(self._address)
+            if owner.expired and self.available:
+                # A late I/O completion may make safe recovery possible without
+                # another advertisement. The normal cooldown still applies.
+                self._hass.loop.call_soon(self.schedule_poll)
+        elif owner.client is not None and owner.cleanup_task is None:
+            # A cancelled connection attempt can still return a live client.
+            # It belongs to the old generation and must never be published.
+            self._hass.loop.create_task(self._async_disconnect_client(owner.client))
+
+    async def _async_client_operation(
+        self, client, awaitable, description, *,
+        timeout=BLE_OPERATION_TIMEOUT_SECONDS, cleanup=False,
+    ):
+        owner = self._transport
+        if owner is None or owner.client is not client or (owner.expired and not cleanup):
+            if inspect.iscoroutine(awaitable):
+                awaitable.close()
+            raise TimeoutError("Bluetooth generation is no longer usable")
+        try:
+            return await owner.run(awaitable, timeout)
+        except TimeoutError:
+            _LOGGER.warning("Timed out waiting for %s on valve %s", description, self._address)
+            raise
 
     @property
     def evb034_packet(self) -> dict | None:
@@ -351,6 +437,76 @@ class ValveConnection:
 
         return self._persistent_poll_interval
 
+    @property
+    def on_demand_poll_interval(self) -> float:
+        """Return the effective expected on-demand interval in seconds."""
+        return self._preferences.on_demand_interval(self._address) if self._preferences else CONNECTION_POLL_INTERVAL.total_seconds()
+
+    def _freshness_policy(self) -> FreshnessPolicy | None:
+        if self._persistent_connection_enabled:
+            interval = self.persistent_poll_interval
+            return FreshnessPolicy("persistent", interval, max(3 * interval, 120))
+        interval = self.on_demand_poll_interval
+        return FreshnessPolicy("on-demand", interval, interval + RECOVERY_ALLOWANCE)
+
+    def reading_is_current(self, key: str) -> bool:
+        if self._evb034_client is not None or (
+            self._advertisement is not None and self._advertisement.model == "Evb034"
+        ):
+            return key in self._evb034_eligible and self._freshness.current(key)
+        return self._freshness.current(key)
+
+    def add_freshness_listener(self, listener: Callable[[], None]) -> CALLBACK_TYPE:
+        self._freshness_listeners.append(listener)
+        return lambda: self._freshness_listeners.remove(listener)
+
+    def _notify_freshness(self) -> None:
+        for listener in list(self._freshness_listeners):
+            listener()
+
+    def _recalculate_freshness(self) -> None:
+        self._freshness.recalculate()
+        self._notify_freshness()
+
+    def _reading_attempt_due(self) -> bool:
+        interval = self.persistent_poll_interval if self._persistent_connection_enabled else self.on_demand_poll_interval
+        return (self._last_confirmation_time is None
+                or self._hass.loop.time() >= self._last_confirmation_time + interval)
+
+    def _automatic_poll_due(self) -> bool:
+        if self._authentication_failed:
+            return False
+        if self._persistent_connection_enabled:
+            return True
+        if self._preferences and self._preferences.entry.pref_disable_polling:
+            return False
+        return (
+            self._recovery_requested or self._last_attempt_failed
+            or self._last_confirmation_time is None
+            or self._hass.loop.time() >= self._last_confirmation_time + self.on_demand_poll_interval
+        )
+
+    def _schedule_next_poll(self) -> None:
+        """Keep a due-time trigger even when the valve sends no new adverts."""
+        if self._due_cancel is not None:
+            self._due_cancel()
+            self._due_cancel = None
+        if (not self.available or self._persistent_connection_enabled
+                or self._authentication_failed
+                or (self._preferences and self._preferences.entry.pref_disable_polling)):
+            return
+        delay = 0 if self._automatic_poll_due() else max(
+            0, self._last_confirmation_time + self.on_demand_poll_interval - self._hass.loop.time()
+        )
+        if self._next_connection_time is not None:
+            delay = max(delay, (self._next_connection_time - dt_util.utcnow()).total_seconds())
+        self._due_cancel = async_call_later(self._hass, max(0.01, delay), self._handle_due_poll)
+
+    @callback
+    def _handle_due_poll(self, _):
+        self._due_cancel = None
+        self.schedule_poll()
+
     def add_authentication_listener(
         self, listener: Callable[[bool], None]
     ) -> CALLBACK_TYPE:
@@ -391,9 +547,32 @@ class ValveConnection:
         )
         self._set_authentication_failed(False)
 
-    async def async_set_persistent_connection_enabled(self, enabled: bool) -> None:
+    def add_preference_listener(self, listener: Callable[[], None]) -> CALLBACK_TYPE:
+        """Subscribe enabled local controls to effective configuration changes."""
+        self._preference_listeners.append(listener)
+        return lambda: self._preference_listeners.remove(listener)
+
+    def _notify_preferences(self) -> None:
+        for listener in list(self._preference_listeners):
+            listener()
+
+    async def async_apply_preferences(self) -> None:
+        """Apply saved options without restarting a healthy live session."""
+        if self._preferences is None or self._unloaded:
+            return
+        await self.async_set_persistent_poll_interval(self._preferences.interval(self._address), persist=False)
+        enabled = self._preferences.enabled(self._address)
+        if enabled != self._persistent_connection_enabled:
+            await self.async_set_persistent_connection_enabled(enabled, persist=False)
+        self._notify_preferences()
+        self._schedule_next_poll()
+        self._recalculate_freshness()
+
+    async def async_set_persistent_connection_enabled(self, enabled: bool, *, persist: bool = True) -> None:
         """Enable or disable persistent connections for this valve."""
 
+        if persist and self._preferences is not None:
+            self._preferences.set(self._address, PERSISTENT_ENABLED, bool(enabled))
         if enabled:
             if self._persistent_connection_enabled:
                 return
@@ -401,32 +580,48 @@ class ValveConnection:
                 "Persistent connection requested for valve %s", self._address
             )
             self._persistent_connection_enabled = True
+            self._recalculate_freshness()
+            self._notify_preferences()
+            self._schedule_next_poll()
             self._cancel_cooldown()
             self._next_connection_time = None
             self.schedule_poll()
             return
 
         if not self._persistent_connection_enabled:
+            if self._persistent_stop_task is not None:
+                await self._async_stop_persistent_session()
+            self._raise_if_cleanup_pending()
             return
 
         _LOGGER.debug(
             "Persistent connection disabled for valve %s", self._address
         )
         self._persistent_connection_enabled = False
+        self._recalculate_freshness()
+        self._notify_preferences()
         await self._async_stop_persistent_session()
+        self._raise_if_cleanup_pending()
+        self._schedule_next_poll()
 
-    async def async_set_persistent_poll_interval(self, seconds: float) -> None:
+    def _raise_if_cleanup_pending(self) -> None:
+        if self.cleanup_pending:
+            raise HomeAssistantError(
+                f"Bluetooth cleanup for {self._address} is not confirmed. "
+                "The old connection is quarantined; retry after the adapter "
+                "or proxy reports release. Check the Bluetooth logs."
+            )
+
+    async def async_set_persistent_poll_interval(self, seconds: float, *, persist: bool = True) -> None:
         """Update the poll interval used during persistent connections."""
 
         try:
-            value = float(seconds)
-        except (TypeError, ValueError):
-            value = DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS
+            value = persistent_interval(seconds)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise HomeAssistantError(str(exc)) from exc
 
-        value = max(
-            MIN_PERSISTENT_POLL_INTERVAL_SECONDS,
-            min(value, MAX_PERSISTENT_POLL_INTERVAL_SECONDS),
-        )
+        if persist and self._preferences is not None:
+            self._preferences.set(self._address, PERSISTENT_INTERVAL, value)
 
         if self._persistent_poll_interval == value:
             return
@@ -437,6 +632,9 @@ class ValveConnection:
             value,
         )
         self._persistent_poll_interval = value
+        self._recalculate_freshness()
+        self._interval_changed.set()
+        self._notify_preferences()
 
     def _get_passcode_configuration(self) -> ValvePasscodeConfiguration:
         """Return the stored passcode configuration for this valve."""
@@ -604,6 +802,8 @@ class ValveConnection:
         """Mark the valve as temporarily unavailable."""
 
         self._available = False
+        self._recovery_requested = True
+        self._schedule_next_poll()
 
     def schedule_poll(self) -> None:
         """Schedule a background poll of the valve."""
@@ -617,7 +817,9 @@ class ValveConnection:
 
         if not self.available:
             return
-        self._hass.async_create_task(self.async_poll())
+        self._freshness.activate()
+        if self._automatic_poll_due():
+            self._hass.async_create_task(self.async_poll(automatic=True))
 
     def _cancel_cooldown(self) -> None:
         """Cancel any scheduled retry callback."""
@@ -673,7 +875,7 @@ class ValveConnection:
 
         stop_task = self._persistent_stop_task
         if stop_task is None:
-            task = self._persistent_task
+            task = self._persistent_task or self._poll_task
             if task is None:
                 return
 
@@ -769,10 +971,8 @@ class ValveConnection:
                 )
 
                 try:
-                    if client is self._evb034_client and self._evb034_session is not None:
-                        await self._evb034_session.wait_interval(interval)
-                    else:
-                        await asyncio.sleep(interval)
+                    if not await self._async_wait_persistent_interval(client, interval):
+                        continue
                 except asyncio.CancelledError:
                     raise
                 except Evb034ProtocolError as exc:
@@ -791,16 +991,17 @@ class ValveConnection:
                         refreshed = False
                         for packet in self._evb034_session.pending_packets():
                             refreshed = self._handle_evb034_update(packet) or refreshed
-                        if refreshed:
-                            self._last_success = dt_util.utcnow()
                         continue
-                    request_sent, response_received = (
-                        await self._async_request_dashboard(client)
-                    )
+                    request_sent, response_received = await self._async_session_read(client)
                 except asyncio.CancelledError:
                     raise
                 except Evb034ProtocolError as exc:
                     _LOGGER.debug("Evb034 stream for valve %s ended: %s", self._address, exc)
+                    break
+                except TimeoutError:
+                    if self._transport is not None:
+                        self._transport.invalidate()
+                    _LOGGER.warning("Persistent read timed out for valve %s", self._address)
                     break
                 except Exception:  # pragma: no cover - unexpected protocol errors
                     _LOGGER.exception(
@@ -816,9 +1017,9 @@ class ValveConnection:
                     )
                     break
 
-                if response_received:
-                    self._last_success = dt_util.utcnow()
-                else:
+                if self._transport is None or self._transport.expired:
+                    break
+                if not response_received:
                     _LOGGER.debug(
                         "Valve %s did not provide a Dashboard response during persistent polling",
                         self._address,
@@ -842,25 +1043,136 @@ class ValveConnection:
                     self._set_connection_cooldown()
                     self.schedule_poll()
 
+    async def _async_wait_persistent_interval(self, client, interval) -> bool:
+        """Wake for live preference edits without interrupting the receiver."""
+        self._interval_changed.clear()
+        changed = asyncio.create_task(self._interval_changed.wait())
+        wait = (
+            self._evb034_session.wait_interval(interval)
+            if client is self._evb034_client and self._evb034_session is not None
+            else asyncio.sleep(interval)
+        )
+        timer = asyncio.create_task(wait)
+        try:
+            done, _ = await asyncio.wait({changed, timer}, return_when=asyncio.FIRST_COMPLETED)
+            if timer in done:
+                timer.result()
+                return True
+            return False
+        finally:
+            changed.cancel()
+            timer.cancel()
+            await asyncio.gather(changed, timer, return_exceptions=True)
+
+    async def _async_session_read(self, client):
+        """Join the same finite request when keepalive and refresh coincide."""
+        task = self._session_read_task
+        if task is None or task.done():
+            self._session_read_start_revision = self._reading_revision
+            task = asyncio.create_task(self._async_owned_session_read(client))
+            self._session_read_task = task
+        return await task
+
+    async def _async_owned_session_read(self, client):
+        due = self._reading_attempt_due()
+        try:
+            async with asyncio.timeout(PERSISTENT_EXCHANGE_TIMEOUT_SECONDS):
+                result = await self._async_request_dashboard(client)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._freshness.failed_attempt(due=due)
+            raise
+        if not all(result):
+            self._freshness.failed_attempt(due=due)
+        return result
+
+    async def async_refresh(self) -> None:
+        """Complete one manual valve refresh, shared by every selected sensor."""
+        task = self._refresh_task
+        if task is None or task.done():
+            task = asyncio.create_task(self._async_manual_refresh())
+            self._refresh_task = task
+        await asyncio.shield(task)
+
+    async def _async_manual_refresh(self) -> None:
+        revision = self._reading_revision
+        if not self.available:
+            raise HomeAssistantError("Valve is unavailable for Bluetooth refresh")
+        if self._authentication_failed:
+            raise HomeAssistantError("Valve authentication is locked out; correct the passcode or clear lockout")
+        self._raise_if_cleanup_pending()
+        poll = self._poll_task
+        if poll is not None and not poll.done():
+            revision = self._poll_start_revision
+            await asyncio.shield(poll)
+        elif self._persistent_task_active():
+            client = self._transport.client if self._transport else None
+            if client is None or self._persistent_stop_task is not None:
+                raise HomeAssistantError("Valve connection is stopping; refresh cannot run yet")
+            if self._session_read_task is not None and not self._session_read_task.done():
+                revision = self._session_read_start_revision
+            try:
+                sent, received = await self._async_session_read(client)
+            except TimeoutError as exc:
+                raise HomeAssistantError("Persistent valve refresh timed out") from exc
+            if not sent or not received:
+                raise HomeAssistantError("Persistent valve did not return fresh readings")
+        else:
+            if self._next_connection_time is not None:
+                await asyncio.sleep(max(0, (self._next_connection_time - dt_util.utcnow()).total_seconds()))
+            if not self.available:
+                raise HomeAssistantError("Valve became unavailable before refresh")
+            self._raise_if_cleanup_pending()
+            await self.async_poll()
+        if self._reading_revision == revision:
+            raise HomeAssistantError("Valve refresh did not produce a validated reading")
+
     async def async_unload(self) -> None:
         """Prevent future polls and wait for any active poll to finish."""
 
         self._unloaded = True
+        self._freshness.close()
         self._persistent_connection_enabled = False
         self._cancel_cooldown()
-        await _async_wait_for_cleanup(asyncio.create_task(self._async_finish_unload()))
+        if self._due_cancel is not None:
+            self._due_cancel()
+            self._due_cancel = None
+        refresh = self._refresh_task
+        if refresh is not None and not refresh.done():
+            refresh.cancel()
+        if self._transport is not None:
+            self._transport.invalidate()
+        poll = self._poll_task
+        if poll is not None and not poll.done():
+            poll.cancel()
+        task = self._unload_task
+        if task is None or task.done():
+            task = asyncio.create_task(self._async_finish_unload())
+            self._unload_task = task
+        await _async_wait_for_cleanup(task)
+        self._raise_if_cleanup_pending()
 
     async def _async_finish_unload(self) -> None:
         """Wait for connection cleanup, including an active one-shot poll."""
 
+        refresh = self._refresh_task
+        if refresh is not None:
+            with contextlib.suppress(asyncio.CancelledError, HomeAssistantError):
+                await refresh
         await self._async_stop_persistent_session()
         async with self._lock:
-            return
+            owner = self._transport
+            if owner is not None and owner.client is not None and not owner.pending:
+                await self._async_disconnect_client(owner.client)
+            self._transport_changed()
 
-    async def async_poll(self) -> None:
+    async def async_poll(self, *, automatic: bool = False) -> None:
         """Attempt to connect to the valve and fetch additional data."""
 
         if not self.available:
+            return
+        if automatic and not self._automatic_poll_due():
             return
 
         if self._persistent_task_active():
@@ -877,12 +1189,39 @@ class ValveConnection:
             return
 
         async with self._lock:
-            await self._async_poll_locked()
+            owner = self._transport
+            if owner is not None and owner.retired:
+                if not owner.pending and owner.client is not None:
+                    await self._async_disconnect_client(owner.client)
+                self._transport_changed()
+                if self._transport is not None:
+                    _LOGGER.debug("Skipping poll for %s; old Bluetooth work is quarantined", self._address)
+                    return
+            owners = self._hass.data.setdefault(DATA_BLUETOOTH_OWNERS, {})
+            previous = owners.get(self._address)
+            if previous is not None and previous is not self:
+                _LOGGER.warning(
+                    "Cannot connect to valve %s: another runtime still owns "
+                    "its Bluetooth connection; wait for confirmed cleanup",
+                    self._address,
+                )
+                return
+            self._poll_task = asyncio.current_task()
+            self._poll_start_revision = self._reading_revision
+            try:
+                if automatic and not self._automatic_poll_due():
+                    return
+                await self._async_poll_locked()
+            finally:
+                self._poll_task = None
 
     async def _async_poll_locked(self) -> None:
         """Perform a Bluetooth connection cycle for the valve."""
 
         now = dt_util.utcnow()
+        self._freshness.activate()
+        if self._authentication_failed:
+            return
         next_connection_time = self._next_connection_time
         if next_connection_time is not None and now < next_connection_time:
             remaining = max((next_connection_time - now).total_seconds(), 0)
@@ -896,6 +1235,9 @@ class ValveConnection:
 
         connection_attempted = False
         cleanup_client: BaseBleakClient | None = None
+        owner: OwnedBluetoothOperations | None = None
+        revision = self._reading_revision
+        due = self._reading_attempt_due()
 
         try:
             advertisement = self._advertisement
@@ -921,14 +1263,18 @@ class ValveConnection:
             connection_attempted = True
             self._cancel_cooldown()
             self._reset_device_list_state()
+            owner = OwnedBluetoothOperations(self._transport_changed)
+            self._transport = owner
+            self._hass.data[DATA_BLUETOOTH_OWNERS][self._address] = self
 
             try:
-                async with asyncio.timeout(CONNECTION_TIMEOUT_SECONDS):
-                    client = await establish_connection(
+                client = await owner.run(
+                    establish_connection(
                         BleakClientWithServiceCache,
                         ble_device,
                         self._address,
-                    )
+                    ), CONNECTION_TIMEOUT_SECONDS, connecting=True,
+                )
             except asyncio.TimeoutError:
                 _LOGGER.warning(
                     "Timed out while attempting to connect to valve %s", self._address
@@ -952,15 +1298,17 @@ class ValveConnection:
             try:
                 if self._connection_state_callback is not None:
                     self._connection_state_callback(self._address, True)
-                refreshed = await self._async_fetch_device_information(client)
+                async with asyncio.timeout(POLL_EXCHANGE_TIMEOUT_SECONDS):
+                    refreshed = await self._async_fetch_device_information(client)
+            except TimeoutError:
+                owner.invalidate()
+                _LOGGER.warning("Reading exchange timed out for valve %s", self._address)
             except Exception:  # pragma: no cover - future protocol work may raise
                 _LOGGER.exception(
                     "Error while retrieving extended data from valve %s", self._address
                 )
             else:
-                if refreshed:
-                    self._last_success = dt_util.utcnow()
-                if refreshed and self._try_begin_persistent_session(client):
+                if refreshed and not owner.expired and self._try_begin_persistent_session(client):
                     cleanup_client = None
             finally:
                 if cleanup_client is not None:
@@ -968,6 +1316,15 @@ class ValveConnection:
         finally:
             if connection_attempted:
                 self._set_connection_cooldown()
+                failed = self._reading_revision == revision
+                self._last_attempt_failed = failed and (due or self._recovery_requested)
+                if failed and not self._unloaded:
+                    self._freshness.failed_attempt(due=due)
+                if owner is not None and owner.client is None:
+                    owner.retired = True
+                    owner.notifications_enabled = False
+                self._transport_changed()
+                self._schedule_next_poll()
 
     async def _async_fetch_device_information(
         self, client: BaseBleakClient
@@ -1086,6 +1443,12 @@ class ValveConnection:
     async def _async_fetch_evb034(self, client: BaseBleakClient) -> bool:
         """Identify and authenticate a connection before requesting its readings."""
         self._evb034_packet = None
+        self._evb034_eligible.clear()
+        self._evb034_received_readings.clear()
+        self._evb034_received_times.clear()
+        self._evb034_last_update_time = None
+        self._evb034_published_time = None
+        self._evb034_reading_ready = False
         resolved = await self._async_resolve_request_characteristic(client)
         if resolved is None:
             return False
@@ -1093,11 +1456,17 @@ class ValveConnection:
         size = min(512, max(20, getattr(client, "mtu_size", 23) - 3))
 
         async def write(payload: bytes) -> None:
-            await client.write_gatt_char(
-                uuid, payload, response="write_without_response" not in properties
+            await self._async_client_operation(
+                client, client.write_gatt_char(
+                    uuid, payload, response="write_without_response" not in properties
+                ), "Evb034 write",
             )
 
-        session = Evb034Session(write, size)
+        session = Evb034Session(
+            write, size,
+            on_packet=lambda packet: self._observe_evb034_readings(client, packet),
+            on_failure=lambda error: self._invalidate_evb034_session(client, str(error)),
+        )
         self._evb034_session = session
         self._evb034_client = client
         subscriptions = await self._async_subscribe_to_notifications(
@@ -1141,9 +1510,10 @@ class ValveConnection:
                     if state == 2:
                         # Pre-authentication readings cannot become a successful
                         # read merely because a later access response arrived.
-                        identification = {key: val for key, val in identification.items()
-                                          if key not in READING_KEYS}
-                        identification.update({key: val for key, val in reply.items() if val is not None})
+                        for key in READING_KEYS:
+                            identification.pop(key, None)
+                            identification.confirmed_at.pop(key, None)
+                        identification.update(reply)
                         self._evb034_packet = identification
                         break
                     identification.update({key: val for key, val in reply.items() if val is not None})
@@ -1161,6 +1531,7 @@ class ValveConnection:
                 and integer(identification, "gbre") != 1
             ):
                 await session.send_command(b'{"gbre":1}')
+            self._evb034_reading_ready = True
             return await self._async_refresh_evb034_dashboard(client, initial=True)
         except (TimeoutError, Evb034ProtocolError) as exc:
             _LOGGER.debug("Evb034 exchange for valve %s failed: %s", self._address, exc)
@@ -1189,12 +1560,17 @@ class ValveConnection:
         session = self._evb034_session
         if session is None or client is not self._evb034_client:
             return False
+        revision = self._reading_revision if initial else self._session_read_start_revision
         async with asyncio.timeout(9):
+            if initial and self._evb034_eligible:
+                return True
+            if self._reading_revision > revision:
+                return True
             if initial and READING_KEYS.intersection(self._evb034_packet):
-                if self._handle_evb034_update(self._evb034_packet):
+                if self._handle_evb034_update(self._evb034_packet) or self._evb034_eligible:
                     return True
             while True:
-                if self._handle_evb034_update(await session.next_packet()):
+                if self._handle_evb034_update(await session.next_packet()) or self._reading_revision > revision:
                     return True
 
     def _handle_evb034_update(self, packet: dict) -> bool:
@@ -1202,8 +1578,14 @@ class ValveConnection:
         if "as" in packet and (type(packet["as"]) is not int or packet["as"] != 2):
             self._device_list_authentication_state = ValveAuthenticationState.UNKNOWN
             raise Evb034ProtocolError("Session lost authentication")
+        if not self._evb034_reading_ready:
+            return False
+        self._observe_evb034_readings(self._evb034_client, packet)
         updated = {**self._evb034_packet, **{key: value for key, value in packet.items()
-                                           if value is not None}}
+                                           if value is not None and key not in READING_KEYS}}
+        # Only explicit valid values received in this session can establish a
+        # baseline. A later invalid/null delta cannot erase an earlier value.
+        updated.update(self._evb034_received_readings)
         firmware = integer(updated, "dlf")
         if firmware is None or not 600 <= firmware <= 9999:
             raise Evb034ProtocolError("Invalid updated firmware identity")
@@ -1214,7 +1596,8 @@ class ValveConnection:
         )
         self._evb034_packet = updated
         self._publish_evb034_metadata()
-        if not READING_KEYS.intersection(packet):
+        received_at = self._evb034_last_update_time
+        if received_at is None or received_at == self._evb034_published_time:
             return False
         data = decode_dashboard(updated, firmware, clack=is_clack)
         if not any(getattr(data, field) is not None for field in (
@@ -1222,9 +1605,67 @@ class ValveConnection:
             "water_hardness", "water_remaining_until_regeneration", "air_recharge",
         )):
             return False
+        self._evb034_eligible.update(
+            key for key, field in READING_FIELDS.items() if getattr(data, field) is not None
+        )
         self._dashboard_data = data
+        self._evb034_published_time = received_at
+        self._record_confirmation(received_at)
+        self._freshness.confirm({key: received_at for key in self._evb034_eligible})
         self._notify_dashboard_listeners(data)
         return True
+
+    def _observe_evb034_readings(self, client, packet) -> None:
+        """Keep the selected session-health policy independent of publication."""
+        owner = self._transport
+        if (
+            client is None or client is not self._evb034_client or owner is None
+            or owner.client is not client or owner.expired or owner.retired
+            or self._device_list_authentication_state != ValveAuthenticationState.AUTHENTICATED
+        ):
+            return
+        identity = {**(self._evb034_packet or {}), **{key: value for key, value in packet.items() if value is not None}}
+        firmware = integer(identity, "dlf")
+        if firmware is None or not 600 <= firmware <= 9999:
+            raise Evb034ProtocolError("Invalid updated firmware identity")
+        clack = integer(identity, "dlic")
+        is_clack = clack == 1 if clack in (0, 1) else self._entity_capabilities.is_clack_valve is True
+        times = getattr(packet, "confirmed_at", {})
+        advanced = []
+        for key in valid_reading_keys(packet, firmware, clack=is_clack):
+            received = times.get(key)
+            if received is None or received <= self._evb034_received_times.get(key, float("-inf")):
+                continue
+            self._evb034_received_readings[key] = packet[key]
+            self._evb034_received_times[key] = received
+            advanced.append(received)
+        if advanced:
+            received = max(advanced)
+            self._evb034_last_update_time = max(received, self._evb034_last_update_time or received)
+            if not self._evb034_reading_ready:
+                return
+            # This intentionally confirms session liveness for every known
+            # field; it does not prove that each field's producer is healthy.
+            self._freshness.renew_session(self._evb034_eligible, received)
+            baseline = {**identity, **self._evb034_received_readings}
+            data = decode_dashboard(baseline, firmware, clack=is_clack)
+            eligible = {key for key, field in READING_FIELDS.items() if getattr(data, field) is not None}
+            if eligible - self._evb034_eligible or any(
+                not self._freshness.current(key) for key in self._evb034_eligible
+            ):
+                # First availability and recovery publish the latest snapshot
+                # immediately, so an old value is never briefly resurrected.
+                # The recursive observer sees no new receipt and does nothing.
+                self._handle_evb034_update(packet)
+
+    def _invalidate_evb034_session(self, client, reason: str) -> None:
+        if client is not self._evb034_client:
+            return
+        eligible = set(self._evb034_eligible)
+        self._evb034_reading_ready = False
+        self._evb034_eligible.clear()
+        self._freshness.invalidate(eligible, reason)
+        self._notify_freshness()
 
     def _publish_evb034_metadata(self) -> None:
         """Use validated packet identity without changing the valve's HA identity."""
@@ -1437,9 +1878,13 @@ class ValveConnection:
             write_with_response = response
 
         try:
-            await client.write_gatt_char(
-                char_uuid, payload, response=write_with_response
+            await self._async_client_operation(
+                client, client.write_gatt_char(
+                    char_uuid, payload, response=write_with_response
+                ), command_name,
             )
+        except TimeoutError:
+            return False
         except BLEAK_RETRY_EXCEPTIONS as exc:
             _LOGGER.debug(
                 "Failed to send %s to valve %s via %s: %s",
@@ -1517,22 +1962,40 @@ class ValveConnection:
     async def _async_disconnect_client(self, client: BaseBleakClient) -> None:
         """Drain bounded reset and disconnect attempts before releasing the client."""
 
+        owner = self._transport
+        if owner is None or owner.client is not client:
+            return
+        if (
+            client is self._evb034_client and not owner.expired and not self._unloaded
+            and not self._persistent_connection_enabled and self._evb034_reading_ready
+        ):
+            # Preserve a validated update buffered before a user stops the
+            # healthy session; its receipt time remains the confirmation time.
+            self._handle_evb034_update({})
+        if client is self._evb034_client and (
+            owner.expired or not client.is_connected or self._persistent_connection_enabled
+        ):
+            self._invalidate_evb034_session(client, "session ended without a trusted baseline")
+        owner.retired = True
+        owner.notifications_enabled = False
+
         async def _cleanup() -> None:
             try:
-                if self._evb034_client is client:
-                    session = self._evb034_session
-                    if session is not None:
-                        await session.close()
-                    await self._async_unsubscribe_notifications(
-                        client, self._evb034_subscriptions
-                    )
-                    self._evb034_session = None
-                    self._evb034_client = None
-                    self._evb034_subscriptions = []
-                    self._reset_device_list_state()
                 try:
                     async with asyncio.timeout(_RESET_BUFFER_TIMEOUT_SECONDS):
-                        if await self._async_send_reset_buffer_packet(client):
+                        read = self._session_read_task
+                        if read is not None and not read.done():
+                            read.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await read
+                        if self._evb034_client is client:
+                            session = self._evb034_session
+                            if session is not None:
+                                await session.close()
+                            await self._async_unsubscribe_notifications(
+                                client, self._evb034_subscriptions
+                            )
+                        elif not owner.expired and await self._async_send_reset_buffer_packet(client):
                             await asyncio.sleep(0.1)
                 except TimeoutError:
                     _LOGGER.warning(
@@ -1545,10 +2008,17 @@ class ValveConnection:
                         exc_info=True,
                     )
             finally:
+                if self._evb034_client is client:
+                    self._evb034_session = None
+                    self._evb034_client = None
+                    self._evb034_subscriptions = []
+                    self._reset_device_list_state()
                 # RESET is best effort and must not use the disconnect budget.
                 try:
-                    async with asyncio.timeout(_DISCONNECT_TIMEOUT_SECONDS):
-                        await client.disconnect()
+                    await self._async_client_operation(
+                        client, client.disconnect(), "disconnect",
+                        timeout=_DISCONNECT_TIMEOUT_SECONDS, cleanup=True,
+                    )
                 except TimeoutError:
                     _LOGGER.warning(
                         "Timed out disconnecting from valve %s; the Bluetooth "
@@ -1563,13 +2033,19 @@ class ValveConnection:
                         exc_info=True,
                     )
 
+        task = owner.cleanup_task
+        if task is None or (task.done() and not owner.pending and client.is_connected):
+            task = asyncio.create_task(_cleanup())
+            owner.cleanup_task = task
+            task.add_done_callback(lambda _: self._transport_changed())
         try:
-            await _async_wait_for_cleanup(asyncio.create_task(_cleanup()))
+            await _async_wait_for_cleanup(task)
         finally:
             # Session availability must end even if cleanup failed or its
             # caller was cancelled. A silent valve may have a deferred loss.
             if self._connection_state_callback is not None:
                 self._connection_state_callback(self._address, False)
+            self._transport_changed()
 
     async def _async_request_device_list(
         self, client: BaseBleakClient
@@ -1938,11 +2414,13 @@ class ValveConnection:
 
         loop = asyncio.get_running_loop()
         response_future: asyncio.Future[list[bytes]] = loop.create_future()
+        received_at: float | None = None
         packets: dict[int, bytes] = {}
         previous_packets: dict[int, bytes] = {}
         compare_previous = self._previous_protocol.access
 
         def _notification_handler(_: int | str, data: bytearray) -> None:
+            nonlocal received_at
             if response_future.cancelled():
                 return
             packet = bytes(data)
@@ -1974,6 +2452,7 @@ class ValveConnection:
                     ordered = [packets[i] for i in range(_DASHBOARD_PACKET_COUNT)]
                 except KeyError:
                     return
+                received_at = loop.time()
                 response_future.set_result(ordered)
 
         subscriptions = await self._async_subscribe_to_notifications(
@@ -2031,7 +2510,10 @@ class ValveConnection:
                 )
                 return True, False
 
-            dashboard = self._handle_dashboard_packets(packets_list)
+            owner = self._transport
+            if owner is None or owner.expired or owner.retired:
+                return True, False
+            dashboard = self._handle_dashboard_packets(packets_list, received_at=received_at)
             if (
                 dashboard is not None
                 and len(previous_packets) == _DASHBOARD_PACKET_COUNT
@@ -2122,9 +2604,16 @@ class ValveConnection:
     ) -> None:
         """Cancel notification subscriptions for the provided characteristic UUIDs."""
 
-        for uuid in subscriptions:
-            with contextlib.suppress(Exception):
-                await client.stop_notify(uuid)
+        try:
+            async with asyncio.timeout(5):
+                for uuid in subscriptions:
+                    with contextlib.suppress(Exception):
+                        await self._async_client_operation(
+                            client, client.stop_notify(uuid), "notification unsubscribe",
+                            cleanup=True,
+                        )
+        except TimeoutError:
+            _LOGGER.warning("Timed out unsubscribing notifications for valve %s", self._address)
 
     async def _async_get_services(self, client: BaseBleakClient):
         """Return the GATT services exposed by the connected client."""
@@ -2141,7 +2630,7 @@ class ValveConnection:
 
         services = get_services()
         if inspect.isawaitable(services):
-            services = await services
+            services = await self._async_client_operation(client, services, "service discovery")
 
         return services
 
@@ -2234,9 +2723,14 @@ class ValveConnection:
         """Attempt to enable notifications for a characteristic."""
 
         try:
-            awaitable = client.start_notify(uuid, handler)
+            owner = self._transport
+            if owner is None or owner.client is not client:
+                return False
+            awaitable = client.start_notify(uuid, owner.guard_notification(handler))
             if inspect.isawaitable(awaitable):
-                await awaitable
+                await self._async_client_operation(client, awaitable, "notification subscribe")
+        except TimeoutError:
+            return False
         except BLEAK_RETRY_EXCEPTIONS as exc:
             _LOGGER.debug(
                 "Failed to subscribe to notifications from %s on valve %s: %s",
@@ -2307,7 +2801,7 @@ class ValveConnection:
 
         return None
 
-    def _handle_dashboard_packets(self, packets: list[bytes]) -> ValveDashboardData | None:
+    def _handle_dashboard_packets(self, packets: list[bytes], *, received_at: float | None = None) -> ValveDashboardData | None:
         """Parse and store the most recent Dashboard response from the valve."""
 
         if len(packets) != _DASHBOARD_PACKET_COUNT:
@@ -2364,8 +2858,18 @@ class ValveConnection:
             return
 
         self._dashboard_data = dashboard
+        if received_at is not None:
+            self._record_confirmation(received_at)
+            self._freshness.confirm({key: received_at for key in READINGS})
         self._notify_dashboard_listeners(dashboard)
         return dashboard
+
+    def _record_confirmation(self, received_at: float) -> None:
+        self._last_confirmation_time = received_at
+        self._last_success = dt_util.utcnow() - timedelta(seconds=max(0, self._hass.loop.time() - received_at))
+        self._reading_revision += 1
+        self._recovery_requested = False
+        self._last_attempt_failed = False
 
     def _decode_dashboard_fields(self, packets: list[bytes]) -> ValveDashboardData:
         """Decode shared byte positions before applying capability conditions."""
@@ -2766,6 +3270,21 @@ class ValveConnectionManager:
         self._remove_listener: CALLBACK_TYPE | None = None
         self._cancel_interval: CALLBACK_TYPE | None = None
         self._startup_unsub: CALLBACK_TYPE | None = None
+        self._unload_task: asyncio.Task | None = None
+        self.preferences = ValvePreferences(hass, config_entry)
+        self.preferences.migrate()
+        self._auth_configuration = self._current_auth_configuration()
+
+    def _current_auth_configuration(self):
+        return (self._config_entry.data.get(CONF_DEFAULT_PASSCODE),
+                dict(self._config_entry.options.get(CONF_DEVICE_PASSCODES, {})))
+
+    def authentication_configuration_changed(self) -> bool:
+        """Separate credential reloads from live local preference edits."""
+        return self._auth_configuration != self._current_auth_configuration()
+
+    async def async_apply_preferences(self) -> None:
+        await asyncio.gather(*(connection.async_apply_preferences() for connection in self._connections.values()))
 
     async def async_setup(self) -> None:
         """Begin tracking valves for periodic polling."""
@@ -2787,7 +3306,7 @@ class ValveConnectionManager:
                 EVENT_HOMEASSISTANT_STARTED, self._handle_home_assistant_started
             )
 
-    async def async_unload(self) -> None:
+    async def async_unload(self) -> bool:
         """Cancel scheduled work and disconnect listeners."""
 
         if self._remove_listener is not None:
@@ -2802,23 +3321,38 @@ class ValveConnectionManager:
             self._startup_unsub()
             self._startup_unsub = None
 
-        await _async_wait_for_cleanup(
-            asyncio.create_task(self._async_unload_connections())
-        )
+        task = self._unload_task
+        if task is None or task.done():
+            task = asyncio.create_task(self._async_unload_connections())
+            self._unload_task = task
+        try:
+            await _async_wait_for_cleanup(task)
+        except TimeoutError:
+            _LOGGER.error("Valve cleanup exceeded its budget; old ownership is retained")
+            return False
+        return task.result()
 
-    async def _async_unload_connections(self) -> None:
+    async def _async_unload_connections(self) -> bool:
         """Drain all valve cleanup before releasing manager ownership."""
 
-        await asyncio.gather(
+        results = await asyncio.gather(
             *(connection.async_unload() for connection in self._connections.values()),
             return_exceptions=True,
         )
+        if any(isinstance(result, BaseException) for result in results):
+            _LOGGER.error(
+                "Valve cleanup is unconfirmed; unload failed and old Bluetooth "
+                "ownership is retained. Check the adapter/proxy; replacement "
+                "setup will wait for confirmed release."
+            )
+            return False
         self._connections.clear()
+        return True
 
-    async def async_shutdown(self) -> None:
+    async def async_shutdown(self) -> bool:
         """Best-effort cleanup when Home Assistant stops."""
 
-        await self.async_unload()
+        return await self.async_unload()
 
     @callback
     def _handle_poll_interval(self, _: datetime) -> None:
@@ -2861,6 +3395,7 @@ class ValveConnectionManager:
                 self.get_passcode,
                 self._discovery_manager.async_set_connection_state,
                 self._discovery_manager.async_set_device_metadata,
+                self.preferences,
             )
             self._connections[advertisement.address] = connection
         connection.update_from_advertisement(advertisement)

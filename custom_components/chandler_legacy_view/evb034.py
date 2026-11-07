@@ -24,6 +24,19 @@ class Evb034ProtocolError(ValueError):
     """An exchange cannot safely produce a packet update."""
 
 
+class ReceivedPacket(dict):
+    """Carry each field's monotonic receipt time through partial coalescing."""
+
+    def __init__(self):
+        super().__init__()
+        self.confirmed_at: dict[str, float] = {}
+
+    def update(self, other):
+        super().update(other)
+        if isinstance(other, ReceivedPacket):
+            self.confirmed_at.update(other.confirmed_at)
+
+
 def frame_payload(payload: bytes, size: int) -> tuple[bytes, ...]:
     """Add first/last flags and a little-endian CCITT CRC to each chunk."""
     if not 14 <= size <= 512 or not payload or len(payload) > MAX_PACKET_BYTES:
@@ -57,10 +70,14 @@ class Evb034Session:
     Only authenticated configuration JSON uses CsBleQueueProcessor framing.
     """
 
-    def __init__(self, write: Callable[[bytes], Awaitable[None]], size: int) -> None:
+    def __init__(
+        self, write: Callable[[bytes], Awaitable[None]], size: int, *,
+        on_packet: Callable[[ReceivedPacket], None] | None = None,
+        on_failure: Callable[[Exception], None] | None = None,
+    ) -> None:
         self.write_size = size
         self._write = write
-        self._queue: asyncio.Queue[tuple[int, bytes]] = asyncio.Queue(maxsize=128)
+        self._queue: asyncio.Queue[tuple[int, bytes, float]] = asyncio.Queue(maxsize=128)
         self._packets: deque[tuple[int, dict]] = deque()
         self._acks: deque[tuple[int, bytes]] = deque()
         self._notification_serial = 0
@@ -75,6 +92,8 @@ class Evb034Session:
         self._failure: Exception | None = None
         self._reader: asyncio.Task | None = None
         self._buffer: bytearray | None = None
+        self._on_packet = on_packet
+        self._on_failure = on_failure
 
     def notification(self, _sender, data: bytearray) -> None:
         """Ignore callbacks after this client relinquishes ownership."""
@@ -82,14 +101,18 @@ class Evb034Session:
             return
         self._notification_serial += 1
         try:
-            self._queue.put_nowait((self._notification_serial, bytes(data)))
+            self._queue.put_nowait((self._notification_serial, bytes(data), asyncio.get_running_loop().time()))
         except asyncio.QueueFull:
             self._fail(Evb034ProtocolError("Receive queue full"))
 
     def _fail(self, error: Exception) -> None:
+        if self._failure is not None:
+            return
         self._failure = error
         self._ready.set()
         self._failed_event.set()
+        if self._on_failure is not None:
+            self._on_failure(error)
 
     def mark_authenticated(self) -> None:
         """Require continued access on this confirmed connection."""
@@ -149,7 +172,7 @@ class Evb034Session:
         if self._reader is not None:
             raise Evb034ProtocolError("Session already identified")
         self._reader = asyncio.create_task(self._receive_loop())
-        packet = {}
+        packet = ReceivedPacket()
         for attempt in range(PACKET_ATTEMPTS):
             await self._send(ID)
             try:
@@ -237,16 +260,24 @@ class Evb034Session:
         self._packets.clear()
         return packets
 
-    def _publish_packet(self, packet: dict, serial: int) -> None:
+    def _publish_packet(self, packet: dict, serial: int, received_at: float) -> None:
         # CsBlePacket.updatePacket skips JsonNull before interpreting any key.
         # Filter before access validation and coalescing, not only at HA refresh.
         packet = {key: value for key, value in packet.items() if value is not None}
         if not packet:
             return
+        received = ReceivedPacket()
+        received.update(packet)
+        received.confirmed_at = {key: received_at for key in packet}
+        packet = received
         if self._authenticated and "as" in packet and (
             type(packet["as"]) is not int or packet["as"] != 2
         ):
             raise Evb034ProtocolError("Authenticated session lost access")
+        if self._authenticated and self._on_packet is not None:
+            # Receipt and publication have different schedules. Observe live
+            # packets now without letting publication manufacture a timestamp.
+            self._on_packet(packet)
         # Ordinary deltas coalesce while HA waits for its configured interval.
         # Keep authentication transitions ordered instead of overwriting them.
         if self._packets and "as" not in packet and "as" not in self._packets[-1][1]:
@@ -266,16 +297,16 @@ class Evb034Session:
             while not self._closed and self._failure is None:
                 if self._buffer is not None:
                     async with asyncio.timeout(TIMEOUT):
-                        serial, data = await self._queue.get()
+                        serial, data, received_at = await self._queue.get()
                 else:
-                    serial, data = await self._queue.get()
-                await self._process_notification(data, serial)
+                    serial, data, received_at = await self._queue.get()
+                await self._process_notification(data, serial, received_at)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self._fail(exc)
 
-    async def _process_notification(self, data: bytes, serial: int) -> None:
+    async def _process_notification(self, data: bytes, serial: int, received_at: float) -> None:
         if not data:
             raise Evb034ProtocolError("Empty notification")
         if len(data) == 1:
@@ -326,5 +357,5 @@ class Evb034Session:
                 raise Evb034ProtocolError("Invalid JSON packet") from exc
             if not isinstance(packet, dict) or not packet:
                 raise Evb034ProtocolError("Expected nonempty JSON object")
-            self._publish_packet(packet, serial)
+            self._publish_packet(packet, serial, received_at)
         await self._send(ACK)

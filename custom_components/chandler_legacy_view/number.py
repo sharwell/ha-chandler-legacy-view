@@ -46,17 +46,26 @@ class ValvePersistentPollIntervalNumber(ChandlerValveEntity, NumberEntity):
         self._attr_available = True
         self._attr_native_value = connection.persistent_poll_interval
 
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self.async_on_remove(self._connection.add_preference_listener(self._handle_preferences))
+        self._handle_preferences()
+
+    @callback
+    def _handle_preferences(self) -> None:
+        self._attr_native_value = self._connection.persistent_poll_interval
+        self.async_write_ha_state()
+
     @callback
     def async_handle_bluetooth_update(
         self, advertisement: ValveAdvertisement, change: ValveDiscoveryChange
     ) -> None:
         """Handle Bluetooth discovery updates for the valve."""
 
-        if change is ValveDiscoveryChange.UNAVAILABLE:
-            self._attr_available = False
-        else:
+        if change is not ValveDiscoveryChange.UNAVAILABLE:
             self.async_update_from_advertisement(advertisement)
-            self._attr_available = True
+        # This is local configuration and requires no radio exchange.
+        self._attr_available = True
 
         self._attr_native_value = self._connection.persistent_poll_interval
         if self.hass is not None:

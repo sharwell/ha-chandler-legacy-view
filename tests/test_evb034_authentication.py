@@ -53,12 +53,13 @@ async def test_lockout_clear_and_reconnect_use_a_new_counter(
     await clock.advance(61)
     await clock.run(connection.async_poll())
     assert len(valve.authentication_payloads) == 2
+    assert len(valve.clients) == 1  # Lockout does not occupy another connection.
     valve.pin = "1234"
     await hass.services.async_call("switch", "turn_off", {"entity_id": lockout}, blocking=True)
     await clock.advance(61)
     await clock.run(connection.async_poll())
     assert connection.last_success is not None
-    assert connection.evb034_packet["dlc"] == 25
+    assert connection.evb034_packet["dlc"] == 24
     assert not connection.authentication_lockout
     assert len(valve.authentication_payloads) == 3
 
