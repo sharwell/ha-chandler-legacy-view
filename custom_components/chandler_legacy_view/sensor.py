@@ -44,6 +44,20 @@ class ValveDashboardSensor(ChandlerValveEntity, SensorEntity):
 
     _attr_available = True
 
+    async def async_update(self) -> None:
+        """A selected reading refreshes all shared valve readings."""
+        await self._connection.async_refresh()
+
+    async def async_update_ha_state(self, force_refresh: bool = False) -> None:
+        # HA's default implementation catches async_update errors and only
+        # logs them. The explicit action must report an unsuccessful refresh
+        # to the calling automation instead of implying that it completed.
+        if force_refresh:
+            await self.async_update()
+            self.async_write_ha_state()
+        else:
+            await super().async_update_ha_state(force_refresh)
+
     def __init__(
         self,
         advertisement: ValveAdvertisement,

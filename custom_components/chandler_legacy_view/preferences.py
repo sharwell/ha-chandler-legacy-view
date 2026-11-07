@@ -16,6 +16,25 @@ PERSISTENT_ENABLED = "persistent_connection"
 VALVE_PREFERENCES = "valve_preferences"
 PREFERENCES_VERSION = "preferences_version"
 INHERIT_PERSISTENT_INTERVAL = "inherit_persistent_interval"
+ON_DEMAND_INTERVAL = "on_demand_poll_interval"
+INHERIT_ON_DEMAND_INTERVAL = "inherit_on_demand_interval"
+
+
+def on_demand_interval(value) -> float:
+    """On-demand options use minutes; never confuse them with persistent seconds."""
+    if isinstance(value, bool):
+        raise ValueError("On-demand interval must be a number")
+    value = float(value)
+    if not math.isfinite(value) or not 1 <= value <= 1440:
+        raise ValueError("On-demand interval must be between 1 and 1440 minutes")
+    return value
+
+
+def default_on_demand_interval(options) -> float:
+    try:
+        return on_demand_interval(options.get(ON_DEMAND_INTERVAL, 15))
+    except (ValueError, TypeError, OverflowError):
+        return 15.0
 
 
 def persistent_interval(value) -> float:
@@ -66,6 +85,14 @@ class ValvePreferences:
         valves[address] = values
         options[VALVE_PREFERENCES] = valves
         self.hass.config_entries.async_update_entry(self.entry, options=options)
+
+    def on_demand_interval(self, address) -> float:
+        """Return the effective expected interval in seconds for scheduling."""
+        try:
+            minutes = on_demand_interval(valve_preferences(self.entry.options, address)[ON_DEMAND_INTERVAL])
+        except (KeyError, ValueError, TypeError, OverflowError):
+            minutes = default_on_demand_interval(self.entry.options)
+        return minutes * 60
 
     def migrate(self) -> None:
         """Import recoverable pre-upgrade evidence once, before creating objects.

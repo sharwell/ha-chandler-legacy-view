@@ -184,6 +184,7 @@ async def test_disable_interrupts_active_dashboard_then_disconnects(connection_f
     gate = valve.operations["dashboard"].block()
     gate.started.clear()
     await clock.advance(10.1)
+    await clock.until(gate.started.is_set, budget=1)
     assert gate.started.is_set()
     await clock.run(connection.async_set_persistent_connection_enabled(False))
     assert gate.cancelled

@@ -12,6 +12,7 @@ from custom_components.chandler_legacy_view.const import DATA_CONNECTION_MANAGER
 from custom_components.chandler_legacy_view.preferences import (
     INHERIT_PERSISTENT_INTERVAL, PERSISTENT_ENABLED, PERSISTENT_INTERVAL,
     PREFERENCES_VERSION, VALVE_PREFERENCES,
+    ON_DEMAND_INTERVAL,
 )
 from packets import dashboard_frames
 from test_configured_authentication import entity_id, manager, update_options
@@ -99,6 +100,7 @@ async def test_real_storage_restores_before_first_poll_even_with_disabled_contro
     await hass.async_block_till_done()
     await number_write(hass, "valve-a", 180)
     switch = entity_id(hass, "switch", "valve-a", "persistent_connection")
+    await update_options(hass, entry, {ON_DEMAND_INTERVAL: 60, "device_address": "valve-a", "device_on_demand_interval": 120})
     number = entity_id(hass, "number", "valve-a", "persistent_poll_interval")
     await hass.services.async_call("switch", "turn_on" if enabled else "turn_off", {"entity_id": switch}, blocking=True)
     assert await clock.run(hass.config_entries.async_unload(entry.entry_id))
@@ -115,6 +117,7 @@ async def test_real_storage_restores_before_first_poll_even_with_disabled_contro
     connection = restored.data[DOMAIN][entry.entry_id][DATA_CONNECTION_MANAGER].get_connection("valve-a")
     assert connection.persistent_connection_enabled is enabled
     assert connection.persistent_poll_interval == 180
+    assert connection.on_demand_poll_interval == 7200
     if disabled:
         assert restored.states.get(switch) is None
         assert restored.states.get(number) is None

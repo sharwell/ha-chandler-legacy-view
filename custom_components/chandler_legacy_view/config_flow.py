@@ -37,6 +37,8 @@ from .entity import friendly_name_from_advertised_name
 from .preferences import (
     PERSISTENT_INTERVAL, VALVE_PREFERENCES, INHERIT_PERSISTENT_INTERVAL,
     default_interval, persistent_interval, valve_preferences,
+    ON_DEMAND_INTERVAL, INHERIT_ON_DEMAND_INTERVAL,
+    default_on_demand_interval, on_demand_interval,
 )
 
 
@@ -155,6 +157,11 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
                     updated_options[PERSISTENT_INTERVAL] = persistent_interval(user_input[PERSISTENT_INTERVAL])
                 except (ValueError, TypeError, OverflowError):
                     errors[PERSISTENT_INTERVAL] = "invalid_interval"
+            if ON_DEMAND_INTERVAL in user_input:
+                try:
+                    updated_options[ON_DEMAND_INTERVAL] = on_demand_interval(user_input[ON_DEMAND_INTERVAL])
+                except (ValueError, TypeError, OverflowError):
+                    errors[ON_DEMAND_INTERVAL] = "invalid_on_demand_interval"
 
             default_passcode_input = _coerce_passcode(
                 user_input.get(CONF_DEFAULT_PASSCODE)
@@ -171,8 +178,10 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
 
             interval_input = user_input.get("device_persistent_interval")
             inherit_interval = bool(user_input.get(INHERIT_PERSISTENT_INTERVAL))
+            on_demand_input = user_input.get("device_on_demand_interval")
+            inherit_on_demand = bool(user_input.get(INHERIT_ON_DEMAND_INTERVAL))
             if selected_device is None:
-                if interval_input is not None or inherit_interval:
+                if interval_input is not None or inherit_interval or on_demand_input is not None or inherit_on_demand:
                     errors["base"] = "device_required"
                 if device_passcode_input is not None or remove_override:
                     errors["base"] = "device_required"
@@ -191,10 +200,20 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
                             existing_overrides.get(selected_device) != device_passcode_input
                         )
                         updated_overrides[selected_device] = device_passcode_input
-                elif interval_input is None and not inherit_interval:
+                elif interval_input is None and not inherit_interval and on_demand_input is None and not inherit_on_demand:
                     errors[CONF_DEVICE_PASSCODE] = "passcode_required"
 
                 values = valve_preferences(updated_options, selected_device)
+                if inherit_on_demand:
+                    if on_demand_input is not None:
+                        errors["device_on_demand_interval"] = "interval_not_expected"
+                    else:
+                        values.pop(ON_DEMAND_INTERVAL, None)
+                elif on_demand_input is not None:
+                    try:
+                        values[ON_DEMAND_INTERVAL] = on_demand_interval(on_demand_input)
+                    except (ValueError, TypeError, OverflowError):
+                        errors["device_on_demand_interval"] = "invalid_on_demand_interval"
                 if inherit_interval:
                     if interval_input is not None:
                         errors["device_persistent_interval"] = "interval_not_expected"
@@ -205,7 +224,7 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
                         values[PERSISTENT_INTERVAL] = persistent_interval(interval_input)
                     except (ValueError, TypeError, OverflowError):
                         errors["device_persistent_interval"] = "invalid_interval"
-                if interval_input is not None or inherit_interval:
+                if interval_input is not None or inherit_interval or on_demand_input is not None or inherit_on_demand:
                     original = updated_options.get(VALVE_PREFERENCES, {})
                     valves = dict(original) if isinstance(original, dict) else {}
                     valves[selected_device] = values
@@ -227,6 +246,9 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
                 return self.async_create_entry(title="", data=updated_options)
 
         schema_dict: dict[vol.Marker, object] = {
+            vol.Optional(ON_DEMAND_INTERVAL, default=default_on_demand_interval(self._config_entry.options)): NumberSelector(
+                NumberSelectorConfig(min=1, max=1440, step=1, unit_of_measurement="min", mode=NumberSelectorMode.BOX)
+            ),
             vol.Optional(PERSISTENT_INTERVAL, default=default_interval(self._config_entry.options)): NumberSelector(
                 NumberSelectorConfig(min=5, max=300, step=1, unit_of_measurement="s", mode=NumberSelectorMode.BOX)
             ),
@@ -250,6 +272,10 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
                 NumberSelectorConfig(min=5, max=300, step=1, unit_of_measurement="s", mode=NumberSelectorMode.BOX)
             )
             schema_dict[vol.Optional(INHERIT_PERSISTENT_INTERVAL, default=False)] = BooleanSelector()
+            schema_dict[vol.Optional("device_on_demand_interval")] = NumberSelector(
+                NumberSelectorConfig(min=1, max=1440, step=1, unit_of_measurement="min", mode=NumberSelectorMode.BOX)
+            )
+            schema_dict[vol.Optional(INHERIT_ON_DEMAND_INTERVAL, default=False)] = BooleanSelector()
             schema_dict[vol.Optional(CONF_REMOVE_OVERRIDE, default=False)] = (
                 BooleanSelector()
             )
@@ -263,5 +289,10 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
                 for address in sorted(saved_valves)
                 for values in [valve_preferences(self._config_entry.options, address)]
                 if PERSISTENT_INTERVAL in values
+            ) or "None", "on_demand_overrides": "; ".join(
+                f"{address}: {values[ON_DEMAND_INTERVAL]} min"
+                for address in sorted(saved_valves)
+                for values in [valve_preferences(self._config_entry.options, address)]
+                if ON_DEMAND_INTERVAL in values
             ) or "None"},
         )

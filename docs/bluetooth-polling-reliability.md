@@ -87,6 +87,11 @@ A failed assertion with an intentionally cancellation-resistant fake call
 left the test loop's final task drain waiting on its artificial gate. The
 shared transport fixture now releases those gates during test teardown.
 
+HA's default forced entity update catches failures and logs them while its
+action returns normally. Dashboard sensors therefore perform the explicitly
+requested refresh before publishing state, allowing its action error to reach
+the caller. Automatic update behavior and other platforms remain unchanged.
+
 ## Operation budgets and evidence (#102)
 
 Connection establishment has 20 seconds. Individual GATT calls have 10
@@ -144,3 +149,26 @@ Real HA actions, options, registries and storage-backed fresh runtimes verify
 inheritance, explicit writes, offline edits, migration, invalid values, saved
 on/off, disabled controls and restored publication cadence. Bluetooth I/O is
 simulated; storage and HA lifecycle are real.
+
+## Polling and refresh evidence (#100)
+
+Automatic advertisement, periodic, due-time and deferred triggers recheck the
+same successful-reading deadline. The default remains 15 minutes; options use
+1–1440 minutes with entry defaults and valve overrides. A dedicated deadline
+timer handles intervals shorter than the manager's periodic check and avoids
+depending on a future advertisement. Failed reads retain cooldown-governed
+recovery; locked-out credentials do not open more connections.
+
+Real `homeassistant.update_entity` calls join shared valve work, wait through
+cooldown, use existing persistent sessions and report unsuccessful reads.
+Evb034 field receipt timestamps survive packet coalescing and publication.
+HA's `pref_disable_polling` governs every automatic on-demand trigger; manual
+refresh and explicitly enabled persistent sessions remain usable.
+
+Regression evidence includes simulated C4.40 advertisement cadence, due times
+without advertisements, independent valve intervals, defaults/overrides,
+disabled automatic polling, cancellation/unload, multi-target refresh and
+Evb019/Evb034 persistent behavior. Fresh HA storage restoration includes the
+on-demand default and override. The documented automation/script examples run
+through HA and appear in its entity relationship lookup. Live C4.40/proxy
+connection-frequency, slot-release and phone-app handoff remain unverified.
