@@ -279,6 +279,8 @@ class ValveConnection:
         self._pending_persistent_client: BaseBleakClient | None = None
         self._persistent_stop_task: asyncio.Task[None] | None = None
         self._evb034_session: Evb034Session | None = None
+        self._evb034_client: BaseBleakClient | None = None
+        self._evb034_subscriptions: list[str] = []
         self._evb034_packet: dict | None = None
 
     @property
@@ -1057,7 +1059,7 @@ class ValveConnection:
         return dashboard_response_received
 
     async def _async_fetch_evb034(self, client: BaseBleakClient) -> bool:
-        """Identify a C6.x session; authentication and readings follow separately."""
+        """Identify and authenticate a connection before requesting its readings."""
         self._evb034_packet = None
         resolved = await self._async_resolve_request_characteristic(client)
         if resolved is None:
@@ -1072,23 +1074,76 @@ class ValveConnection:
 
         session = Evb034Session(write, size)
         self._evb034_session = session
+        self._evb034_client = client
         subscriptions = await self._async_subscribe_to_notifications(
             client, session.notification
         )
+        self._evb034_subscriptions = subscriptions
         try:
             if not subscriptions:
                 return False
-            self._evb034_packet = await session.identify()
-            # A validated identification is not a successful Dashboard poll.
-            return False
+            identification = await session.identify()
+            self._evb034_packet = identification
+            passcode = self.get_configured_passcode()
+            self._reset_authentication_failure_if_needed(passcode)
+            if self._authentication_failed:
+                return False
+            state = identification.get("as")
+            if type(state) is not int or state not in (1, 2):
+                return False
+            if state == 1:
+                counter = identification.get("dlc")
+                value = self._parse_passcode(passcode)
+                if type(counter) is not int or not 0 <= counter <= 0x7FFFFFFF or value is None:
+                    return False
+                reply = await session.request(self._create_evb034_password_buffer(
+                    session.write_size, counter, value
+                ))
+                state = reply.get("as")
+                if type(state) is not int:
+                    return False
+                if state == 1:
+                    self._record_authentication_failure(passcode)
+                    return False
+                if state != 2:
+                    return False
+                self._evb034_packet.update(reply)
+            self._set_authentication_failed(False)
+            self._device_list_authentication_state = ValveAuthenticationState.AUTHENTICATED
+            return await self._async_refresh_evb034_dashboard(client)
         except (TimeoutError, Evb034ProtocolError) as exc:
             _LOGGER.debug("Evb034 exchange for valve %s failed: %s", self._address, exc)
             return False
-        finally:
-            session.close()
-            await self._async_unsubscribe_notifications(client, subscriptions)
-            if self._evb034_session is session:
-                self._evb034_session = None
+
+    def _create_evb034_password_buffer(self, size: int, counter: int, passcode: int) -> bytes:
+        """Match CsDataBufferEvb034$Companion.getPasswordBuffer byte placement."""
+        buffer = bytearray(_CRC_RANDOM.randbytes(min(20, size)))
+        polynomial = _CRC_RANDOM.choice(_CRC_ALLOWED_POLYNOMIALS)
+        seed = buffer[0]
+        nonce = buffer[4] ^ seed
+        crc = _ChandlerCrc8()
+        crc.set_options(polynomial, seed)
+        previous = (counter ^ crc.compute(nonce)) & 0xFF
+        buffer[1], buffer[3], buffer[5] = polynomial, seed, nonce
+        ones, tens, hundreds, thousands = self._get_password_digits(passcode)
+        for index, digit in zip((7, 9, 11, 13), (thousands, ones, hundreds, tens)):
+            previous = digit ^ crc.compute(previous)
+            buffer[index] = previous
+        return bytes(buffer)
+
+    async def _async_refresh_evb034_dashboard(self, client: BaseBleakClient) -> bool:
+        """Require fresh Dashboard fields from the authenticated owning client."""
+        session = self._evb034_session
+        if session is None or client is not self._evb034_client:
+            return False
+        packet = await session.request(b"u" * 20)
+        if "as" in packet and (type(packet["as"]) is not int or packet["as"] != 2):
+            self._device_list_authentication_state = ValveAuthenticationState.UNKNOWN
+            return False
+        if not any(key.startswith("d") and not key.startswith("dl") for key in packet):
+            return False
+        self._evb034_packet.update(packet)
+        return True
 
     @staticmethod
     def _create_request_payload(request: ValveRequestCommand | int) -> bytes:
@@ -1328,6 +1383,17 @@ class ValveConnection:
 
         async def _cleanup() -> None:
             try:
+                if self._evb034_client is client:
+                    session = self._evb034_session
+                    if session is not None:
+                        session.close()
+                    await self._async_unsubscribe_notifications(
+                        client, self._evb034_subscriptions
+                    )
+                    self._evb034_session = None
+                    self._evb034_client = None
+                    self._evb034_subscriptions = []
+                    self._reset_device_list_state()
                 try:
                     async with asyncio.timeout(_RESET_BUFFER_TIMEOUT_SECONDS):
                         if await self._async_send_reset_buffer_packet(client):
@@ -1726,6 +1792,13 @@ class ValveConnection:
         self, client: BaseBleakClient
     ) -> tuple[bool, bool]:
         """Send a Dashboard request and wait for the full multi-packet response."""
+
+        if client is self._evb034_client:
+            try:
+                return True, await self._async_refresh_evb034_dashboard(client)
+            except (TimeoutError, Evb034ProtocolError) as exc:
+                _LOGGER.debug("Evb034 Dashboard for valve %s failed: %s", self._address, exc)
+                return True, False
 
         loop = asyncio.get_running_loop()
         response_future: asyncio.Future[list[bytes]] = loop.create_future()

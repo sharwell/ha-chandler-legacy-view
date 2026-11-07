@@ -7,7 +7,7 @@ from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.service import BleakGATTService, BleakGATTServiceCollection
 
 from packets import dashboard_frames, device_list_frame
-from evb034_packets import crc16, frames
+from evb034_packets import crc16, frames, password_pin
 
 SERVICE = "00001000-0000-1000-8000-00805f9b34fb"
 WRITE = "00001001-0000-1000-8000-00805f9b34fb"
@@ -235,9 +235,24 @@ class Client:
         if request == b"t" * 20:
             await self.valve.operations["device_list"].run()
             default = {"dlf": self.valve.firmware_version, "dlc": self.connection_counter,
-                       "as": 1, "dlvt": 1, "dli": False, "dlic": False}
+                       "as": 1 if self.valve.authentication_required else 2,
+                       "dlvt": 1, "dli": False, "dlic": False}
+            self.challenge = self.connection_counter
             replies = (self.valve.identification_packets.popleft()
                        if self.valve.identification_packets else frames(default, self.mtu_size - 3))
+        elif request == b"u" * 20:
+            await self.valve.operations["dashboard"].run()
+            self.valve.dashboard_requests += 1
+            replies = ((self.valve.dashboards.popleft() if self.valve.dashboards
+                        else frames({"dwu": 567}, self.mtu_size - 3))
+                       if self.dashboard_access else [])
+        elif len(request) == 20:
+            await self.valve.operations["authenticate"].run()
+            self.valve.authentication_payloads.append(request)
+            pin = password_pin(request, self.challenge)
+            self.dashboard_access = pin == self.valve.pin
+            replies = (self.valve.auth_replies.popleft() if self.valve.auth_replies else
+                       frames({"as": 2 if self.dashboard_access else 1}, self.mtu_size - 3))
         else:
             raise AssertionError(f"Unexpected packet request {request!r}")
         for packet in replies:

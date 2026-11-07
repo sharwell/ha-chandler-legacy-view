@@ -23,8 +23,9 @@ async def test_identifies_newer_valves_with_negotiated_packet_sizes(
     await clock.run(connection.async_poll())
     assert connection.evb034_packet["dlf"] == 622
     assert connection.evb034_packet["dlc"] == 23
-    assert valve.packet_requests == [b"t" * 20]
-    assert connection.last_success is None
+    assert valve.packet_requests[0] == b"t" * 20
+    assert valve.packet_requests[-1] == b"u" * 20
+    assert connection.last_success is not None
     assert valve.clients[0].notifications == {}
     assert not valve.clients[0].is_connected
 

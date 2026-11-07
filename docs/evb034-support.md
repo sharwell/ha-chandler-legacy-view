@@ -40,6 +40,23 @@ identification to a replacement connection. Tests cover CRC/JSON rejection,
 fragmentation, coalescing, MTU sizes, bounded ACK/NAK/timeouts and cancellation
 alongside all Evb019 regressions.
 
+## Authentication and recovery
+
+`CsDataBufferEvb034$Companion.getPasswordBuffer` uses a random buffer of
+`min(20, available ATT bytes)`, CRC8 polynomial/seed/nonce at offsets 1/3/5,
+and encrypted thousands/ones/hundreds/tens digits at offsets 7/9/11/13.
+`CsBleViewModel.write` obtains the counter from the current packet's `dlc`,
+not from the advertisement or a previous connection. `CsBlePacketAuthState`
+defines unknown `0`, unauthenticated `1`, and authenticated `2`.
+
+The Authentication Lockout switch is available on Evb034 because access is
+reported in packet `as`, independently of the advertisement's status bits.
+Only an explicit credential rejection locks out retries. Missing, malformed
+or unknown authentication replies remain retryable; clearing lockout or
+changing configured credentials permits a new attempt. Reconnect always
+identifies and authenticates again. Persistent polling retains the same
+owning session, and teardown invalidates callbacks before disconnecting.
+
 ## Protocol limitations and remaining evidence
 
 The reference's chunks have no sequence number, message ID or payload length.
