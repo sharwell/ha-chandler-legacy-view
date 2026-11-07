@@ -70,6 +70,7 @@ class ValveDashboardSensor(ChandlerValveEntity, SensorEntity):
         base_name = self._attr_name
         self._attr_unique_id = f"{advertisement.address}_{unique_id_suffix}"
         self._name_suffix = name_suffix
+        self._freshness_key = unique_id_suffix
         self._connection = connection
         self._bluetooth_available = True
         self._remove_dashboard_listener: CALLBACK_TYPE | None = None
@@ -88,6 +89,7 @@ class ValveDashboardSensor(ChandlerValveEntity, SensorEntity):
         self._remove_capability_listener = self._connection.add_capability_listener(
             self._handle_capability_update
         )
+        self.async_on_remove(self._connection.add_freshness_listener(self._handle_capability_update))
 
     def _apply_name_suffix(
         self, base_name: str, advertisement: ValveAdvertisement
@@ -144,7 +146,10 @@ class ValveDashboardSensor(ChandlerValveEntity, SensorEntity):
         return True
 
     def _update_availability(self) -> None:
-        self._attr_available = self._bluetooth_available and self._is_supported()
+        self._attr_available = (
+            self._bluetooth_available and self._is_supported()
+            and self._connection.reading_is_current(self._freshness_key)
+        )
 
     @callback
     def _handle_capability_update(self) -> None:

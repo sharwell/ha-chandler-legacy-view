@@ -8,6 +8,12 @@ import struct
 from .models import ValveDashboardData
 
 READING_KEYS = {"dh", "dm", "da", "dbl", "gpf", "dtgr", "dwu", "dpfd", "dwh", "dcdo"}
+READING_FIELDS = {
+    "present_flow": "present_flow", "water_usage_today": "water_usage",
+    "peak_flow_today": "peak_flow", "soft_water_remaining": "water_remaining_until_regeneration",
+    "days_until_regeneration": "air_recharge", "water_hardness": "water_hardness",
+    "battery": "battery_capacity", "time_of_day": "time_hour",
+}
 
 
 def number(packet: Mapping, key: str) -> float | None:
@@ -22,6 +28,17 @@ def number(packet: Mapping, key: str) -> float | None:
 def integer(packet: Mapping, key: str) -> int | None:
     value = number(packet, key)
     return int(value) if value is not None else None
+
+
+def valid_reading_keys(packet: Mapping, firmware: int, *, clack: bool) -> set[str]:
+    """Recognize explicit usable components without borrowing retained values."""
+    keys = {key for key in READING_KEYS.intersection(packet) if number(packet, key) is not None}
+    for key, maximum in (("dh", 23), ("dm", 59), ("da", 1)):
+        if key in keys and integer(packet, key) > maximum:
+            keys.remove(key)
+    if clack or firmware >= 609:
+        keys.discard("da")  # The 24-hour clock does not consume this component.
+    return keys
 
 
 def _battery_capacity(raw: float) -> int:

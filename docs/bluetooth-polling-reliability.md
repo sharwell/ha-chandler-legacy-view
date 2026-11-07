@@ -62,12 +62,17 @@ Simulated disconnect/cleanup evidence does not establish physical valve or
 ESPHome proxy-slot release. Record available live evidence and missing
 firmware/adapter/proxy coverage explicitly.
 
-The #105 comment requires a per-field/firmware decision record for Evb034:
+The original #105 comment requires a per-field/firmware decision record for Evb034:
 the APK merges partial maps and skips nulls, but that alone does not prove a
 maximum report interval or a change-only health contract. The user has no
 Evb034 hardware. Firmware classification cannot be inferred from the fake's
 one-second stream. Resolve the reference/documentation evidence and record
 remaining capture requirements before claiming #105 or #106 complete.
+
+On 2026-11-07 the user selected the session-health policy recorded below as
+the implementation approach despite the unresolved firmware classifications.
+That explicit direction replaces the original proof-before-retention gate for
+#105 implementation; it does not supply missing hardware/producer evidence.
 
 ## Unexpected situations and open questions
 
@@ -91,6 +96,13 @@ HA's default forced entity update catches failures and logs them while its
 action returns normally. Dashboard sensors therefore perform the explicitly
 requested refresh before publishing state, allowing its action error to reach
 the caller. Automatic update behavior and other platforms remain unchanged.
+
+The #105 APK review confirms the known Evb034 evidence gap. Delta merging and
+transport keepalive methods do not specify per-field reporting/health limits.
+The user's subsequent direction resolves the implementation boundary using
+session-based eligibility and renewal. `docs/evb034-reporting.md` records the
+selected assumption, every field/family as unclassified and required captures.
+One stopped producer can remain undetected while other reading traffic arrives.
 
 ## Operation budgets and evidence (#102)
 
@@ -172,3 +184,39 @@ Evb019/Evb034 persistent behavior. Fresh HA storage restoration includes the
 on-demand default and override. The documented automation/script examples run
 through HA and appear in its entity relationship lookup. Live C4.40/proxy
 connection-frequency, slot-release and phone-app handoff remain unverified.
+
+## Reading expiration and evidence (#105)
+
+The Evb019 portion implements monotonic confirmation, independent expiration
+timers, due-attempt/retry early failure, unknown initial acquisition, live
+interval/mode recalculation and sticky expiration until fresh data. Recovery
+publishes the fresh value and availability together. Early manual failures
+retain current data and do not create extra automatic retries before due time.
+Existing Bluetooth and APK capability availability conditions remain in force.
+
+Evb034 implements the selected session policy. A complete valid baseline makes
+an applicable field eligible; later valid reading activity renews all eligible
+fields in that authenticated connection. Unseen fields stay unavailable.
+Metadata/ACK/null/invalid traffic cannot renew them. Receipt is observed before
+publication, while first availability and recovery publish a fresh snapshot
+atomically. New connections and access/receiver loss invalidate eligibility.
+Healthy on-demand snapshots retain their bounded between-read lifetime.
+
+Regression checks use real HA states/events and simulated Bluetooth I/O. They
+cover both expiry formulas, startup, due failures/retries, early manual failures,
+coalescing timestamps, long publication intervals, mode/interval changes,
+unchanged zero, independent valves, supported/unsupported entities, late old
+callbacks, new baselines and clock dependencies across conversion families and
+Clack variants. Session initialization still must finish before first success.
+
+The final minimum/current HA suites each pass 536 tests and 294 subtests.
+Initialization-failure regressions exposed a need to defer baseline publication
+until the required battery-read command is acknowledged. The receiver can
+retain data during initialization, but cannot report a successful read early.
+
+All five software steps and their failure tests are complete under the user's
+revised #105 policy, completing #106's implementation outcomes. The #105 commit
+therefore includes the requested #106 closing line. Actual Evb034 producer
+classification and physical adapter/proxy release remain unverified; these
+are recorded evidence gaps, not simulated physical results. Linux CI was not
+run locally and remains for the PR checks alongside the Windows targets.

@@ -70,7 +70,11 @@ class Evb034Session:
     Only authenticated configuration JSON uses CsBleQueueProcessor framing.
     """
 
-    def __init__(self, write: Callable[[bytes], Awaitable[None]], size: int) -> None:
+    def __init__(
+        self, write: Callable[[bytes], Awaitable[None]], size: int, *,
+        on_packet: Callable[[ReceivedPacket], None] | None = None,
+        on_failure: Callable[[Exception], None] | None = None,
+    ) -> None:
         self.write_size = size
         self._write = write
         self._queue: asyncio.Queue[tuple[int, bytes, float]] = asyncio.Queue(maxsize=128)
@@ -88,6 +92,8 @@ class Evb034Session:
         self._failure: Exception | None = None
         self._reader: asyncio.Task | None = None
         self._buffer: bytearray | None = None
+        self._on_packet = on_packet
+        self._on_failure = on_failure
 
     def notification(self, _sender, data: bytearray) -> None:
         """Ignore callbacks after this client relinquishes ownership."""
@@ -100,9 +106,13 @@ class Evb034Session:
             self._fail(Evb034ProtocolError("Receive queue full"))
 
     def _fail(self, error: Exception) -> None:
+        if self._failure is not None:
+            return
         self._failure = error
         self._ready.set()
         self._failed_event.set()
+        if self._on_failure is not None:
+            self._on_failure(error)
 
     def mark_authenticated(self) -> None:
         """Require continued access on this confirmed connection."""
@@ -264,6 +274,10 @@ class Evb034Session:
             type(packet["as"]) is not int or packet["as"] != 2
         ):
             raise Evb034ProtocolError("Authenticated session lost access")
+        if self._authenticated and self._on_packet is not None:
+            # Receipt and publication have different schedules. Observe live
+            # packets now without letting publication manufacture a timestamp.
+            self._on_packet(packet)
         # Ordinary deltas coalesce while HA waits for its configured interval.
         # Keep authentication transitions ordered instead of overwriting them.
         if self._packets and "as" not in packet and "as" not in self._packets[-1][1]:

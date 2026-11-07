@@ -42,7 +42,8 @@ async def test_persistent_refreshes_publish_new_readings_on_same_session(hass, r
         # readings must prove request cleanup while this same session is live,
         # otherwise a one-shot disconnect could conceal a subscription leak.
         for reading in (456, 789):
-            await clock.until(lambda: hass.states.get(usage).state == str(reading), budget=15)
+            await clock.until(lambda: hass.states.get(usage).state == str(reading)
+                              and not session.notifications, budget=15)
             assert valve.clients == [session]
             assert session.is_connected
             assert session.disconnects == 0

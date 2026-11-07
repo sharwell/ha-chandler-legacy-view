@@ -97,3 +97,47 @@ release, Home Assistant logs the failure and retains the old connection in
 quarantine. Replacement setup retries until release is confirmed. Consult the
 Bluetooth adapter/proxy logs when this persists. A completed integration unload
 does not itself prove that a physical connection or proxy slot was released.
+
+## Reading expiration
+
+Expired Dashboard readings become unavailable
+independently of Bluetooth presence. Presence can remain on while a reading
+is unavailable. On-demand maximum age is the declared interval plus five
+minutes of recovery allowance: 20 minutes by default, or 65 minutes for an
+hourly custom schedule. Persistent maximum age is the greater of three
+persistent intervals or two minutes (15 minutes at a five-minute interval).
+
+A due read and its permitted retry can make readings unavailable sooner if
+both fail. Failed early manual refreshes do not expire current readings or
+start extra automatic retries during their normal freshness window. An Evb019
+reading without an initial value remains unknown while acquisition is pending,
+then becomes unavailable after two due failures or five minutes without
+confirmation.
+
+A valid complete authenticated Evb019 Dashboard response confirms its
+applicable readings, including unchanged values and zero. Advertisements,
+attempts and incomplete or invalid replies do not renew them. Interval/mode
+edits recalculate from the original confirmation time; increasing an interval
+cannot revive an expired value. New valid data restores the value and
+availability together. Firmware/type/Clack applicability still takes precedence.
+
+Evb034 uses session health for fields with a valid baseline: receiving a valid
+field makes that field eligible, and later valid reading updates renew all
+eligible fields in the same authenticated session. Fields can first appear
+later in a session. A clock needs all required components before eligibility.
+Fields never received stay unavailable; their entities and registry enablement
+are unchanged. Existing firmware/type/Clack restrictions still apply.
+
+Metadata, ACKs, nulls and invalid data do not renew session health. Silence
+uses the same deadlines above. Access loss, receiver failure or a detected
+unexpected disconnect invalidates the session baseline, and reconnect starts
+with no eligible fields. A completed on-demand snapshot remains available
+between reads until its deadline. First availability and recovery publish the
+current snapshot immediately, while ordinary updates retain the configured
+publication interval.
+
+This is a deliberate policy assumption: other reading updates can keep one
+field marked fresh even if that field's producer has stopped. The APK does
+not prove a reporting guarantee for each field. See
+[Evb034 reporting evidence](evb034-reporting.md) for the decision and remaining
+hardware validation.

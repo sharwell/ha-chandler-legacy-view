@@ -47,7 +47,8 @@ from .device_registry import async_update_device_serial_number
 from .discovery import ValveDiscoveryChange, ValveDiscoveryManager, _map_valve_type
 from .models import ValveAdvertisement, ValveCapabilities, ValveDashboardData
 from .evb034 import Evb034ProtocolError, Evb034Session
-from .evb034_data import READING_KEYS, decode_dashboard, integer
+from .evb034_data import READING_KEYS, READING_FIELDS, decode_dashboard, integer, valid_reading_keys
+from .freshness import FreshnessPolicy, ReadingFreshness, READINGS, RECOVERY_ALLOWANCE
 from .preferences import ValvePreferences, PERSISTENT_ENABLED, PERSISTENT_INTERVAL, persistent_interval
 from .protocol_compatibility import (
     PreviousProtocol,
@@ -312,9 +313,17 @@ class ValveConnection:
         self._evb034_client: BaseBleakClient | None = None
         self._evb034_subscriptions: list[str] = []
         self._evb034_packet: dict | None = None
+        self._evb034_eligible: set[str] = set()
+        self._evb034_received_readings: dict = {}
+        self._evb034_received_times: dict[str, float] = {}
+        self._evb034_last_update_time: float | None = None
+        self._evb034_published_time: float | None = None
+        self._evb034_reading_ready = False
         self._transport: OwnedBluetoothOperations | None = None
         self._poll_task: asyncio.Task | None = None
         self._unload_task: asyncio.Task | None = None
+        self._freshness_listeners: list[Callable[[], None]] = []
+        self._freshness = ReadingFreshness(hass, address, self._freshness_policy, self._notify_freshness)
 
     @property
     def config_entry_id(self) -> str:
@@ -433,6 +442,37 @@ class ValveConnection:
         """Return the effective expected on-demand interval in seconds."""
         return self._preferences.on_demand_interval(self._address) if self._preferences else CONNECTION_POLL_INTERVAL.total_seconds()
 
+    def _freshness_policy(self) -> FreshnessPolicy | None:
+        if self._persistent_connection_enabled:
+            interval = self.persistent_poll_interval
+            return FreshnessPolicy("persistent", interval, max(3 * interval, 120))
+        interval = self.on_demand_poll_interval
+        return FreshnessPolicy("on-demand", interval, interval + RECOVERY_ALLOWANCE)
+
+    def reading_is_current(self, key: str) -> bool:
+        if self._evb034_client is not None or (
+            self._advertisement is not None and self._advertisement.model == "Evb034"
+        ):
+            return key in self._evb034_eligible and self._freshness.current(key)
+        return self._freshness.current(key)
+
+    def add_freshness_listener(self, listener: Callable[[], None]) -> CALLBACK_TYPE:
+        self._freshness_listeners.append(listener)
+        return lambda: self._freshness_listeners.remove(listener)
+
+    def _notify_freshness(self) -> None:
+        for listener in list(self._freshness_listeners):
+            listener()
+
+    def _recalculate_freshness(self) -> None:
+        self._freshness.recalculate()
+        self._notify_freshness()
+
+    def _reading_attempt_due(self) -> bool:
+        interval = self.persistent_poll_interval if self._persistent_connection_enabled else self.on_demand_poll_interval
+        return (self._last_confirmation_time is None
+                or self._hass.loop.time() >= self._last_confirmation_time + interval)
+
     def _automatic_poll_due(self) -> bool:
         if self._authentication_failed:
             return False
@@ -526,6 +566,7 @@ class ValveConnection:
             await self.async_set_persistent_connection_enabled(enabled, persist=False)
         self._notify_preferences()
         self._schedule_next_poll()
+        self._recalculate_freshness()
 
     async def async_set_persistent_connection_enabled(self, enabled: bool, *, persist: bool = True) -> None:
         """Enable or disable persistent connections for this valve."""
@@ -539,6 +580,7 @@ class ValveConnection:
                 "Persistent connection requested for valve %s", self._address
             )
             self._persistent_connection_enabled = True
+            self._recalculate_freshness()
             self._notify_preferences()
             self._schedule_next_poll()
             self._cancel_cooldown()
@@ -556,6 +598,7 @@ class ValveConnection:
             "Persistent connection disabled for valve %s", self._address
         )
         self._persistent_connection_enabled = False
+        self._recalculate_freshness()
         self._notify_preferences()
         await self._async_stop_persistent_session()
         self._raise_if_cleanup_pending()
@@ -589,6 +632,7 @@ class ValveConnection:
             value,
         )
         self._persistent_poll_interval = value
+        self._recalculate_freshness()
         self._interval_changed.set()
         self._notify_preferences()
 
@@ -773,6 +817,7 @@ class ValveConnection:
 
         if not self.available:
             return
+        self._freshness.activate()
         if self._automatic_poll_due():
             self._hass.async_create_task(self.async_poll(automatic=True))
 
@@ -947,10 +992,7 @@ class ValveConnection:
                         for packet in self._evb034_session.pending_packets():
                             refreshed = self._handle_evb034_update(packet) or refreshed
                         continue
-                    async with asyncio.timeout(PERSISTENT_EXCHANGE_TIMEOUT_SECONDS):
-                        request_sent, response_received = (
-                            await self._async_session_read(client)
-                        )
+                    request_sent, response_received = await self._async_session_read(client)
                 except asyncio.CancelledError:
                     raise
                 except Evb034ProtocolError as exc:
@@ -1027,9 +1069,23 @@ class ValveConnection:
         task = self._session_read_task
         if task is None or task.done():
             self._session_read_start_revision = self._reading_revision
-            task = asyncio.create_task(self._async_request_dashboard(client))
+            task = asyncio.create_task(self._async_owned_session_read(client))
             self._session_read_task = task
         return await task
+
+    async def _async_owned_session_read(self, client):
+        due = self._reading_attempt_due()
+        try:
+            async with asyncio.timeout(PERSISTENT_EXCHANGE_TIMEOUT_SECONDS):
+                result = await self._async_request_dashboard(client)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._freshness.failed_attempt(due=due)
+            raise
+        if not all(result):
+            self._freshness.failed_attempt(due=due)
+        return result
 
     async def async_refresh(self) -> None:
         """Complete one manual valve refresh, shared by every selected sensor."""
@@ -1057,8 +1113,7 @@ class ValveConnection:
             if self._session_read_task is not None and not self._session_read_task.done():
                 revision = self._session_read_start_revision
             try:
-                async with asyncio.timeout(PERSISTENT_EXCHANGE_TIMEOUT_SECONDS):
-                    sent, received = await self._async_session_read(client)
+                sent, received = await self._async_session_read(client)
             except TimeoutError as exc:
                 raise HomeAssistantError("Persistent valve refresh timed out") from exc
             if not sent or not received:
@@ -1077,6 +1132,7 @@ class ValveConnection:
         """Prevent future polls and wait for any active poll to finish."""
 
         self._unloaded = True
+        self._freshness.close()
         self._persistent_connection_enabled = False
         self._cancel_cooldown()
         if self._due_cancel is not None:
@@ -1163,6 +1219,7 @@ class ValveConnection:
         """Perform a Bluetooth connection cycle for the valve."""
 
         now = dt_util.utcnow()
+        self._freshness.activate()
         if self._authentication_failed:
             return
         next_connection_time = self._next_connection_time
@@ -1180,6 +1237,7 @@ class ValveConnection:
         cleanup_client: BaseBleakClient | None = None
         owner: OwnedBluetoothOperations | None = None
         revision = self._reading_revision
+        due = self._reading_attempt_due()
 
         try:
             advertisement = self._advertisement
@@ -1258,7 +1316,10 @@ class ValveConnection:
         finally:
             if connection_attempted:
                 self._set_connection_cooldown()
-                self._last_attempt_failed = self._reading_revision == revision
+                failed = self._reading_revision == revision
+                self._last_attempt_failed = failed and (due or self._recovery_requested)
+                if failed and not self._unloaded:
+                    self._freshness.failed_attempt(due=due)
                 if owner is not None and owner.client is None:
                     owner.retired = True
                     owner.notifications_enabled = False
@@ -1382,6 +1443,12 @@ class ValveConnection:
     async def _async_fetch_evb034(self, client: BaseBleakClient) -> bool:
         """Identify and authenticate a connection before requesting its readings."""
         self._evb034_packet = None
+        self._evb034_eligible.clear()
+        self._evb034_received_readings.clear()
+        self._evb034_received_times.clear()
+        self._evb034_last_update_time = None
+        self._evb034_published_time = None
+        self._evb034_reading_ready = False
         resolved = await self._async_resolve_request_characteristic(client)
         if resolved is None:
             return False
@@ -1395,7 +1462,11 @@ class ValveConnection:
                 ), "Evb034 write",
             )
 
-        session = Evb034Session(write, size)
+        session = Evb034Session(
+            write, size,
+            on_packet=lambda packet: self._observe_evb034_readings(client, packet),
+            on_failure=lambda error: self._invalidate_evb034_session(client, str(error)),
+        )
         self._evb034_session = session
         self._evb034_client = client
         subscriptions = await self._async_subscribe_to_notifications(
@@ -1460,6 +1531,7 @@ class ValveConnection:
                 and integer(identification, "gbre") != 1
             ):
                 await session.send_command(b'{"gbre":1}')
+            self._evb034_reading_ready = True
             return await self._async_refresh_evb034_dashboard(client, initial=True)
         except (TimeoutError, Evb034ProtocolError) as exc:
             _LOGGER.debug("Evb034 exchange for valve %s failed: %s", self._address, exc)
@@ -1488,12 +1560,17 @@ class ValveConnection:
         session = self._evb034_session
         if session is None or client is not self._evb034_client:
             return False
+        revision = self._reading_revision if initial else self._session_read_start_revision
         async with asyncio.timeout(9):
+            if initial and self._evb034_eligible:
+                return True
+            if self._reading_revision > revision:
+                return True
             if initial and READING_KEYS.intersection(self._evb034_packet):
-                if self._handle_evb034_update(self._evb034_packet):
+                if self._handle_evb034_update(self._evb034_packet) or self._evb034_eligible:
                     return True
             while True:
-                if self._handle_evb034_update(await session.next_packet()):
+                if self._handle_evb034_update(await session.next_packet()) or self._reading_revision > revision:
                     return True
 
     def _handle_evb034_update(self, packet: dict) -> bool:
@@ -1501,8 +1578,14 @@ class ValveConnection:
         if "as" in packet and (type(packet["as"]) is not int or packet["as"] != 2):
             self._device_list_authentication_state = ValveAuthenticationState.UNKNOWN
             raise Evb034ProtocolError("Session lost authentication")
+        if not self._evb034_reading_ready:
+            return False
+        self._observe_evb034_readings(self._evb034_client, packet)
         updated = {**self._evb034_packet, **{key: value for key, value in packet.items()
-                                           if value is not None}}
+                                           if value is not None and key not in READING_KEYS}}
+        # Only explicit valid values received in this session can establish a
+        # baseline. A later invalid/null delta cannot erase an earlier value.
+        updated.update(self._evb034_received_readings)
         firmware = integer(updated, "dlf")
         if firmware is None or not 600 <= firmware <= 9999:
             raise Evb034ProtocolError("Invalid updated firmware identity")
@@ -1513,7 +1596,8 @@ class ValveConnection:
         )
         self._evb034_packet = updated
         self._publish_evb034_metadata()
-        if not READING_KEYS.intersection(packet):
+        received_at = self._evb034_last_update_time
+        if received_at is None or received_at == self._evb034_published_time:
             return False
         data = decode_dashboard(updated, firmware, clack=is_clack)
         if not any(getattr(data, field) is not None for field in (
@@ -1521,13 +1605,67 @@ class ValveConnection:
             "water_hardness", "water_remaining_until_regeneration", "air_recharge",
         )):
             return False
+        self._evb034_eligible.update(
+            key for key, field in READING_FIELDS.items() if getattr(data, field) is not None
+        )
         self._dashboard_data = data
-        times = getattr(packet, "confirmed_at", {})
-        received = [times[key] for key in READING_KEYS.intersection(packet) if key in times]
-        if received:
-            self._record_confirmation(max(received))
+        self._evb034_published_time = received_at
+        self._record_confirmation(received_at)
+        self._freshness.confirm({key: received_at for key in self._evb034_eligible})
         self._notify_dashboard_listeners(data)
         return True
+
+    def _observe_evb034_readings(self, client, packet) -> None:
+        """Keep the selected session-health policy independent of publication."""
+        owner = self._transport
+        if (
+            client is None or client is not self._evb034_client or owner is None
+            or owner.client is not client or owner.expired or owner.retired
+            or self._device_list_authentication_state != ValveAuthenticationState.AUTHENTICATED
+        ):
+            return
+        identity = {**(self._evb034_packet or {}), **{key: value for key, value in packet.items() if value is not None}}
+        firmware = integer(identity, "dlf")
+        if firmware is None or not 600 <= firmware <= 9999:
+            raise Evb034ProtocolError("Invalid updated firmware identity")
+        clack = integer(identity, "dlic")
+        is_clack = clack == 1 if clack in (0, 1) else self._entity_capabilities.is_clack_valve is True
+        times = getattr(packet, "confirmed_at", {})
+        advanced = []
+        for key in valid_reading_keys(packet, firmware, clack=is_clack):
+            received = times.get(key)
+            if received is None or received <= self._evb034_received_times.get(key, float("-inf")):
+                continue
+            self._evb034_received_readings[key] = packet[key]
+            self._evb034_received_times[key] = received
+            advanced.append(received)
+        if advanced:
+            received = max(advanced)
+            self._evb034_last_update_time = max(received, self._evb034_last_update_time or received)
+            if not self._evb034_reading_ready:
+                return
+            # This intentionally confirms session liveness for every known
+            # field; it does not prove that each field's producer is healthy.
+            self._freshness.renew_session(self._evb034_eligible, received)
+            baseline = {**identity, **self._evb034_received_readings}
+            data = decode_dashboard(baseline, firmware, clack=is_clack)
+            eligible = {key for key, field in READING_FIELDS.items() if getattr(data, field) is not None}
+            if eligible - self._evb034_eligible or any(
+                not self._freshness.current(key) for key in self._evb034_eligible
+            ):
+                # First availability and recovery publish the latest snapshot
+                # immediately, so an old value is never briefly resurrected.
+                # The recursive observer sees no new receipt and does nothing.
+                self._handle_evb034_update(packet)
+
+    def _invalidate_evb034_session(self, client, reason: str) -> None:
+        if client is not self._evb034_client:
+            return
+        eligible = set(self._evb034_eligible)
+        self._evb034_reading_ready = False
+        self._evb034_eligible.clear()
+        self._freshness.invalidate(eligible, reason)
+        self._notify_freshness()
 
     def _publish_evb034_metadata(self) -> None:
         """Use validated packet identity without changing the valve's HA identity."""
@@ -1827,6 +1965,17 @@ class ValveConnection:
         owner = self._transport
         if owner is None or owner.client is not client:
             return
+        if (
+            client is self._evb034_client and not owner.expired and not self._unloaded
+            and not self._persistent_connection_enabled and self._evb034_reading_ready
+        ):
+            # Preserve a validated update buffered before a user stops the
+            # healthy session; its receipt time remains the confirmation time.
+            self._handle_evb034_update({})
+        if client is self._evb034_client and (
+            owner.expired or not client.is_connected or self._persistent_connection_enabled
+        ):
+            self._invalidate_evb034_session(client, "session ended without a trusted baseline")
         owner.retired = True
         owner.notifications_enabled = False
 
@@ -2711,6 +2860,7 @@ class ValveConnection:
         self._dashboard_data = dashboard
         if received_at is not None:
             self._record_confirmation(received_at)
+            self._freshness.confirm({key: received_at for key in READINGS})
         self._notify_dashboard_listeners(dashboard)
         return dashboard
 
