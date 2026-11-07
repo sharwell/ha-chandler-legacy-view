@@ -20,6 +20,30 @@ actual C6.x valves, adapters and proxies still require acceptance in #61.
 6. #61: obtain paired app/HA values and live connection/recovery evidence
    from users with the relevant valves and host/proxy combinations.
 
+## Reference review corrections
+
+The follow-up Smali review found six discrepancies in the delivered path.
+Apply these as separate validated corrections, each with its regression tests:
+
+1. Validate a complete notification before considering any shorter CRC match,
+   so a valid identification with counter 5131 can authenticate and read data.
+2. Restart assembly on a valid first marker, including a repeated first chunk
+   after a lost ACK; verify a replacement packet discards the old partial data.
+3. Match notification boundaries and immediately NAK bad CRCs on short frames.
+   Remove speculative callback splitting/joining; preserve actual multi-frame
+   packet assembly and exercise retransmission at the shared GATT boundary.
+4. Publish metadata received while authenticating before deciding whether a
+   Clack-excluded battery command is needed; validate the resulting HA readings.
+5. Ignore JSON nulls before access checks and delta coalescing, retaining both
+   pending readings and confirmed access; preserve real access-loss handling.
+6. Match the C2/C3 status replies and bounded queue recovery in
+   `processStatusPacket`; test wire responses, interrupted commands and cleanup.
+
+The expected result is the existing HA entity coverage with reference-aligned
+notification, recovery and null-update behavior. Each correction must retain
+the earlier regressions. Hardware acceptance remains in #61; simulated success
+does not establish physical release, proxy capacity or real firmware timing.
+
 ## Packet reference
 
 `CsBleViewModel.onBleDeviceFullConnected` sends `EA` before packet exchanges.

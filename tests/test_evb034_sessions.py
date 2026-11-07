@@ -31,6 +31,21 @@ async def test_identifies_newer_valves_with_negotiated_packet_sizes(
     assert not valve.clients[0].is_connected
 
 
+async def test_valid_notification_with_crc_matching_prefix_can_authenticate(
+    connection_factory, bluetooth_io, transport, clock,
+):
+    connection, valve = newer_connection(connection_factory, bluetooth_io, transport, mtu=64)
+    valve.connection_counter = 5131
+    # This complete notification also contains a shorter CRC-valid prefix.
+    # Searching for that prefix truncates valid JSON and prevents all readings.
+    valve.identification_packets.append(frames({"dlf": 622, "dlc": 5131, "as": 1}, 61))
+    await clock.run(connection.async_poll())
+    assert connection.last_success is not None
+    assert connection.evb034_packet["dlc"] == 5131
+    assert connection.evb034_packet["dwu"] == 567
+    assert not connection.authentication_lockout
+
+
 @pytest.mark.parametrize("delivery", ["fragmented", "coalesced", "keepalive"])
 async def test_notification_transport_boundaries_preserve_identification(
     connection_factory, bluetooth_io, transport, clock, delivery,

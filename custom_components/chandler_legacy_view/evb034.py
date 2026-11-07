@@ -289,9 +289,15 @@ class Evb034Session:
         if len(self._wire) > MAX_PACKET_BYTES * 2:
             raise Evb034ProtocolError("Receive limit exceeded")
         while len(self._wire) >= 3:
-            end = next((end for end in range(3, min(len(self._wire), 512) + 1)
-                        if crc_hqx(self._wire[:end - 2], 0xFFFF)
-                        == int.from_bytes(self._wire[end - 2:end], "little")), None)
+            # processDataPacket checks the complete notification's CRC. A
+            # coincidental matching prefix must not truncate a valid frame.
+            if (len(self._wire) <= 512 and crc_hqx(self._wire[:-2], 0xFFFF)
+                    == int.from_bytes(self._wire[-2:], "little")):
+                end = len(self._wire)
+            else:
+                end = next((end for end in range(3, min(len(self._wire), 512) + 1)
+                            if crc_hqx(self._wire[:end - 2], 0xFFFF)
+                            == int.from_bytes(self._wire[end - 2:end], "little")), None)
             if end is None:
                 if len(self._wire) >= self.write_size:
                     self._wire.clear()
