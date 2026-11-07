@@ -67,8 +67,11 @@ the framed outbound queue.
 Identification alone is not a successful Dashboard read. Packet assembly and
 notification callbacks belong to one connection; cancelled work cannot supply
 identification to a replacement connection. Tests cover CRC/JSON rejection,
-fragmentation, coalescing, MTU sizes, bounded ACK/NAK/timeouts and cancellation
-alongside all Evb019 regressions.
+multi-notification packet assembly, MTU sizes, bounded ACK/NAK/timeouts and
+cancellation alongside all Evb019 regressions. Each notification is one CRC
+frame, as in `processDataPacket`; a bad short frame immediately receives NAK
+without discarding earlier good chunks. Splitting or joining ATT notification
+values is not a supported transport behavior.
 
 ## Authentication and recovery
 

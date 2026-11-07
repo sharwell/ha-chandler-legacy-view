@@ -46,17 +46,13 @@ async def test_valid_notification_with_crc_matching_prefix_can_authenticate(
     assert not connection.authentication_lockout
 
 
-@pytest.mark.parametrize("delivery", ["fragmented", "coalesced", "keepalive"])
+@pytest.mark.parametrize("delivery", ["chunks", "keepalive"])
 async def test_notification_transport_boundaries_preserve_identification(
     connection_factory, bluetooth_io, transport, clock, delivery,
 ):
     connection, valve = newer_connection(connection_factory, bluetooth_io, transport)
     reply = frames({"dlf": 622, "dlc": 91})
-    if delivery == "fragmented":
-        reply = [part for frame in reply for part in (frame[:4], frame[4:])]
-    elif delivery == "coalesced":
-        reply = [b"".join(reply)]
-    else:
+    if delivery == "keepalive":
         reply = [b"\xe0", *reply, b"\xc2"]
     valve.identification_packets.append(reply)
     await clock.run(connection.async_poll())
@@ -108,6 +104,39 @@ async def test_valid_first_marker_restarts_identification_assembly(
     assert connection.evb034_packet["dwu"] == 567
     assert "obsolete" not in connection.evb034_packet
     assert not connection.authentication_lockout
+
+
+@pytest.mark.parametrize("mtu", [23, 64, 247])
+async def test_corrupted_short_last_notification_can_be_retransmitted(
+    connection_factory, bluetooth_io, transport, clock, mtu,
+):
+    connection, valve = newer_connection(connection_factory, bluetooth_io, transport, mtu)
+    reply = frames({"dlf": 622, "dlc": 23, "as": 1, "gbre": 1}, mtu - 3)
+    assert len(reply[-1]) < mtu - 3
+    damaged = reply[-1][:-1] + bytes((reply[-1][-1] ^ 1,))
+    # A bad short last chunk must be NAKed without losing earlier good chunks.
+    valve.identification_packets.append([*reply[:-1], damaged, reply[-1]])
+    await clock.run(connection.async_poll())
+    assert connection.last_success is not None
+    assert connection.evb034_packet["dwu"] == 567
+    assert b"\xc8" in [payload for _, payload in valve.writes]
+    assert not connection.authentication_lockout
+
+
+@pytest.mark.parametrize("delivery", ["split", "joined"])
+async def test_invalid_notification_boundaries_cannot_supply_identification(
+    connection_factory, bluetooth_io, transport, clock, delivery,
+):
+    connection, valve = newer_connection(connection_factory, bluetooth_io, transport)
+    reply = frames({"dlf": 622, "dlc": 23, "as": 1})
+    malformed = ([part for frame in reply for part in (frame[:4], frame[4:])]
+                 if delivery == "split" else [b"".join(reply)])
+    valve.identification_packets.append(malformed)
+    await clock.run(connection.async_poll())
+    assert connection.last_success is None
+    assert connection.evb034_packet is None
+    assert b"\xc8" in [payload for _, payload in valve.writes]
+    assert not valve.clients[0].is_connected
 
 
 @pytest.mark.parametrize("replies,successful", [([b"\xc8", b"\xcc"], True), ([b"\xc8"] * 2, False)])

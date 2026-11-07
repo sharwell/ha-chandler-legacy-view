@@ -65,8 +65,14 @@ async def test_duplicate_initial_auth_state_is_not_a_response_to_the_pin_write(
     initial = frames({"dlf": 622, "dlc": 23, "as": 1, "gbre": 1})
     # Both messages were delivered before the PIN write. The second queued
     # state must not be counted as a credential rejection after that write.
-    valve.identification_packets.append([b"".join(initial + frames({"as": 1}))])
-    await clock.run(connection.async_poll())
+    gate = valve.operations["identify"].block()
+    valve.identification_packets.append([])
+    poll = asyncio.create_task(connection.async_poll())
+    await clock.run(gate.started.wait())
+    for frame in initial + frames({"as": 1}):
+        valve.clients[0].notify(frame)
+    gate.release.set()
+    await clock.run(poll)
     assert connection.last_success is not None
     assert len(valve.authentication_payloads) == 1
     assert hass.states.get(lockout).state == "off"

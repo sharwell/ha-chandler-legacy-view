@@ -73,7 +73,6 @@ class Evb034Session:
         self._failure: Exception | None = None
         self._reader: asyncio.Task | None = None
         self._buffer: bytearray | None = None
-        self._wire = bytearray()
 
     def notification(self, _sender, data: bytearray) -> None:
         """Ignore callbacks after this client relinquishes ownership."""
@@ -124,7 +123,6 @@ class Evb034Session:
             self._reader = None
         self._packets.clear()
         self._acks.clear()
-        self._wire.clear()
         self._buffer = None
         while not self._queue.empty():
             self._queue.get_nowait()
@@ -249,7 +247,7 @@ class Evb034Session:
         try:
             while not self._closed and self._failure is None:
                 try:
-                    if self._wire or self._buffer is not None:
+                    if self._buffer is not None:
                         async with asyncio.timeout(TIMEOUT):
                             serial, data = await self._queue.get()
                     else:
@@ -271,7 +269,7 @@ class Evb034Session:
     async def _process_notification(self, data: bytes, serial: int) -> None:
         if not data:
             raise Evb034ProtocolError("Empty notification")
-        if not self._wire and len(data) == 1:
+        if len(data) == 1:
             if data in (ACK, NAK):
                 if len(self._acks) >= 16:
                     raise Evb034ProtocolError("Status queue full")
@@ -285,48 +283,33 @@ class Evb034Session:
                 if data == b"\xc2":
                     await self._send(b"\xc3")
                 return
-        self._wire.extend(data)
-        if len(self._wire) > MAX_PACKET_BYTES * 2:
-            raise Evb034ProtocolError("Receive limit exceeded")
-        while len(self._wire) >= 3:
-            # processDataPacket checks the complete notification's CRC. A
-            # coincidental matching prefix must not truncate a valid frame.
-            if (len(self._wire) <= 512 and crc_hqx(self._wire[:-2], 0xFFFF)
-                    == int.from_bytes(self._wire[-2:], "little")):
-                end = len(self._wire)
-            else:
-                end = next((end for end in range(3, min(len(self._wire), 512) + 1)
-                            if crc_hqx(self._wire[:end - 2], 0xFFFF)
-                            == int.from_bytes(self._wire[end - 2:end], "little")), None)
-            if end is None:
-                if len(self._wire) >= self.write_size:
-                    self._wire.clear()
-                    await self._send(NAK)
-                return
-            frame = bytes(self._wire[:end])
-            del self._wire[:end]
-            header = frame[0]
-            if header not in (0, 0x40, 0x80, 0xC0):
-                raise Evb034ProtocolError("Invalid data flags")
-            if header & 0x80:
-                # processDataPacket resets the receive buffer on every first
-                # marker, including a retransmission after an ACK was lost.
-                self._buffer = bytearray()
-            if self._buffer is None:
-                await self._send(NAK)
-                raise Evb034ProtocolError("Chunk without first marker")
-            self._buffer.extend(frame[1:-2])
-            if len(self._buffer) > MAX_PACKET_BYTES:
-                raise Evb034ProtocolError("Packet assembly limit exceeded")
-            if header & 0x40:
-                raw = bytes(self._buffer)
-                self._buffer = None
-                try:
-                    packet = json.loads(raw, object_pairs_hook=_unique_object,
-                                        parse_constant=_reject_constant)
-                except (ValueError, UnicodeError) as exc:
-                    raise Evb034ProtocolError("Invalid JSON packet") from exc
-                if not isinstance(packet, dict) or not packet:
-                    raise Evb034ProtocolError("Expected nonempty JSON object")
-                self._publish_packet(packet, serial)
-            await self._send(ACK)
+        # processDataPacket validates each complete ATT notification, including
+        # a short final chunk. Invalid bytes never spill into the next frame.
+        if (not 3 <= len(data) <= 512 or crc_hqx(data[:-2], 0xFFFF)
+                != int.from_bytes(data[-2:], "little")):
+            await self._send(NAK)
+            return
+        header = data[0]
+        if header not in (0, 0x40, 0x80, 0xC0):
+            raise Evb034ProtocolError("Invalid data flags")
+        if header & 0x80:
+            # A first marker restarts assembly, including retransmissions.
+            self._buffer = bytearray()
+        if self._buffer is None:
+            await self._send(NAK)
+            raise Evb034ProtocolError("Chunk without first marker")
+        self._buffer.extend(data[1:-2])
+        if len(self._buffer) > MAX_PACKET_BYTES:
+            raise Evb034ProtocolError("Packet assembly limit exceeded")
+        if header & 0x40:
+            raw = bytes(self._buffer)
+            self._buffer = None
+            try:
+                packet = json.loads(raw, object_pairs_hook=_unique_object,
+                                    parse_constant=_reject_constant)
+            except (ValueError, UnicodeError) as exc:
+                raise Evb034ProtocolError("Invalid JSON packet") from exc
+            if not isinstance(packet, dict) or not packet:
+                raise Evb034ProtocolError("Expected nonempty JSON object")
+            self._publish_packet(packet, serial)
+        await self._send(ACK)
