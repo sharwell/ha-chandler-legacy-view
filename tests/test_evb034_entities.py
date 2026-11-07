@@ -4,6 +4,7 @@ from datetime import datetime
 import pytest
 
 from homeassistant.const import EVENT_STATE_CHANGED
+from homeassistant.core import callback
 from homeassistant.helpers import entity_registry as er, device_registry as dr
 from homeassistant.util import dt as dt_util
 from custom_components.chandler_legacy_view.const import DOMAIN, DATA_CONNECTION_MANAGER
@@ -106,9 +107,14 @@ async def test_persistent_partial_updates_retain_session_values_but_reconnect_do
     _, connection, valve = await setup_readings(hass, entry_factory, runtime_factory, bluetooth_io, transport)
     usage = sensor_id(hass, "water_usage_today")
     sequence = []
-    remove = hass.bus.async_listen(EVENT_STATE_CHANGED, lambda event:
-        sequence.append(event.data["new_state"].state)
-        if event.data["entity_id"] == usage and event.data["new_state"] else None)
+    # Executor callbacks can complete out of order even after HA drains them.
+    # Capture on the event loop to preserve the published reading sequence.
+    @callback
+    def record_usage_change(event):
+        if event.data["entity_id"] == usage and event.data["new_state"] is not None:
+            sequence.append(event.data["new_state"].state)
+
+    remove = hass.bus.async_listen(EVENT_STATE_CHANGED, record_usage_change)
     await connection.async_set_persistent_connection_enabled(True)
     valve.dashboards.extend([frames({"dwu": 12300, "gpf": 150}), frames({"dwu": 45600}), frames({"gpf": 275})])
     try:

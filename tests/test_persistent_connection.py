@@ -3,6 +3,7 @@
 import asyncio
 import pytest
 from homeassistant.const import EVENT_STATE_CHANGED
+from homeassistant.core import callback
 from homeassistant.helpers import entity_registry as er
 from custom_components.chandler_legacy_view.const import DOMAIN
 from ble import NOTIFY
@@ -22,9 +23,14 @@ async def test_persistent_refreshes_publish_new_readings_on_same_session(hass, r
     valve = transport.valve()
     valve.dashboards.extend(dashboard_frames(gallons=reading) for reading in (123, 456, 789))
     published = []
-    remove = hass.bus.async_listen(EVENT_STATE_CHANGED, lambda event:
-        published.append(event.data["new_state"].state)
-        if event.data["entity_id"] == usage and event.data["new_state"] else None)
+    # Unmarked synchronous listeners run in HA's executor and can lag behind
+    # the state checks below. Record the ordered events on the event loop.
+    @callback
+    def record_usage_change(event):
+        if event.data["entity_id"] == usage and event.data["new_state"] is not None:
+            published.append(event.data["new_state"].state)
+
+    remove = hass.bus.async_listen(EVENT_STATE_CHANGED, record_usage_change)
     try:
         await hass.services.async_call("switch", "turn_on", {"entity_id": persistent}, blocking=True)
         await hass.async_start()

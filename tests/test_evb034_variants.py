@@ -4,6 +4,7 @@ from datetime import datetime
 import pytest
 
 from homeassistant.const import EVENT_STATE_CHANGED
+from homeassistant.core import callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 from custom_components.chandler_legacy_view.const import DOMAIN
@@ -81,9 +82,14 @@ async def test_confirmed_variant_survives_advertisements_and_partial_packet_upda
     battery = sensor_id(hass, "battery")
     hardness = sensor_id(hass, "water_hardness")
     published = []
-    remove = hass.bus.async_listen(EVENT_STATE_CHANGED, lambda event:
-        published.append(event.data["new_state"].state)
-        if event.data["entity_id"] == battery and event.data["new_state"] else None)
+    # Record on the event loop so a delayed executor callback cannot hide
+    # an incorrect availability transition from the assertions below.
+    @callback
+    def record_battery_change(event):
+        if event.data["entity_id"] == battery and event.data["new_state"] is not None:
+            published.append(event.data["new_state"].state)
+
+    remove = hass.bus.async_listen(EVENT_STATE_CHANGED, record_battery_change)
     try:
         for observation in ({"payload": EVB034_622}, {"manufacturer_data": {}}):
             bluetooth_io.advertise(**observation)
