@@ -177,6 +177,9 @@ class Client:
         if self.valve.firmware_version is not None and self.valve.firmware_version >= 600:
             await self.write_evb034(payload)
             return
+        if payload == b"\xea":
+            # Evb019 firmware does not understand the newer-family probe.
+            return
         if payload[:4] == b"ttPA":
             operation = "authenticate"
             self.valve.authentication_payloads.append(payload)
@@ -205,6 +208,9 @@ class Client:
             self.notify(packet)
 
     async def write_evb034(self, payload):
+        if payload in (b"t" * 20, b"u" * 20, b"r" * 20):
+            # A partial advertisement can initially select the legacy probe.
+            return
         if payload == b"\xea":
             await self.valve.operations["identify"].run()
             self.notify(self.valve.id_acknowledgements.popleft()
@@ -236,7 +242,7 @@ class Client:
             await self.valve.operations["device_list"].run()
             default = {"dlf": self.valve.firmware_version, "dlc": self.connection_counter,
                        "as": 1 if self.valve.authentication_required else 2,
-                       "dlvt": 1, "dli": False, "dlic": False}
+                       "dlvt": 1, "dli": 0, "dlic": 0, "gbre": 1}
             self.challenge = self.connection_counter
             replies = (self.valve.identification_packets.popleft()
                        if self.valve.identification_packets else frames(default, self.mtu_size - 3))
@@ -246,6 +252,8 @@ class Client:
             replies = ((self.valve.dashboards.popleft() if self.valve.dashboards
                         else frames({"dwu": 567}, self.mtu_size - 3))
                        if self.dashboard_access else [])
+        elif request == b'{"gbre":1}':
+            replies = frames({"gbre": 1}, self.mtu_size - 3)
         elif len(request) == 20:
             await self.valve.operations["authenticate"].run()
             self.valve.authentication_payloads.append(request)

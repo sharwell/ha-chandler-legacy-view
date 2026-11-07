@@ -40,6 +40,7 @@ from .device_registry import async_update_device_serial_number
 from .discovery import ValveDiscoveryChange, ValveDiscoveryManager, _map_valve_type
 from .models import ValveAdvertisement, ValveCapabilities, ValveDashboardData
 from .evb034 import Evb034ProtocolError, Evb034Session
+from .evb034_data import READING_KEYS, decode_dashboard, integer
 from .protocol_compatibility import (
     PreviousProtocol,
     password_digits,
@@ -237,6 +238,7 @@ class ValveConnection:
         config_entry_id: str,
         passcode_getter: Callable[[str], ValvePasscodeConfiguration] | None = None,
         connection_state_callback: Callable[[str, bool], None] | None = None,
+        metadata_callback: Callable[[ValveAdvertisement], None] | None = None,
     ) -> None:
         """Initialize the valve connection handler."""
 
@@ -271,6 +273,7 @@ class ValveConnection:
         self._authentication_listeners: list[Callable[[bool], None]] = []
         self._passcode_getter = passcode_getter
         self._connection_state_callback = connection_state_callback
+        self._metadata_callback = metadata_callback
         self._crc8 = _ChandlerCrc8()
         self._previous_protocol = PreviousProtocol()
         self._persistent_connection_enabled = False
@@ -976,6 +979,8 @@ class ValveConnection:
             )
 
         request_sent, response_received = await self._async_request_device_list(client)
+        if model is None and not manufacturer_data_complete and not response_received:
+            return await self._async_fetch_evb034(client)
         if not request_sent:
             _LOGGER.debug(
                 "Unable to send DeviceList request to valve %s; will retry on next poll",
@@ -1084,6 +1089,7 @@ class ValveConnection:
                 return False
             identification = await session.identify()
             self._evb034_packet = identification
+            self._publish_evb034_metadata()
             passcode = self.get_configured_passcode()
             self._reset_authentication_failure_if_needed(passcode)
             if self._authentication_failed:
@@ -1110,6 +1116,11 @@ class ValveConnection:
                 self._evb034_packet.update(reply)
             self._set_authentication_failed(False)
             self._device_list_authentication_state = ValveAuthenticationState.AUTHENTICATED
+            if identification.get("dlic") != 1 and identification.get("gbre") != 1:
+                reply = await session.request(b'{"gbre":1}')
+                if "as" in reply and (type(reply["as"]) is not int or reply["as"] != 2):
+                    return False
+                self._evb034_packet.update(reply)
             return await self._async_refresh_evb034_dashboard(client)
         except (TimeoutError, Evb034ProtocolError) as exc:
             _LOGGER.debug("Evb034 exchange for valve %s failed: %s", self._address, exc)
@@ -1140,10 +1151,64 @@ class ValveConnection:
         if "as" in packet and (type(packet["as"]) is not int or packet["as"] != 2):
             self._device_list_authentication_state = ValveAuthenticationState.UNKNOWN
             return False
-        if not any(key.startswith("d") and not key.startswith("dl") for key in packet):
+        if not READING_KEYS.intersection(packet):
             return False
-        self._evb034_packet.update(packet)
+        updated = {**self._evb034_packet, **{key: value for key, value in packet.items()
+                                           if value is not None}}
+        firmware = integer(updated, "dlf")
+        if firmware is None or not 600 <= firmware <= 9999:
+            raise Evb034ProtocolError("Invalid updated firmware identity")
+        data = decode_dashboard(updated, firmware, clack=updated.get("dlic") == 1)
+        if not any(getattr(data, field) is not None for field in (
+            "time_hour", "battery_capacity", "present_flow", "water_usage", "peak_flow",
+            "water_hardness", "water_remaining_until_regeneration", "air_recharge",
+        )):
+            return False
+        self._evb034_packet = updated
+        self._publish_evb034_metadata()
+        self._dashboard_data = data
+        self._notify_dashboard_listeners(data)
         return True
+
+    def _publish_evb034_metadata(self) -> None:
+        """Use validated packet identity without changing the valve's HA identity."""
+        packet, advertisement = self._evb034_packet, self._advertisement
+        if packet is None or advertisement is None:
+            return
+        firmware = integer(packet, "dlf")
+        if firmware is None or firmware < 600:
+            return
+        updates = {"model": "Evb034", "firmware_version": firmware,
+                   "firmware_major": firmware // 100, "firmware_minor": firmware % 100}
+        valve_type = integer(packet, "dlvt")
+        twin = integer(packet, "dli")
+        if valve_type is not None:
+            updates.update(valve_type_full=valve_type,
+                           valve_type=_map_valve_type(valve_type, packet.get("dlic") == 1))
+        if twin in (0, 1):
+            updates["is_twin_valve"] = bool(twin)
+        series = integer(packet, "dlvs")
+        if series is not None:
+            updates["valve_series_version"] = series
+        status = integer(packet, "gvs")
+        if status is not None and status <= 255:
+            updates.update(valve_status=status, salt_sensor_status=int(bool(status & 0x80)),
+                           water_status=int(bool(status & 0x40)), bypass_status=int(bool(status & 0x20)))
+        self._advertisement = replace(advertisement, **updates)
+        self._update_entity_capabilities(
+            valve_type=updates.get("valve_type"), is_twin_valve=updates.get("is_twin_valve")
+        )
+        serial_a, serial_b = packet.get("dlsa"), packet.get("dlsb")
+        if all(type(value) is int and 0 <= value <= 0x7FFFFFFFFFFFFFFF
+               for value in (serial_a, serial_b)) and (serial_a or serial_b):
+            serial = f"{serial_a:X}{serial_b:X}"
+            if serial != self._serial_number:
+                self._serial_number = serial
+                async_update_device_serial_number(
+                    self._hass, self._config_entry_id, self._address, serial
+                )
+        if self._metadata_callback is not None:
+            self._metadata_callback(self._advertisement)
 
     @staticmethod
     def _create_request_payload(request: ValveRequestCommand | int) -> bytes:
@@ -2724,6 +2789,7 @@ class ValveConnectionManager:
                 self._config_entry.entry_id,
                 self.get_passcode,
                 self._discovery_manager.async_set_connection_state,
+                self._discovery_manager.async_set_device_metadata,
             )
             self._connections[advertisement.address] = connection
         connection.update_from_advertisement(advertisement)

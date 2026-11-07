@@ -7,6 +7,16 @@ from homeassistant.helpers import device_registry as dr
 from .const import DOMAIN
 
 
+def async_update_device_model(
+    hass: HomeAssistant, config_entry_id: str, address: str, model: str | None,
+) -> None:
+    """Update a model learned from active identification for its owning entry."""
+    registry = dr.async_get(hass)
+    device = registry.async_get_device_by_identifier((DOMAIN, address), config_entry_id)
+    if device is not None and device.model != model:
+        registry.async_update_device(device.id, model=model)
+
+
 def async_update_device_serial_number(
     hass: HomeAssistant,
     config_entry_id: str,

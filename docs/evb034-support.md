@@ -57,6 +57,28 @@ changing configured credentials permits a new attempt. Reconnect always
 identifies and authenticates again. Persistent polling retains the same
 owning session, and teardown invalidates callbacks before disconnecting.
 
+## Existing entity readings
+
+`CsBlePacket$Companion.updatePacket/getFloatDivisor` divides present flow
+(`gpf`) and daily peak flow (`dpfd`) by 100 on all C6.x versions. Usage
+(`dwu`) and remaining water (`dtgr`) use divisor 1 before C6.11 and 100 from
+C6.11 onward; remaining water is truncated to integer gallons. Hardness
+(`dwh`) is unscaled. `CsDashboardFragment.updateRegenOptionsEvb034` uses
+current day countdown `dcdo`, independently of configured frequency `ddo`.
+
+`CsBlePacket.getFullTimeString` changes from hours plus AM/PM to a 24-hour
+field at C6.09. This boundary is distinct from the C6.11 volume boundary.
+Battery `dbl` is millivolts, converted with the reference's piecewise curve.
+`processPacketEvb034` enables battery sampling with `gbre=1` on non-Clack
+valves when it is not already enabled.
+
+Absent or invalid readings remain unknown. Null/omitted updates preserve
+values already received in the same session, matching the reference's packet
+updates; a replacement session does not borrow missing readings from its
+predecessor. Validated identification can recover model, type, firmware,
+series and concatenated hexadecimal serial fields `dlsa`/`dlsb` after partial
+startup, preserving the address-based HA device and entity identities.
+
 ## Protocol limitations and remaining evidence
 
 The reference's chunks have no sequence number, message ID or payload length.

@@ -242,6 +242,8 @@ class ValveTimeOfDaySensor(ValveDashboardSensor):
             return None
         hour_value = dashboard.time_hour
         minute = dashboard.time_minute
+        if hour_value is None or minute is None or dashboard.is_pm is None:
+            return None
         if hour_value < 0 or minute < 0 or minute >= 60:
             return None
 
