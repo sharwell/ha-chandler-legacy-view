@@ -7,6 +7,7 @@ from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.service import BleakGATTService, BleakGATTServiceCollection
 
 from packets import dashboard_frames, device_list_frame
+from evb034_packets import crc16, frames
 
 SERVICE = "00001000-0000-1000-8000-00805f9b34fb"
 WRITE = "00001001-0000-1000-8000-00805f9b34fb"
@@ -82,8 +83,13 @@ class Valve:
         self.dashboard_requests = 0
         self.writes = []
         self.clients = []
+        self.mtu_size = 23
+        self.identification_packets = deque()
+        self.chunk_acknowledgements = deque()
+        self.id_acknowledgements = deque()
+        self.packet_requests = []
         self.operations = {name: Operation() for name in
-                           ("connect", "device_list", "authenticate", "dashboard", "reset", "disconnect")}
+                           ("connect", "identify", "device_list", "authenticate", "dashboard", "reset", "disconnect")}
 
     def authenticated(self, counter=23):
         self.device_lists.append([device_list_frame(status=0, counter=counter)])
@@ -100,6 +106,8 @@ class Client:
         self.connection_counter = valve.connection_counter
         valve.connection_counter = (valve.connection_counter + 1) & 255
         self.challenge = None
+        self.mtu_size = valve.mtu_size
+        self.packet_buffer = bytearray()
         self.dashboard_access = not valve.authentication_required
         # These Bleak data objects perform no host I/O. Keep the real service
         # representation so polling cannot rely on a test-only list contract.
@@ -166,6 +174,9 @@ class Client:
         assert uuid == WRITE and response
         payload = bytes(payload)
         self.valve.writes.append((self, payload))
+        if self.valve.firmware_version is not None and self.valve.firmware_version >= 600:
+            await self.write_evb034(payload)
+            return
         if payload[:4] == b"ttPA":
             operation = "authenticate"
             self.valve.authentication_payloads.append(payload)
@@ -190,6 +201,45 @@ class Client:
         else:
             raise AssertionError(f"Unexpected outbound command {payload[:2].hex()}")
         await self.valve.operations[operation].run()
+        for packet in replies:
+            self.notify(packet)
+
+    async def write_evb034(self, payload):
+        if payload == b"\xea":
+            await self.valve.operations["identify"].run()
+            self.notify(self.valve.id_acknowledgements.popleft()
+                        if self.valve.id_acknowledgements else b"\xcc")
+            return
+        if payload in (b"\xcc", b"\xc8", b"\xe0", b"\xf0", b"\xc3"):
+            return
+        if payload == b"\xc2":
+            self.notify(b"\xc3")
+            return
+        assert len(payload) <= self.mtu_size - 3
+        assert int.from_bytes(payload[-2:], "little") == crc16(payload[:-2])
+        ack = (self.valve.chunk_acknowledgements.popleft()
+               if self.valve.chunk_acknowledgements else b"\xcc")
+        if ack != b"\xcc":
+            if ack:
+                self.notify(ack)
+            return
+        if payload[0] & 0x80:
+            self.packet_buffer.clear()
+        self.packet_buffer.extend(payload[1:-2])
+        self.notify(ack)
+        if not payload[0] & 0x40:
+            return
+        request = bytes(self.packet_buffer)
+        self.packet_buffer.clear()
+        self.valve.packet_requests.append(request)
+        if request == b"t" * 20:
+            await self.valve.operations["device_list"].run()
+            default = {"dlf": self.valve.firmware_version, "dlc": self.connection_counter,
+                       "as": 1, "dlvt": 1, "dli": False, "dlic": False}
+            replies = (self.valve.identification_packets.popleft()
+                       if self.valve.identification_packets else frames(default, self.mtu_size - 3))
+        else:
+            raise AssertionError(f"Unexpected packet request {request!r}")
         for packet in replies:
             self.notify(packet)
 

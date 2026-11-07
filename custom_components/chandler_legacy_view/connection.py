@@ -39,6 +39,7 @@ from .const import (
 from .device_registry import async_update_device_serial_number
 from .discovery import ValveDiscoveryChange, ValveDiscoveryManager, _map_valve_type
 from .models import ValveAdvertisement, ValveCapabilities, ValveDashboardData
+from .evb034 import Evb034ProtocolError, Evb034Session
 from .protocol_compatibility import (
     PreviousProtocol,
     password_digits,
@@ -277,6 +278,13 @@ class ValveConnection:
         self._persistent_task: asyncio.Task[None] | None = None
         self._pending_persistent_client: BaseBleakClient | None = None
         self._persistent_stop_task: asyncio.Task[None] | None = None
+        self._evb034_session: Evb034Session | None = None
+        self._evb034_packet: dict | None = None
+
+    @property
+    def evb034_packet(self) -> dict | None:
+        """Return a copy of the latest validated packet, without wire credentials."""
+        return dict(self._evb034_packet) if self._evb034_packet is not None else None
 
     @property
     def address(self) -> str:
@@ -948,6 +956,9 @@ class ValveConnection:
         model = advertisement.model
         manufacturer_data_complete = advertisement.manufacturer_data_complete
 
+        if model == "Evb034":
+            return await self._async_fetch_evb034(client)
+
         if model not in (None, "Evb019"):
             _LOGGER.debug(
                 "Connected to valve %s (%s); requests are only defined for Evb019 valves",
@@ -1044,6 +1055,40 @@ class ValveConnection:
                 self._address,
             )
         return dashboard_response_received
+
+    async def _async_fetch_evb034(self, client: BaseBleakClient) -> bool:
+        """Identify a C6.x session; authentication and readings follow separately."""
+        self._evb034_packet = None
+        resolved = await self._async_resolve_request_characteristic(client)
+        if resolved is None:
+            return False
+        uuid, properties = resolved
+        size = min(512, max(20, getattr(client, "mtu_size", 23) - 3))
+
+        async def write(payload: bytes) -> None:
+            await client.write_gatt_char(
+                uuid, payload, response="write_without_response" not in properties
+            )
+
+        session = Evb034Session(write, size)
+        self._evb034_session = session
+        subscriptions = await self._async_subscribe_to_notifications(
+            client, session.notification
+        )
+        try:
+            if not subscriptions:
+                return False
+            self._evb034_packet = await session.identify()
+            # A validated identification is not a successful Dashboard poll.
+            return False
+        except (TimeoutError, Evb034ProtocolError) as exc:
+            _LOGGER.debug("Evb034 exchange for valve %s failed: %s", self._address, exc)
+            return False
+        finally:
+            session.close()
+            await self._async_unsubscribe_notifications(client, subscriptions)
+            if self._evb034_session is session:
+                self._evb034_session = None
 
     @staticmethod
     def _create_request_payload(request: ValveRequestCommand | int) -> bytes:
