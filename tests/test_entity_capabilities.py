@@ -12,6 +12,7 @@ import logging
 
 import pytest
 from homeassistant.const import EVENT_STATE_CHANGED
+from homeassistant.core import callback
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 
 from custom_components.chandler_legacy_view.const import DATA_CONNECTION_MANAGER, DOMAIN
@@ -197,9 +198,14 @@ async def test_partial_updates_and_empty_fields_cannot_erase_confirmed_support(
     remaining = identifiers["soft_water_remaining"]
     assert hass.states.get(remaining).state == "unavailable"
     published = []
-    remove = hass.bus.async_listen(EVENT_STATE_CHANGED, lambda event:
-        published.append(event.data["new_state"].state)
-        if event.data["entity_id"] == remaining and event.data["new_state"] else None)
+    # Record on the event loop so a delayed executor callback cannot hide
+    # an incorrect availability transition from the assertions below.
+    @callback
+    def record_remaining_change(event):
+        if event.data["entity_id"] == remaining and event.data["new_state"] is not None:
+            published.append(event.data["new_state"].state)
+
+    remove = hass.bus.async_listen(EVENT_STATE_CHANGED, record_remaining_change)
     try:
         # Discovery merges the older metered advertisement into a short status
         # update. It must not override the newer non-metered DeviceList result.
