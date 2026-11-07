@@ -26,6 +26,7 @@ from homeassistant.helpers.event import async_call_later, async_track_time_inter
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    BLE_OPERATION_TIMEOUT_SECONDS,
     CONF_DEFAULT_PASSCODE,
     CONF_DEVICE_PASSCODES,
     CONNECTION_MIN_RETRY_INTERVAL,
@@ -35,7 +36,10 @@ from .const import (
     DEFAULT_VALVE_PASSCODE,
     MAX_PERSISTENT_POLL_INTERVAL_SECONDS,
     MIN_PERSISTENT_POLL_INTERVAL_SECONDS,
+    POLL_EXCHANGE_TIMEOUT_SECONDS,
+    PERSISTENT_EXCHANGE_TIMEOUT_SECONDS,
 )
+from .ble_operations import OwnedBluetoothOperations
 from .device_registry import async_update_device_serial_number
 from .discovery import ValveDiscoveryChange, ValveDiscoveryManager, _map_valve_type
 from .models import ValveAdvertisement, ValveCapabilities, ValveDashboardData
@@ -285,6 +289,46 @@ class ValveConnection:
         self._evb034_client: BaseBleakClient | None = None
         self._evb034_subscriptions: list[str] = []
         self._evb034_packet: dict | None = None
+        self._transport: OwnedBluetoothOperations | None = None
+
+    @property
+    def cleanup_pending(self) -> bool:
+        """Report an old owner whose external work/release is not confirmed."""
+
+        owner = self._transport
+        return owner is not None and owner.retired and not owner.released
+
+    def _transport_changed(self) -> None:
+        """Reap an expired owner only after every external operation settles."""
+
+        owner = self._transport
+        if owner is None or not owner.retired:
+            return
+        if owner.released:
+            self._transport = None
+            if owner.expired and self.available:
+                # A late I/O completion may make safe recovery possible without
+                # another advertisement. The normal cooldown still applies.
+                self._hass.loop.call_soon(self.schedule_poll)
+        elif owner.client is not None and owner.cleanup_task is None:
+            # A cancelled connection attempt can still return a live client.
+            # It belongs to the old generation and must never be published.
+            self._hass.loop.create_task(self._async_disconnect_client(owner.client))
+
+    async def _async_client_operation(
+        self, client, awaitable, description, *,
+        timeout=BLE_OPERATION_TIMEOUT_SECONDS, cleanup=False,
+    ):
+        owner = self._transport
+        if owner is None or owner.client is not client or (owner.expired and not cleanup):
+            if inspect.iscoroutine(awaitable):
+                awaitable.close()
+            raise TimeoutError("Bluetooth generation is no longer usable")
+        try:
+            return await owner.run(awaitable, timeout)
+        except TimeoutError:
+            _LOGGER.warning("Timed out waiting for %s on valve %s", description, self._address)
+            raise
 
     @property
     def evb034_packet(self) -> dict | None:
@@ -794,13 +838,19 @@ class ValveConnection:
                         if refreshed:
                             self._last_success = dt_util.utcnow()
                         continue
-                    request_sent, response_received = (
-                        await self._async_request_dashboard(client)
-                    )
+                    async with asyncio.timeout(PERSISTENT_EXCHANGE_TIMEOUT_SECONDS):
+                        request_sent, response_received = (
+                            await self._async_request_dashboard(client)
+                        )
                 except asyncio.CancelledError:
                     raise
                 except Evb034ProtocolError as exc:
                     _LOGGER.debug("Evb034 stream for valve %s ended: %s", self._address, exc)
+                    break
+                except TimeoutError:
+                    if self._transport is not None:
+                        self._transport.invalidate()
+                    _LOGGER.warning("Persistent read timed out for valve %s", self._address)
                     break
                 except Exception:  # pragma: no cover - unexpected protocol errors
                     _LOGGER.exception(
@@ -816,6 +866,8 @@ class ValveConnection:
                     )
                     break
 
+                if self._transport is None or self._transport.expired:
+                    break
                 if response_received:
                     self._last_success = dt_util.utcnow()
                 else:
@@ -877,6 +929,14 @@ class ValveConnection:
             return
 
         async with self._lock:
+            owner = self._transport
+            if owner is not None and owner.retired:
+                if not owner.pending and owner.client is not None:
+                    await self._async_disconnect_client(owner.client)
+                self._transport_changed()
+                if self._transport is not None:
+                    _LOGGER.debug("Skipping poll for %s; old Bluetooth work is quarantined", self._address)
+                    return
             await self._async_poll_locked()
 
     async def _async_poll_locked(self) -> None:
@@ -896,6 +956,7 @@ class ValveConnection:
 
         connection_attempted = False
         cleanup_client: BaseBleakClient | None = None
+        owner: OwnedBluetoothOperations | None = None
 
         try:
             advertisement = self._advertisement
@@ -921,14 +982,17 @@ class ValveConnection:
             connection_attempted = True
             self._cancel_cooldown()
             self._reset_device_list_state()
+            owner = OwnedBluetoothOperations(self._transport_changed)
+            self._transport = owner
 
             try:
-                async with asyncio.timeout(CONNECTION_TIMEOUT_SECONDS):
-                    client = await establish_connection(
+                client = await owner.run(
+                    establish_connection(
                         BleakClientWithServiceCache,
                         ble_device,
                         self._address,
-                    )
+                    ), CONNECTION_TIMEOUT_SECONDS, connecting=True,
+                )
             except asyncio.TimeoutError:
                 _LOGGER.warning(
                     "Timed out while attempting to connect to valve %s", self._address
@@ -952,15 +1016,19 @@ class ValveConnection:
             try:
                 if self._connection_state_callback is not None:
                     self._connection_state_callback(self._address, True)
-                refreshed = await self._async_fetch_device_information(client)
+                async with asyncio.timeout(POLL_EXCHANGE_TIMEOUT_SECONDS):
+                    refreshed = await self._async_fetch_device_information(client)
+            except TimeoutError:
+                owner.invalidate()
+                _LOGGER.warning("Reading exchange timed out for valve %s", self._address)
             except Exception:  # pragma: no cover - future protocol work may raise
                 _LOGGER.exception(
                     "Error while retrieving extended data from valve %s", self._address
                 )
             else:
-                if refreshed:
+                if refreshed and not owner.expired:
                     self._last_success = dt_util.utcnow()
-                if refreshed and self._try_begin_persistent_session(client):
+                if refreshed and not owner.expired and self._try_begin_persistent_session(client):
                     cleanup_client = None
             finally:
                 if cleanup_client is not None:
@@ -968,6 +1036,10 @@ class ValveConnection:
         finally:
             if connection_attempted:
                 self._set_connection_cooldown()
+                if owner is not None and owner.client is None:
+                    owner.retired = True
+                    owner.notifications_enabled = False
+                self._transport_changed()
 
     async def _async_fetch_device_information(
         self, client: BaseBleakClient
@@ -1093,8 +1165,10 @@ class ValveConnection:
         size = min(512, max(20, getattr(client, "mtu_size", 23) - 3))
 
         async def write(payload: bytes) -> None:
-            await client.write_gatt_char(
-                uuid, payload, response="write_without_response" not in properties
+            await self._async_client_operation(
+                client, client.write_gatt_char(
+                    uuid, payload, response="write_without_response" not in properties
+                ), "Evb034 write",
             )
 
         session = Evb034Session(write, size)
@@ -1437,9 +1511,13 @@ class ValveConnection:
             write_with_response = response
 
         try:
-            await client.write_gatt_char(
-                char_uuid, payload, response=write_with_response
+            await self._async_client_operation(
+                client, client.write_gatt_char(
+                    char_uuid, payload, response=write_with_response
+                ), command_name,
             )
+        except TimeoutError:
+            return False
         except BLEAK_RETRY_EXCEPTIONS as exc:
             _LOGGER.debug(
                 "Failed to send %s to valve %s via %s: %s",
@@ -1517,22 +1595,24 @@ class ValveConnection:
     async def _async_disconnect_client(self, client: BaseBleakClient) -> None:
         """Drain bounded reset and disconnect attempts before releasing the client."""
 
+        owner = self._transport
+        if owner is None or owner.client is not client:
+            return
+        owner.retired = True
+        owner.notifications_enabled = False
+
         async def _cleanup() -> None:
             try:
-                if self._evb034_client is client:
-                    session = self._evb034_session
-                    if session is not None:
-                        await session.close()
-                    await self._async_unsubscribe_notifications(
-                        client, self._evb034_subscriptions
-                    )
-                    self._evb034_session = None
-                    self._evb034_client = None
-                    self._evb034_subscriptions = []
-                    self._reset_device_list_state()
                 try:
                     async with asyncio.timeout(_RESET_BUFFER_TIMEOUT_SECONDS):
-                        if await self._async_send_reset_buffer_packet(client):
+                        if self._evb034_client is client:
+                            session = self._evb034_session
+                            if session is not None:
+                                await session.close()
+                            await self._async_unsubscribe_notifications(
+                                client, self._evb034_subscriptions
+                            )
+                        elif not owner.expired and await self._async_send_reset_buffer_packet(client):
                             await asyncio.sleep(0.1)
                 except TimeoutError:
                     _LOGGER.warning(
@@ -1545,10 +1625,17 @@ class ValveConnection:
                         exc_info=True,
                     )
             finally:
+                if self._evb034_client is client:
+                    self._evb034_session = None
+                    self._evb034_client = None
+                    self._evb034_subscriptions = []
+                    self._reset_device_list_state()
                 # RESET is best effort and must not use the disconnect budget.
                 try:
-                    async with asyncio.timeout(_DISCONNECT_TIMEOUT_SECONDS):
-                        await client.disconnect()
+                    await self._async_client_operation(
+                        client, client.disconnect(), "disconnect",
+                        timeout=_DISCONNECT_TIMEOUT_SECONDS, cleanup=True,
+                    )
                 except TimeoutError:
                     _LOGGER.warning(
                         "Timed out disconnecting from valve %s; the Bluetooth "
@@ -1563,13 +1650,19 @@ class ValveConnection:
                         exc_info=True,
                     )
 
+        task = owner.cleanup_task
+        if task is None or (task.done() and not owner.pending and client.is_connected):
+            task = asyncio.create_task(_cleanup())
+            owner.cleanup_task = task
+            task.add_done_callback(lambda _: self._transport_changed())
         try:
-            await _async_wait_for_cleanup(asyncio.create_task(_cleanup()))
+            await _async_wait_for_cleanup(task)
         finally:
             # Session availability must end even if cleanup failed or its
             # caller was cancelled. A silent valve may have a deferred loss.
             if self._connection_state_callback is not None:
                 self._connection_state_callback(self._address, False)
+            self._transport_changed()
 
     async def _async_request_device_list(
         self, client: BaseBleakClient
@@ -2122,9 +2215,16 @@ class ValveConnection:
     ) -> None:
         """Cancel notification subscriptions for the provided characteristic UUIDs."""
 
-        for uuid in subscriptions:
-            with contextlib.suppress(Exception):
-                await client.stop_notify(uuid)
+        try:
+            async with asyncio.timeout(5):
+                for uuid in subscriptions:
+                    with contextlib.suppress(Exception):
+                        await self._async_client_operation(
+                            client, client.stop_notify(uuid), "notification unsubscribe",
+                            cleanup=True,
+                        )
+        except TimeoutError:
+            _LOGGER.warning("Timed out unsubscribing notifications for valve %s", self._address)
 
     async def _async_get_services(self, client: BaseBleakClient):
         """Return the GATT services exposed by the connected client."""
@@ -2141,7 +2241,7 @@ class ValveConnection:
 
         services = get_services()
         if inspect.isawaitable(services):
-            services = await services
+            services = await self._async_client_operation(client, services, "service discovery")
 
         return services
 
@@ -2234,9 +2334,14 @@ class ValveConnection:
         """Attempt to enable notifications for a characteristic."""
 
         try:
-            awaitable = client.start_notify(uuid, handler)
+            owner = self._transport
+            if owner is None or owner.client is not client:
+                return False
+            awaitable = client.start_notify(uuid, owner.guard_notification(handler))
             if inspect.isawaitable(awaitable):
-                await awaitable
+                await self._async_client_operation(client, awaitable, "notification subscribe")
+        except TimeoutError:
+            return False
         except BLEAK_RETRY_EXCEPTIONS as exc:
             _LOGGER.debug(
                 "Failed to subscribe to notifications from %s on valve %s: %s",

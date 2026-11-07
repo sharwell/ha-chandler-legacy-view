@@ -112,8 +112,11 @@ async def test_poll_cannot_reconnect_while_stop_owns_cleanup(connection_factory,
             await clock.drain()
             stop = asyncio.create_task(connection.async_set_persistent_connection_enabled(False))
         else:
-            stop = asyncio.create_task(connection.async_set_persistent_connection_enabled(False))
+            # Return at the handoff, before the queued keepalive starts. Raw
+            # Bluetooth calls may yield before this handoff, so requesting
+            # disable before polling does not reliably exercise that case.
             await connection.async_poll()
+            stop = asyncio.create_task(connection.async_set_persistent_connection_enabled(False))
         await clock.run(gate.started.wait())
         assert not stop.done()
         # Let the genuine retry cooldown expire while cleanup is still gated.
@@ -148,8 +151,8 @@ async def test_reenable_during_cleanup_retries_after_release(hass, connection_fa
             await clock.drain()
             stop = asyncio.create_task(connection.async_set_persistent_connection_enabled(False))
         else:
-            stop = asyncio.create_task(connection.async_set_persistent_connection_enabled(False))
             await connection.async_poll()
+            stop = asyncio.create_task(connection.async_set_persistent_connection_enabled(False))
         await clock.run(gate.started.wait())
         await hass.async_start()
         await connection.async_set_persistent_connection_enabled(True)

@@ -38,6 +38,12 @@ DATA_DISCOVERY_DEVICE_ID: Final = "discovery_device_id"
 CONNECTION_POLL_INTERVAL: Final = timedelta(minutes=15)
 CONNECTION_MIN_RETRY_INTERVAL: Final = timedelta(seconds=30)
 CONNECTION_TIMEOUT_SECONDS: Final = 20
+BLE_OPERATION_TIMEOUT_SECONDS: Final = 10
+POLL_EXCHANGE_TIMEOUT_SECONDS: Final = 60
+PERSISTENT_EXCHANGE_TIMEOUT_SECONDS: Final = 30
+# Connect (20), exchange (60), request unsubscribe (5), reset/stream close (5),
+# and disconnect (30) are independent bounded waits. Expiry uses their sum.
+CONNECTION_ATTEMPT_BUDGET_SECONDS: Final = 120
 
 # Default presentation details for discovered devices
 DEFAULT_FRIENDLY_NAME: Final = "Treatment Valve"
