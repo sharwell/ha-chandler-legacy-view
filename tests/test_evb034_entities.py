@@ -16,12 +16,14 @@ def sensor_id(hass, suffix):
 
 
 async def setup_readings(hass, entry_factory, runtime_factory, bluetooth_io, transport,
-                         firmware=622, valve_type=1, partial=False, **identity):
+                         firmware=622, valve_type=1, partial=False,
+                         advertised_name="CS_Meter_Soft", **identity):
     entry = entry_factory()
     er.async_get(hass).async_get_or_create("sensor", DOMAIN, "valve-a_time_of_day",
                                          config_entry=entry, disabled_by=None)
     await runtime_factory(entry=entry)
-    bluetooth_io.advertise(**({"manufacturer_data": {}} if partial else {"payload": EVB034_622}))
+    bluetooth_io.advertise(name=advertised_name,
+                          **({"manufacturer_data": {}} if partial else {"payload": EVB034_622}))
     await hass.async_block_till_done()
     valve = transport.valve()
     valve.firmware_version = firmware
@@ -36,7 +38,7 @@ async def setup_readings(hass, entry_factory, runtime_factory, bluetooth_io, tra
 @pytest.mark.parametrize("firmware,hour,usage,remaining", [
     (600, 11, 12345, 45678), (608, 11, 12345, 45678),
     (609, 23, 12345, 45678), (610, 23, 12345, 45678),
-    (611, 23, 123.45, 456), (622, 23, 123.45, 456),
+    (611, 23, 123.45, 456), (618, 23, 123.45, 456), (622, 23, 123.45, 456),
 ])
 async def test_existing_entities_match_field_specific_conversion_boundaries(
     hass, entry_factory, runtime_factory, bluetooth_io, transport, clock,

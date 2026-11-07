@@ -736,6 +736,17 @@ class ValveDiscoveryManager:
                 radio_protocol_version=classification.radio_protocol_version,
             )
             previous_advertisement = self._devices.get(service_info.address)
+            if previous_advertisement is not None and previous_advertisement.is_clack_valve is not None:
+                # C6.x advertisement layouts do not carry the packet's dlic/dli
+                # identity. They must not erase confirmed variant information.
+                advertisement = replace(
+                    advertisement,
+                    is_clack_valve=previous_advertisement.is_clack_valve,
+                    clack_firmware_version=previous_advertisement.clack_firmware_version,
+                    is_twin_valve=previous_advertisement.is_twin_valve,
+                    valve_type=previous_advertisement.valve_type,
+                    valve_type_full=previous_advertisement.valve_type_full,
+                )
             if (
                 previous_advertisement is not None
                 and not advertisement.manufacturer_data_complete

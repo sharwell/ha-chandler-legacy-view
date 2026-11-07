@@ -33,7 +33,7 @@ from .const import (
 )
 from .connection import ValveConnection, ValveConnectionManager
 from .discovery import ValveDiscoveryChange, ValveDiscoveryManager
-from .entity import ChandlerValveEntity, _is_clack_valve
+from .entity import ChandlerValveEntity, advertisement_is_clack_valve
 from .models import ValveAdvertisement, ValveDashboardData
 
 _LOGGER = logging.getLogger(__name__)
@@ -269,7 +269,10 @@ class ValveBatteryCapacitySensor(ValveDashboardSensor):
     _attr_device_class = SensorDeviceClass.BATTERY
 
     def _is_supported(self) -> bool:
-        return super()._is_supported() and not _is_clack_valve(self._advertisement.name)
+        clack = self._connection.entity_capabilities.is_clack_valve
+        if clack is None:
+            clack = advertisement_is_clack_valve(self._advertisement)
+        return super()._is_supported() and not clack
 
     def __init__(
         self, advertisement: ValveAdvertisement, connection: ValveConnection
@@ -488,7 +491,7 @@ async def async_setup_entry(
         return _ensure_dashboard_entity(
             advertisement,
             battery_entities,
-            predicate=lambda adv: not _is_clack_valve(adv.name),
+            predicate=lambda adv: not advertisement_is_clack_valve(adv),
             factory=lambda adv, conn: ValveBatteryCapacitySensor(adv, conn),
             debug_description="battery",
         )

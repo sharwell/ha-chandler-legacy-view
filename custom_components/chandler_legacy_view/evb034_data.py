@@ -53,6 +53,14 @@ def decode_dashboard(packet: Mapping, firmware: int, *, clack: bool = False) -> 
         value = number(packet, key)
         if value is not None:
             normalized = value / scale
+            if key == "dtgr":
+                # updatePacket casts Number to JVM float and divides as float
+                # before float-to-int. Large counters can otherwise differ by
+                # a gallon when decoded with Python's double precision.
+                raw_float = struct.unpack("f", struct.pack("f", value))[0]
+                normalized = struct.unpack("f", struct.pack("f", raw_float / scale))[0]
+                # JVM float-to-int saturates when rounding exceeds Int.MAX_VALUE.
+                normalized = min(normalized, 0x7FFFFFFF)
             values[field] = int(normalized) if truncate else normalized
     hour, minute = integer(packet, "dh"), integer(packet, "dm")
     am_pm = integer(packet, "da")

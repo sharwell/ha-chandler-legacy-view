@@ -22,6 +22,7 @@ class ValveCapabilities:
 
     is_twin_valve: bool | None = None
     valve_type: str | None = None
+    is_clack_valve: bool | None = None
 
     @property
     def is_metered_softener(self) -> bool | None:
@@ -66,6 +67,8 @@ class ValveAdvertisement:
     bootloader_version: int | None = None
     radio_protocol_version: int | None = None
     authentication_required: bool | None = None
+    is_clack_valve: bool | None = None
+    clack_firmware_version: str | None = None
 
     @property
     def is_metered_softener(self) -> bool:

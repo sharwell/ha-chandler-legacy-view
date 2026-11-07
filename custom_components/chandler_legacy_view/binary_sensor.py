@@ -20,7 +20,7 @@ from .entity import (
     _VALVE_SERIES_EBX044_DISPLAY,
     _bypass_status_display,
     _can_report_low_salt,
-    _is_clack_valve,
+    advertisement_is_clack_valve,
     _salt_sensor_status_display,
     _valve_error_display,
     _valve_series_display,
@@ -60,7 +60,11 @@ class ValvePresenceBinarySensor(ChandlerValveEntity, BinarySensorEntity):
         """Provide metadata about the most recent advertisement."""
 
         attributes: dict[str, int | str] = {}
-        is_clack_valve = _is_clack_valve(self._advertisement.name)
+        is_clack_valve = advertisement_is_clack_valve(self._advertisement)
+        if self._advertisement.is_clack_valve is not None:
+            attributes["is_clack_valve"] = is_clack_valve
+        if self._advertisement.clack_firmware_version is not None:
+            attributes["clack_firmware_version"] = self._advertisement.clack_firmware_version
         can_report_low_salt = _can_report_low_salt(self._advertisement.name)
         if self._advertisement.rssi is not None:
             attributes["rssi"] = self._advertisement.rssi

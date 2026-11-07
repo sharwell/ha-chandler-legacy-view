@@ -95,6 +95,49 @@ predecessor. Validated identification can recover model, type, firmware,
 series and concatenated hexadecimal serial fields `dlsa`/`dlsb` after partial
 startup, preserving the address-based HA device and entity identities.
 
+## Clack and EBX044 variants
+
+`CsMainCoreActivity` copies `dlIsClackValve`, `dlIsTwinValve` and the mapped
+valve type into the Dashboard model after connecting. Confirmed `dlic` and
+`dli` therefore govern availability, rather than the discovery name alone.
+The packet flag also controls `CsBlePacket$Companion.getFloatDivisor` and
+`CsBlePacket.getFullTimeString`: Clack always uses hundredths for usage and
+remaining volume and a 24-hour clock. The battery row and battery-sampling
+write are excluded for Clack. `dtgr` follows JVM float division and integer
+truncation, including large-counter rounding and signed-integer saturation.
+
+`CsValveType$Companion.fromValveType` maps Clack types 1/4/6/8 to metered
+softener, 2/5/7/9 to backwashing filter, and 3 to Clack aeration. Standard
+commercial metered type 17 and all twins use metered applicability. Unknown
+type/series codes remain explicit diagnostics and do not invent a new model.
+`dlcf` is a byte array decoded as UTF-8 by `arrayToString`; expose that
+controller firmware separately from the numeric valve firmware.
+
+`CsBleValveDataEvb034.parsePayload` interprets the same series byte through
+both `CsValveSeriesVersionEvb034` and `CsValveSeriesVersionEbx044`. EBX044
+is not inferred as a separate transport from a branding or firmware prefix.
+Keep the existing Evb034/EBX044 series diagnostics; a BLE valve with these
+reported fields uses the packet session above. RFCOMM-only valves remain
+outside implementation scope and are covered by investigation #97.
+
+## Support evidence
+
+| Combination | Automated evidence | Hardware evidence |
+| --- | --- | --- |
+| Existing Evb019, including C4.18/C4.19/C4.20+ and D1 twins | Full regression suite retained | Existing reports; no new live validation in this work |
+| C6.00–6.08 | Packet/authentication, legacy clock flag, unscaled volumes | Needed in #61 |
+| C6.09–6.10 | 24-hour clock and unscaled volumes | Needed in #61 |
+| C6.11+ including the C6.18 report scenario | 24-hour clock, hundredths volume, present/peak flow scaling | Needed in #61 |
+| Standard/commercial/twin packet flags | HA readings, type/applicability transitions, stable identities | Needed in #61 |
+| Clack BLE types 1–9 | Hundredths volume, 24-hour clock, battery exclusion, type mappings | Needed in #61 |
+| Evb034/EBX044 series 1–7 | Shared packet path, series diagnostics, unknown-series handling | Needed in #61 |
+
+Tests use real HA objects with simulated scanner/GATT I/O on HA 2026.8.0
+and 2026.10.4 under Windows/Python 3.14.2. They do not establish physical
+disconnects, released ESPHome proxy slots, MTU negotiation with actual valves,
+or phone-app handoff. Collect paired app/HA readings, exact versions and
+transport-boundary recovery/release observations from future user reports.
+
 ## Unexpected situations and open questions
 
 The #60 reference review found that the original #57–59 session and peer
@@ -118,11 +161,12 @@ overflow/access-loss cleanup, bounded framing/command failures, stale
 pre-write authentication states, and cancellation/unload with pending
 notifications. Simulated cleanup is distinct from physical release evidence.
 
-The remaining sequence still reaches existing-entity BLE parity: commit the
-corrected lifecycle, finish #60 variant interpretation and support records,
-then obtain #61 hardware evidence from future user reports. RFCOMM remains
-excluded. The unsequenced wire limitation below remains unresolved by design;
-hardware behavior is unverified rather than inferred from simulated tests.
+The corrected lifecycle is recorded in commit `86af040`. With #60 variant
+interpretation and support records, the repository implements the existing
+entity coverage planned in #57–60. The remaining step is #61 hardware evidence
+from future user reports. RFCOMM remains excluded. The unsequenced wire
+limitation below remains unresolved by design; hardware behavior is unverified
+rather than inferred from simulated tests.
 
 ## Protocol limitations and remaining evidence
 

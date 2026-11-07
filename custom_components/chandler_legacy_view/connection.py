@@ -529,6 +529,7 @@ class ValveConnection:
         *,
         is_twin_valve: bool | None = None,
         valve_type: str | None = None,
+        is_clack_valve: bool | None = None,
     ) -> None:
         """Retain known support until newer, explicit metadata supersedes it.
 
@@ -545,6 +546,9 @@ class ValveConnection:
                 is_twin_valve if is_twin_valve is not None else previous.is_twin_valve
             ),
             valve_type=valve_type if valve_type is not None else previous.valve_type,
+            is_clack_valve=(
+                is_clack_valve if is_clack_valve is not None else previous.is_clack_valve
+            ),
         )
         if updated == previous:
             return
@@ -1149,7 +1153,10 @@ class ValveConnection:
             self._set_authentication_failed(False)
             self._device_list_authentication_state = ValveAuthenticationState.AUTHENTICATED
             session.mark_authenticated()
-            if integer(identification, "dlic") != 1 and integer(identification, "gbre") != 1:
+            if (
+                self._entity_capabilities.is_clack_valve is not True
+                and integer(identification, "gbre") != 1
+            ):
                 await session.send_command(b'{"gbre":1}')
             return await self._async_refresh_evb034_dashboard(client, initial=True)
         except (TimeoutError, Evb034ProtocolError) as exc:
@@ -1197,7 +1204,11 @@ class ValveConnection:
         firmware = integer(updated, "dlf")
         if firmware is None or not 600 <= firmware <= 9999:
             raise Evb034ProtocolError("Invalid updated firmware identity")
-        is_clack = integer(updated, "dlic") == 1
+        clack = integer(updated, "dlic")
+        is_clack = (
+            clack == 1 if clack in (0, 1)
+            else self._entity_capabilities.is_clack_valve is True
+        )
         self._evb034_packet = updated
         self._publish_evb034_metadata()
         if not READING_KEYS.intersection(packet):
@@ -1224,21 +1235,36 @@ class ValveConnection:
                    "firmware_major": firmware // 100, "firmware_minor": firmware % 100}
         valve_type = integer(packet, "dlvt")
         twin = integer(packet, "dli")
+        clack = integer(packet, "dlic")
+        if clack in (0, 1):
+            updates["is_clack_valve"] = bool(clack)
         if valve_type is not None:
             updates.update(valve_type_full=valve_type,
-                           valve_type=_map_valve_type(valve_type, packet.get("dlic") == 1))
+                           valve_type=_map_valve_type(
+                               valve_type, clack == 1 if clack in (0, 1)
+                               else self._entity_capabilities.is_clack_valve is True
+                           ))
         if twin in (0, 1):
             updates["is_twin_valve"] = bool(twin)
         series = integer(packet, "dlvs")
         if series is not None:
             updates["valve_series_version"] = series
+        clack_firmware = packet.get("dlcf")
+        if isinstance(clack_firmware, list) and all(
+            type(value) is int and -0x80000000 <= value <= 0x7FFFFFFF
+            for value in clack_firmware
+        ):
+            updates["clack_firmware_version"] = bytes(
+                value & 255 for value in clack_firmware
+            ).decode("utf-8", errors="replace")
         status = integer(packet, "gvs")
         if status is not None and status <= 255:
             updates.update(valve_status=status, salt_sensor_status=int(bool(status & 0x80)),
                            water_status=int(bool(status & 0x40)), bypass_status=int(bool(status & 0x20)))
         self._advertisement = replace(advertisement, **updates)
         self._update_entity_capabilities(
-            valve_type=updates.get("valve_type"), is_twin_valve=updates.get("is_twin_valve")
+            valve_type=updates.get("valve_type"), is_twin_valve=updates.get("is_twin_valve"),
+            is_clack_valve=updates.get("is_clack_valve"),
         )
         serial_a, serial_b = packet.get("dlsa"), packet.get("dlsb")
         if all(type(value) is int and 0 <= value <= 0x7FFFFFFFFFFFFFFF
