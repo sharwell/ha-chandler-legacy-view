@@ -3,6 +3,7 @@
 import asyncio
 import pytest
 from homeassistant.const import EVENT_STATE_CHANGED
+from homeassistant.core import callback
 from homeassistant.helpers import entity_registry as er
 from custom_components.chandler_legacy_view.const import DOMAIN, DATA_CONNECTION_MANAGER
 from packets import MODERN_422
@@ -37,9 +38,14 @@ async def test_all_platforms_publish_loss_and_recovery(hass, runtime_factory, bl
     presence = entity_id(hass, "binary_sensor", "softener")
     assert hass.states.get(presence).state == "on"
     published = []
-    remove = hass.bus.async_listen(EVENT_STATE_CHANGED, lambda event:
-        published.append(event.data["new_state"].state)
-        if event.data["entity_id"] == presence and event.data["new_state"] else None)
+    # Unmarked synchronous listeners run in HA's executor and can lag behind
+    # recovery. Record the transition sequence on the event loop.
+    @callback
+    def record_presence_change(event):
+        if event.data["entity_id"] == presence and event.data["new_state"] is not None:
+            published.append(event.data["new_state"].state)
+
+    remove = hass.bus.async_listen(EVENT_STATE_CHANGED, record_presence_change)
     try:
         await clock.run(hass.async_start())
         await clock.until(lambda: all(transport.valve(address).clients and
