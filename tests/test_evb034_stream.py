@@ -167,7 +167,7 @@ async def test_all_null_update_does_not_refresh_last_success_or_revoke_access(
     last_success = connection.last_success
     for frame in frames({"as": None, "dlf": None, "dwu": None}):
         owner.notify(frame)
-    await clock.advance(6)
+    await clock.advance(connection.persistent_poll_interval + 1)
     assert owner.is_connected
     assert connection.last_success == last_success
     assert hass.states.get(sensor_id(hass, "water_usage_today")).state == "5.67"

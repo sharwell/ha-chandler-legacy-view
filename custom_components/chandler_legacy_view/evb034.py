@@ -67,6 +67,8 @@ class Evb034Session:
         self._ready = asyncio.Event()
         self._failed_event = asyncio.Event()
         self._authenticated = False
+        self._command_active = False
+        self._timeout_retries = 0
         self._operation_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         self._closed = False
@@ -187,26 +189,38 @@ class Evb034Session:
         if not isinstance(command, dict) or not command:
             raise Evb034ProtocolError("Expected configuration object")
         async with self._operation_lock:
-            for chunk in frame_payload(payload, self.write_size):
-                self._acks.clear()
-                for attempt in range(PACKET_ATTEMPTS):
+            chunks = frame_payload(payload, self.write_size)
+            index = attempts = 0
+            self._command_active = True
+            try:
+                while index < len(chunks):
+                    self._acks.clear()
                     after = self._notification_serial
-                    await self._send(chunk)
-                    try:
-                        async with asyncio.timeout(TIMEOUT):
-                            while True:
-                                serial, response = await self._wait_ready(self._acks, TIMEOUT)
-                                if serial > after:
-                                    break
-                    except TimeoutError:
-                        if attempt + 1 == PACKET_ATTEMPTS:
-                            raise
-                        await self._send(b"\xc2")
+                    await self._send(chunks[index])
+                    # restartTimeout's timer reports failure; it does not emit
+                    # a timeout query or invent a retransmission on silence.
+                    async with asyncio.timeout(TIMEOUT):
+                        while True:
+                            serial, response = await self._wait_ready(self._acks, TIMEOUT)
+                            if serial > after:
+                                break
+                    if response in (b"\xc2", b"\xc3"):
+                        if self._timeout_retries > PACKET_ATTEMPTS:
+                            raise Evb034ProtocolError("Timeout retries exceeded")
+                        # resetCurrentEntry clears processing state, causing
+                        # startProcessor to re-chunk the original queue entry.
+                        index = attempts = 0
                         continue
                     if response == ACK:
-                        break
-                    if attempt + 1 == PACKET_ATTEMPTS:
-                        raise Evb034ProtocolError("Packet retries exceeded")
+                        index += 1
+                        attempts = 0
+                    else:
+                        attempts += 1
+                        if attempts >= PACKET_ATTEMPTS:
+                            raise Evb034ProtocolError("Packet retries exceeded")
+            finally:
+                self._command_active = False
+                self._acks.clear()
 
     async def next_packet(self, *, after: int = 0) -> dict:
         """Wait a bounded time for a complete update from this client."""
@@ -248,24 +262,14 @@ class Evb034Session:
         self._ready.set()
 
     async def _receive_loop(self) -> None:
-        retries = 0
         try:
             while not self._closed and self._failure is None:
-                try:
-                    if self._buffer is not None:
-                        async with asyncio.timeout(TIMEOUT):
-                            serial, data = await self._queue.get()
-                    else:
+                if self._buffer is not None:
+                    async with asyncio.timeout(TIMEOUT):
                         serial, data = await self._queue.get()
-                except TimeoutError:
-                    retries += 1
-                    if retries > PACKET_ATTEMPTS:
-                        raise Evb034ProtocolError("Incomplete notification stream")
-                    await self._send(b"\xc2")
-                    continue
+                else:
+                    serial, data = await self._queue.get()
                 await self._process_notification(data, serial)
-                if data not in (b"\xe0", b"\xf0", b"\xc2", b"\xc3"):
-                    retries = 0
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -285,8 +289,14 @@ class Evb034Session:
                 await self._send(b"\xf0" if data == b"\xe0" else b"\xe0")
                 return
             if data in (b"\xc2", b"\xc3"):
-                if data == b"\xc2":
-                    await self._send(b"\xc3")
+                # processStatusPacket replies in both directions and retains
+                # its timeout count across queue entries in this processor.
+                await self._send(b"\xc3" if data == b"\xc2" else b"\xc2")
+                self._timeout_retries += 1
+                if self._command_active:
+                    self._acks.clear()
+                    self._acks.append((serial, data))
+                    self._ready.set()
                 return
         # processDataPacket validates each complete ATT notification, including
         # a short final chunk. Invalid bytes never spill into the next frame.

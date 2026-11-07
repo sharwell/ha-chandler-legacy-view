@@ -88,11 +88,12 @@ class Valve:
         self.identification_packets = deque()
         self.chunk_acknowledgements = deque()
         self.id_acknowledgements = deque()
+        self.timeout_responses = deque()
         self.packet_requests = []
         self.dashboard_notifications = 0
         self.stream_enabled = True
         self.operations = {name: Operation() for name in
-                           ("connect", "identify", "device_list", "authenticate", "dashboard", "reset", "disconnect")}
+                           ("connect", "identify", "device_list", "authenticate", "dashboard", "reset", "disconnect", "timeout")}
 
     def authenticated(self, counter=23):
         self.device_lists.append([device_list_frame(status=0, counter=counter)])
@@ -238,10 +239,16 @@ class Client:
         if payload in (b"\xcc", b"\xc8"):
             self.peer_ack.put_nowait(payload)
             return
-        if payload in (b"\xe0", b"\xf0", b"\xc3"):
+        if payload in (b"\xe0", b"\xf0"):
             return
-        if payload == b"\xc2":
-            self.notify(b"\xc3")
+        if payload in (b"\xc2", b"\xc3"):
+            await self.valve.operations["timeout"].run()
+            # A scripted timeout exchange supplies each peer status explicitly;
+            # do not manufacture an unbounded C2/C3 echo conversation.
+            if self.valve.timeout_responses:
+                reply = self.valve.timeout_responses.popleft()
+                if reply:
+                    self.notify(reply)
             return
         if not self.dashboard_access:
             assert len(payload) == 20, "Initial password is a direct ATT write"
@@ -276,8 +283,10 @@ class Client:
         self.packet_buffer.clear()
         self.valve.packet_requests.append(request)
         command = json.loads(request)
-        assert command == {"gbre": 1}, "Only the app's battery-read setting is expected"
-        await self.peer_outgoing.put((frames({"gbre": 1}, min(512, self.mtu_size - 3)), False))
+        # Packet-session tests can send several app configuration fields in one
+        # JSON message; only battery sampling needs a modeled setting response.
+        if command.get("gbre") == 1:
+            await self.peer_outgoing.put((frames({"gbre": 1}, min(512, self.mtu_size - 3)), False))
 
     @staticmethod
     def _peer_packet(reply):

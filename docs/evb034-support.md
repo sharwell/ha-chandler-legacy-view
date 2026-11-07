@@ -64,6 +64,15 @@ polling loops on C6.x (`CsDeviceListFragment.lambda$writeData$8` and
 `CsDashboardFragment.onViewCreated`). Authenticated configuration JSON uses
 the framed outbound queue.
 
+`processStatusPacket` replies C3 to C2 and C2 to C3. Its
+`resetCurrentEntry`/`startProcessor$lambda$0` path restarts the whole queued
+message, not just the interrupted chunk, for up to two timeout-control resets.
+The timeout count persists across commands in the connection-owned processor.
+An exhausted command is dropped; an ordinary later command can still succeed.
+`restartTimeout$1.run` reports a three-second local timeout as failure; it does
+not originate a C2 query. Regression checks cover both directions, multi-chunk
+restart, retry exhaustion, silent deadlines and cancellation during a reply.
+
 Identification alone is not a successful Dashboard read. Packet assembly and
 notification callbacks belong to one connection; cancelled work cannot supply
 identification to a replacement connection. Tests cover CRC/JSON rejection,
@@ -196,6 +205,15 @@ before the last HA event listener completed, despite the final state already
 being correct. The focused check and a subsequent full current-HA run passed;
 the C6.x-only change does not modify that path. This remains a test-timing
 observation rather than evidence of valve or transport behavior.
+One temporary review probe also assumed a seven-second publication wait;
+validation now waits for the configured HA interval (ten seconds by default).
+
+The final timeout review also found that local deadlines had been originating
+C2 queries absent from `restartTimeout$1.run`. Correction 6 removes those
+queries along with fixing the peer-initiated C2/C3 replies and queue resets.
+All six review corrections now have production-path regression coverage.
+The existing entity coverage remains the intended result, with live acceptance
+still deferred to #61 and the wire limitation below unchanged.
 
 The corrected lifecycle is recorded in commit `86af040`. With #60 variant
 interpretation and support records, the repository implements the existing
