@@ -194,7 +194,7 @@ async def test_cancelled_unload_waits_for_active_poll(connection_factory, transp
         gate.release.set()
         tasks = [poll] if unload is None else [poll, unload]
         results = await clock.run(asyncio.gather(*tasks, return_exceptions=True))
-    assert results[0] is None
+    assert isinstance(results[0], asyncio.CancelledError)
     assert isinstance(results[1], asyncio.CancelledError)
     assert_closed(valve)
 

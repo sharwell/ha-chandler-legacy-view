@@ -22,6 +22,7 @@ from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import CALLBACK_TYPE, CoreState, HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.util import dt as dt_util
 
@@ -32,6 +33,8 @@ from .const import (
     CONNECTION_MIN_RETRY_INTERVAL,
     CONNECTION_POLL_INTERVAL,
     CONNECTION_TIMEOUT_SECONDS,
+    CONNECTION_TEARDOWN_BUDGET_SECONDS,
+    DATA_BLUETOOTH_OWNERS,
     DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS,
     DEFAULT_VALVE_PASSCODE,
     MAX_PERSISTENT_POLL_INTERVAL_SECONDS,
@@ -117,10 +120,16 @@ async def _async_wait_for_cleanup(task: asyncio.Task[None]) -> None:
     """Finish cleanup before propagating cancellation of its caller."""
 
     cancelled: asyncio.CancelledError | None = None
+    deadline = asyncio.get_running_loop().time() + CONNECTION_TEARDOWN_BUDGET_SECONDS
     try:
         while not task.done():
             try:
-                await asyncio.shield(task)
+                remaining = max(0, deadline - asyncio.get_running_loop().time())
+                done, _ = await asyncio.wait({task}, timeout=remaining)
+                if not done:
+                    # The caller retains this worker; a deadline never means
+                    # that old transport work or cleanup can be forgotten.
+                    raise TimeoutError("Bluetooth cleanup exceeded 45 seconds")
             except asyncio.CancelledError as exc:
                 # Keep a strong reference and drain the same task, even when
                 # shutdown requests cancellation more than once.
@@ -290,6 +299,13 @@ class ValveConnection:
         self._evb034_subscriptions: list[str] = []
         self._evb034_packet: dict | None = None
         self._transport: OwnedBluetoothOperations | None = None
+        self._poll_task: asyncio.Task | None = None
+        self._unload_task: asyncio.Task | None = None
+
+    @property
+    def config_entry_id(self) -> str:
+        """Identify the runtime retaining this connection's ownership."""
+        return self._config_entry_id
 
     @property
     def cleanup_pending(self) -> bool:
@@ -306,6 +322,9 @@ class ValveConnection:
             return
         if owner.released:
             self._transport = None
+            owners = self._hass.data.get(DATA_BLUETOOTH_OWNERS, {})
+            if owners.get(self._address) is self:
+                owners.pop(self._address)
             if owner.expired and self.available:
                 # A late I/O completion may make safe recovery possible without
                 # another advertisement. The normal cooldown still applies.
@@ -451,6 +470,9 @@ class ValveConnection:
             return
 
         if not self._persistent_connection_enabled:
+            if self._persistent_stop_task is not None:
+                await self._async_stop_persistent_session()
+            self._raise_if_cleanup_pending()
             return
 
         _LOGGER.debug(
@@ -458,6 +480,15 @@ class ValveConnection:
         )
         self._persistent_connection_enabled = False
         await self._async_stop_persistent_session()
+        self._raise_if_cleanup_pending()
+
+    def _raise_if_cleanup_pending(self) -> None:
+        if self.cleanup_pending:
+            raise HomeAssistantError(
+                f"Bluetooth cleanup for {self._address} is not confirmed. "
+                "The old connection is quarantined; retry after the adapter "
+                "or proxy reports release. Check the Bluetooth logs."
+            )
 
     async def async_set_persistent_poll_interval(self, seconds: float) -> None:
         """Update the poll interval used during persistent connections."""
@@ -717,7 +748,7 @@ class ValveConnection:
 
         stop_task = self._persistent_stop_task
         if stop_task is None:
-            task = self._persistent_task
+            task = self._persistent_task or self._poll_task
             if task is None:
                 return
 
@@ -900,14 +931,27 @@ class ValveConnection:
         self._unloaded = True
         self._persistent_connection_enabled = False
         self._cancel_cooldown()
-        await _async_wait_for_cleanup(asyncio.create_task(self._async_finish_unload()))
+        if self._transport is not None:
+            self._transport.invalidate()
+        poll = self._poll_task
+        if poll is not None and not poll.done():
+            poll.cancel()
+        task = self._unload_task
+        if task is None or task.done():
+            task = asyncio.create_task(self._async_finish_unload())
+            self._unload_task = task
+        await _async_wait_for_cleanup(task)
+        self._raise_if_cleanup_pending()
 
     async def _async_finish_unload(self) -> None:
         """Wait for connection cleanup, including an active one-shot poll."""
 
         await self._async_stop_persistent_session()
         async with self._lock:
-            return
+            owner = self._transport
+            if owner is not None and owner.client is not None and not owner.pending:
+                await self._async_disconnect_client(owner.client)
+            self._transport_changed()
 
     async def async_poll(self) -> None:
         """Attempt to connect to the valve and fetch additional data."""
@@ -937,7 +981,20 @@ class ValveConnection:
                 if self._transport is not None:
                     _LOGGER.debug("Skipping poll for %s; old Bluetooth work is quarantined", self._address)
                     return
-            await self._async_poll_locked()
+            owners = self._hass.data.setdefault(DATA_BLUETOOTH_OWNERS, {})
+            previous = owners.get(self._address)
+            if previous is not None and previous is not self:
+                _LOGGER.warning(
+                    "Cannot connect to valve %s: another runtime still owns "
+                    "its Bluetooth connection; wait for confirmed cleanup",
+                    self._address,
+                )
+                return
+            self._poll_task = asyncio.current_task()
+            try:
+                await self._async_poll_locked()
+            finally:
+                self._poll_task = None
 
     async def _async_poll_locked(self) -> None:
         """Perform a Bluetooth connection cycle for the valve."""
@@ -984,6 +1041,7 @@ class ValveConnection:
             self._reset_device_list_state()
             owner = OwnedBluetoothOperations(self._transport_changed)
             self._transport = owner
+            self._hass.data[DATA_BLUETOOTH_OWNERS][self._address] = self
 
             try:
                 client = await owner.run(
@@ -2871,6 +2929,7 @@ class ValveConnectionManager:
         self._remove_listener: CALLBACK_TYPE | None = None
         self._cancel_interval: CALLBACK_TYPE | None = None
         self._startup_unsub: CALLBACK_TYPE | None = None
+        self._unload_task: asyncio.Task | None = None
 
     async def async_setup(self) -> None:
         """Begin tracking valves for periodic polling."""
@@ -2892,7 +2951,7 @@ class ValveConnectionManager:
                 EVENT_HOMEASSISTANT_STARTED, self._handle_home_assistant_started
             )
 
-    async def async_unload(self) -> None:
+    async def async_unload(self) -> bool:
         """Cancel scheduled work and disconnect listeners."""
 
         if self._remove_listener is not None:
@@ -2907,23 +2966,38 @@ class ValveConnectionManager:
             self._startup_unsub()
             self._startup_unsub = None
 
-        await _async_wait_for_cleanup(
-            asyncio.create_task(self._async_unload_connections())
-        )
+        task = self._unload_task
+        if task is None or task.done():
+            task = asyncio.create_task(self._async_unload_connections())
+            self._unload_task = task
+        try:
+            await _async_wait_for_cleanup(task)
+        except TimeoutError:
+            _LOGGER.error("Valve cleanup exceeded its budget; old ownership is retained")
+            return False
+        return task.result()
 
-    async def _async_unload_connections(self) -> None:
+    async def _async_unload_connections(self) -> bool:
         """Drain all valve cleanup before releasing manager ownership."""
 
-        await asyncio.gather(
+        results = await asyncio.gather(
             *(connection.async_unload() for connection in self._connections.values()),
             return_exceptions=True,
         )
+        if any(isinstance(result, BaseException) for result in results):
+            _LOGGER.error(
+                "Valve cleanup is unconfirmed; unload failed and old Bluetooth "
+                "ownership is retained. Check the adapter/proxy; replacement "
+                "setup will wait for confirmed release."
+            )
+            return False
         self._connections.clear()
+        return True
 
-    async def async_shutdown(self) -> None:
+    async def async_shutdown(self) -> bool:
         """Best-effort cleanup when Home Assistant stops."""
 
-        await self.async_unload()
+        return await self.async_unload()
 
     @callback
     def _handle_poll_interval(self, _: datetime) -> None:

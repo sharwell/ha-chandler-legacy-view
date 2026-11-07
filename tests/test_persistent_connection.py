@@ -91,9 +91,9 @@ async def test_one_shot_poll_publishes_connected_then_disconnected(connection_fa
 async def test_concurrent_stops_before_handoff_share_disconnect(connection_factory, transport, clock):
     connection = connection_factory()
     await connection.async_set_persistent_connection_enabled(True)
+    await connection.async_poll()
     disable = asyncio.create_task(connection.async_set_persistent_connection_enabled(False))
     unload = asyncio.create_task(connection.async_unload())
-    await connection.async_poll()
     await clock.run(asyncio.gather(disable, unload))
     assert transport.valve().clients[0].disconnects == 1
     assert not transport.valve().clients[0].is_connected

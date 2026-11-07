@@ -7,6 +7,7 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceEntryType
 from homeassistant.helpers.typing import ConfigType
@@ -15,6 +16,7 @@ from .const import (
     CONF_DEFAULT_PASSCODE,
     CONF_DEVICE_PASSCODES,
     DATA_CONNECTION_MANAGER,
+    DATA_BLUETOOTH_OWNERS,
     DATA_DISCOVERY_DEVICE_ID,
     DATA_DISCOVERY_MANAGER,
     DEFAULT_MANUFACTURER,
@@ -42,6 +44,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Chandler Legacy View from a config entry."""
 
     hass.data.setdefault(DOMAIN, {})
+
+    pending = [
+        owner.address for owner in hass.data.get(DATA_BLUETOOTH_OWNERS, {}).values()
+        if owner.config_entry_id == entry.entry_id and owner.cleanup_pending
+    ]
+    if pending:
+        raise ConfigEntryNotReady(
+            "Old Bluetooth cleanup is unconfirmed for " + ", ".join(pending)
+            + "; check the adapter/proxy. Setup will retry after release."
+        )
 
     stored_default = entry.data.get(CONF_DEFAULT_PASSCODE)
     if stored_default in (None, "", "0000"):
@@ -117,16 +129,24 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if not unload_ok:
         return False
 
-    data = hass.data[DOMAIN].pop(entry.entry_id, None)
+    data = hass.data[DOMAIN].get(entry.entry_id)
     try:
         if data is not None:
             try:
-                await data[DATA_CONNECTION_MANAGER].async_unload()
+                if not await data[DATA_CONNECTION_MANAGER].async_unload():
+                    # Logical unload can finish with the external owner in
+                    # quarantine. FAILED_UNLOAD is terminal in HA; instead
+                    # replacement setup retries until release is confirmed.
+                    _LOGGER.error(
+                        "Entry %s unloaded with Bluetooth cleanup quarantined; "
+                        "replacement setup will retry until the adapter/proxy "
+                        "confirms release", entry.entry_id,
+                    )
             finally:
-                # Connection cleanup drains cancellation before re-raising it.
-                # Discovery subscriptions must still be released afterward.
                 await data[DATA_DISCOVERY_MANAGER].async_unload()
     finally:
+        if hass.data[DOMAIN].get(entry.entry_id) is data:
+            hass.data[DOMAIN].pop(entry.entry_id, None)
         if not hass.data.get(DOMAIN):
             hass.data.pop(DOMAIN, None)
 

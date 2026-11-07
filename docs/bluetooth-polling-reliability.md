@@ -76,6 +76,17 @@ handoff. Three existing tests requested stop before polling and depended on
 that poll reaching the handoff without yielding. They now request stop at
 the actual handoff; their ownership and cancellation assertions are retained.
 
+HA's `FAILED_UNLOAD` state is terminal, even if a backend later releases its
+connection. #103 therefore uses the planned quarantined outcome: logical
+unload removes entities/listeners, logs the cleanup failure and retains
+external ownership separately. Replacement setup raises `ConfigEntryNotReady`
+until release, allowing HA's normal setup retry rather than requiring a
+restart. Platform refusal/cancellation retains the existing HA semantics.
+
+A failed assertion with an intentionally cancellation-resistant fake call
+left the test loop's final task drain waiting on its artificial gate. The
+shared transport fixture now releases those gates during test teardown.
+
 ## Operation budgets and evidence (#102)
 
 Connection establishment has 20 seconds. Individual GATT calls have 10
@@ -94,3 +105,17 @@ connect, discovery, subscription, authentication and reading operations,
 late callbacks/results, independent valves, and authenticated Evb034 streams
 through simulated Bluetooth I/O. Live adapter/proxy release, shared physical
 capacity and phone-app handoff remain unverified.
+
+## Lifecycle budgets and evidence (#103)
+
+Switch-off and unload invalidate callbacks and cancel/join the same owned
+poll/session. Cleanup retains the independent five-second unsubscribe,
+five-second reset/stream-close and thirty-second disconnect allowances, with
+a 45-second total caller wait. Repeated cancellation preserves that deadline
+and the caller's cancellation result. Unknown release is quarantined across
+entry runtimes; switch-off reports an action error while retaining "off".
+
+Real HA lifecycle tests with simulated GATT cover cooperative reload and
+fresh published values, resistant late connect/read/disconnect, retryable
+replacement setup, another entry, unsubscribe failure, repeated cancellation
+and queued/running handoffs. No physical adapter/proxy evidence is available.

@@ -74,10 +74,12 @@ class ValvePersistentConnectionSwitch(ChandlerValveEntity, SwitchEntity):
     async def async_turn_off(self, **kwargs) -> None:
         """Disable the persistent connection preference."""
 
-        await self._connection.async_set_persistent_connection_enabled(False)
-        self._attr_is_on = self._connection.persistent_connection_enabled
-        if self.hass is not None:
-            self.async_write_ha_state()
+        try:
+            await self._connection.async_set_persistent_connection_enabled(False)
+        finally:
+            self._attr_is_on = self._connection.persistent_connection_enabled
+            if self.hass is not None:
+                self.async_write_ha_state()
 
 
 class ValveAuthenticationLockoutSwitch(ChandlerValveEntity, SwitchEntity):

@@ -44,6 +44,9 @@ PERSISTENT_EXCHANGE_TIMEOUT_SECONDS: Final = 30
 # Connect (20), exchange (60), request unsubscribe (5), reset/stream close (5),
 # and disconnect (30) are independent bounded waits. Expiry uses their sum.
 CONNECTION_ATTEMPT_BUDGET_SECONDS: Final = 120
+CONNECTION_TEARDOWN_BUDGET_SECONDS: Final = 45
+# Separate from entry runtimes: an unconfirmed old owner survives unload.
+DATA_BLUETOOTH_OWNERS: Final = f"{DOMAIN}_bluetooth_owners"
 
 # Default presentation details for discovered devices
 DEFAULT_FRIENDLY_NAME: Final = "Treatment Valve"
