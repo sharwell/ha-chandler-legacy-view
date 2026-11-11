@@ -101,6 +101,49 @@ async def test_manual_refresh_joins_automatic_first_read(
     assert len(valve.clients) == 1
 
 
+async def test_refresh_reuses_a_read_completed_during_cooldown(
+    hass, runtime_factory, bluetooth_io, transport, clock, refresh_action,
+):
+    _, connection, usage = await setup_readings(hass, runtime_factory, bluetooth_io)
+    await clock.run(refresh_action(usage))
+    await hass.async_start()
+    refreshing = asyncio.create_task(refresh_action(usage))
+    await clock.drain()
+    assert not refreshing.done()
+    valve = transport.valve()
+    valve.dashboards.append(dashboard_frames(gallons=987))
+    await connection.async_set_persistent_poll_interval(300)
+    await connection.async_set_persistent_connection_enabled(True)
+    await clock.until(lambda: hass.states.get(usage).state == "987")
+    # Enabling persistent monitoring starts a read before the waiting refresh
+    # wakes. Its validated result already satisfies that refresh.
+    await clock.run(refreshing)
+    assert hass.states.get(usage).state == "987"
+    assert valve.dashboard_requests == 2
+    assert len(valve.clients) == 2
+    assert valve.clients[-1].is_connected
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "lockout"])
+async def test_refresh_rechecks_guards_after_cooldown(
+    hass, runtime_factory, bluetooth_io, transport, clock, refresh_action, failure,
+):
+    _, connection, usage = await setup_readings(hass, runtime_factory, bluetooth_io)
+    await clock.run(refresh_action(usage))
+    success = connection.last_success
+    refreshing = asyncio.create_task(refresh_action(usage))
+    await clock.drain()
+    assert not refreshing.done()
+    if failure == "unavailable":
+        bluetooth_io.expire()
+    else:
+        connection.set_authentication_lockout(True)
+    with pytest.raises(HomeAssistantError, match="unavailable|locked out"):
+        await clock.run(refreshing)
+    assert connection.last_success == success
+    assert len(transport.attempts) == 1
+
+
 @pytest.mark.parametrize("failure", ["unavailable", "lockout", "read"])
 async def test_update_entity_reports_failure_without_changing_success(
     hass, runtime_factory, bluetooth_io, transport, clock, refresh_action, failure,

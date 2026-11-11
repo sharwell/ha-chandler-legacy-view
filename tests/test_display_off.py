@@ -311,12 +311,17 @@ async def test_commands_serialize_with_each_other_and_manual_refresh(
 
 @pytest.mark.parametrize("firmware", [440, 618])
 @pytest.mark.parametrize("failure", ["write", "readback"])
+@pytest.mark.parametrize("persistent", [False, True])
 async def test_queued_refresh_reads_after_a_failed_display_setting(
-    hass, runtime_factory, bluetooth_io, transport, clock, firmware, failure,
+    hass, runtime_factory, bluetooth_io, transport, clock, firmware, failure, persistent,
 ):
     _, connection, valve = await setup_display(
         hass, runtime_factory, bluetooth_io, transport, clock, firmware,
     )
+    if persistent:
+        await connection.async_set_persistent_connection_enabled(True)
+        await clock.run(connection.async_poll())
+        await hass.async_start()
     gate = valve.operations["display_setting"].block()
     if failure == "write":
         gate.failure = OSError("Valve write failed")
@@ -332,12 +337,47 @@ async def test_queued_refresh_reads_after_a_failed_display_setting(
         await clock.run(writing)
     valve.report_display_off = True
     attempts = len(transport.attempts)
+    if persistent:
+        # Recovery can own the valve when the refresh's cooldown ends. The
+        # refresh must join that read rather than treating a skipped poll as
+        # a failed refresh, even while the read is still awaiting a reply.
+        read_gate = valve.operations["dashboard"].block()
+        read_gate.started.clear()
+        await clock.run(read_gate.started.wait())
+        assert not refreshing.done()
+        read_gate.release.set()
     await clock.run(refreshing)
     # Refresh reconciles the actual device value even when a lost reply left
     # the command's adoption uncertain; it must never replay that command.
     expected = "on" if failure == "readback" else "off"
     assert hass.states.get(entity_id(hass, "switch", "valve-a", "display_off")).state == expected
     assert len(transport.attempts) == attempts + 1
+    assert valve.clients[-1].is_connected is persistent
+    assert all(not client.is_connected for client in valve.clients[:-1])
+    assert len(valve.display_writes) == 1
+
+
+@pytest.mark.parametrize("firmware", [440, 618])
+async def test_refresh_waiting_for_cooldown_waits_for_a_new_display_command(
+    hass, runtime_factory, bluetooth_io, transport, clock, firmware,
+):
+    _, connection, valve = await setup_display(
+        hass, runtime_factory, bluetooth_io, transport, clock, firmware,
+    )
+    previous_success = connection.last_success
+    refreshing = asyncio.create_task(connection.async_refresh())
+    await clock.drain()
+    assert not refreshing.done()
+    gate = valve.operations["display_setting"].block()
+    writing = asyncio.create_task(write_display(hass, True))
+    await clock.run(gate.started.wait())
+    # The command arrived after the refresh began waiting. Recheck its
+    # ownership after cooldown instead of failing while the command runs.
+    assert not refreshing.done()
+    gate.release.set()
+    await clock.run(asyncio.gather(writing, refreshing))
+    assert hass.states.get(entity_id(hass, "switch", "valve-a", "display_off")).state == "on"
+    assert connection.last_success > previous_success
     assert all(not client.is_connected for client in valve.clients)
     assert len(valve.display_writes) == 1
 

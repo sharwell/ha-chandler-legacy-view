@@ -1204,39 +1204,47 @@ class ValveConnection:
         await asyncio.shield(task)
 
     async def _async_manual_refresh(self) -> None:
-        if self._setting_tasks:
-            # Wait for ownership to settle, independently of command outcomes.
-            # A refresh can reconcile a setting whose readback was lost.
-            await asyncio.shield(asyncio.gather(*self._setting_tasks, return_exceptions=True))
         revision = self._reading_revision
-        if not self.available:
-            raise HomeAssistantError("Valve is unavailable for Bluetooth refresh")
-        if self._authentication_failed:
-            raise HomeAssistantError("Valve authentication is locked out; correct the passcode or clear lockout")
-        self._raise_if_cleanup_pending()
-        poll = self._poll_task
-        if poll is not None and not poll.done():
-            revision = self._poll_start_revision
-            await asyncio.shield(poll)
-        elif self._persistent_task_active():
-            client = self._transport.client if self._transport else None
-            if client is None or self._persistent_stop_task is not None:
-                raise HomeAssistantError("Valve connection is stopping; refresh cannot run yet")
-            if self._session_read_task is not None and not self._session_read_task.done():
-                revision = self._session_read_start_revision
-            try:
-                sent, received = await self._async_session_read(client)
-            except TimeoutError as exc:
-                raise HomeAssistantError("Persistent valve refresh timed out") from exc
-            if not sent or not received:
-                raise HomeAssistantError("Persistent valve did not return fresh readings")
-        else:
-            if self._next_connection_time is not None:
-                await asyncio.sleep(max(0, (self._next_connection_time - dt_util.utcnow()).total_seconds()))
+        while True:
+            if self._setting_tasks:
+                # Wait for ownership to settle, independently of command outcomes.
+                # A refresh can reconcile a setting whose readback was lost.
+                await asyncio.shield(asyncio.gather(*self._setting_tasks, return_exceptions=True))
+                revision = self._reading_revision
+                continue
             if not self.available:
-                raise HomeAssistantError("Valve became unavailable before refresh")
+                raise HomeAssistantError("Valve is unavailable for Bluetooth refresh")
+            if self._authentication_failed:
+                raise HomeAssistantError("Valve authentication is locked out; correct the passcode or clear lockout")
             self._raise_if_cleanup_pending()
-            await self.async_poll()
+            if self._reading_revision != revision:
+                return
+            poll = self._poll_task
+            if poll is not None and not poll.done():
+                revision = self._poll_start_revision
+                await asyncio.shield(poll)
+            elif self._persistent_task_active():
+                client = self._transport.client if self._transport else None
+                if client is None or self._persistent_stop_task is not None:
+                    raise HomeAssistantError("Valve connection is stopping; refresh cannot run yet")
+                if self._session_read_task is not None and not self._session_read_task.done():
+                    revision = self._session_read_start_revision
+                try:
+                    sent, received = await self._async_session_read(client)
+                except TimeoutError as exc:
+                    raise HomeAssistantError("Persistent valve refresh timed out") from exc
+                if not sent or not received:
+                    raise HomeAssistantError("Persistent valve did not return fresh readings")
+            else:
+                if self._next_connection_time is not None:
+                    remaining = (self._next_connection_time - dt_util.utcnow()).total_seconds()
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+                        # Cooldown does not reserve the connection. Recheck
+                        # commands, guards and readers that changed while asleep.
+                        continue
+                await self.async_poll()
+            break
         if self._reading_revision == revision:
             raise HomeAssistantError("Valve refresh did not produce a validated reading")
 
