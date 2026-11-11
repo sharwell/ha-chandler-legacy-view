@@ -3,6 +3,7 @@
 from datetime import UTC, datetime
 import logging
 import pytest
+from homeassistant.const import EntityStateAttribute
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 from custom_components.chandler_legacy_view.const import DOMAIN, DATA_CONNECTION_MANAGER
@@ -41,7 +42,9 @@ async def test_enabling_clock_uses_real_lifecycle_and_current_reading(hass, runt
     await hass.async_block_till_done()
     identifier = sensor_id(hass, "time_of_day")
     er.async_get(hass).async_update_entity(identifier, disabled_by=None)
-    await clock.until(lambda: hass.states.get(identifier) is not None)
+    # HA 2026.11 publishes a restored placeholder before reloading the entity.
+    await clock.until(lambda: (state := hass.states.get(identifier)) is not None
+                      and not state.attributes.get(EntityStateAttribute.RESTORED))
     transport.valve().dashboards.append(dashboard_frames(hour=4, minute=36, is_pm=is_pm))
     await clock.run(connection(hass, entry).async_poll())
     published = datetime.fromisoformat(hass.states.get(identifier).state)

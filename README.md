@@ -81,7 +81,7 @@ environment, then choose a requirements file for the HA version to test:
 
 | Home Assistant target | Test requirements |
 | --- | --- |
-| 2026.10.4 | `requirements-test.txt` |
+| 2026.11.1 | `requirements-test.txt` |
 | 2026.8.0, the declared minimum | `requirements-test-min.txt` |
 
 Install the selected requirements and run the suite, for example:
