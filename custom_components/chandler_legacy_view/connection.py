@@ -1205,7 +1205,9 @@ class ValveConnection:
 
     async def _async_manual_refresh(self) -> None:
         if self._setting_tasks:
-            await asyncio.shield(asyncio.gather(*self._setting_tasks))
+            # Wait for ownership to settle, independently of command outcomes.
+            # A refresh can reconcile a setting whose readback was lost.
+            await asyncio.shield(asyncio.gather(*self._setting_tasks, return_exceptions=True))
         revision = self._reading_revision
         if not self.available:
             raise HomeAssistantError("Valve is unavailable for Bluetooth refresh")

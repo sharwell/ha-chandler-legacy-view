@@ -240,10 +240,15 @@ async def test_unload_cancels_pending_setting_and_prevents_late_state(
     gate = valve.operations["display_setting"].block()
     writing = asyncio.create_task(write_display(hass, True))
     await clock.run(gate.started.wait())
+    refreshing = asyncio.create_task(connection.async_refresh())
+    await clock.drain()
+    assert not refreshing.done()
     assert await clock.run(hass.config_entries.async_unload(entry.entry_id))
     await clock.drain()
     with pytest.raises(asyncio.CancelledError):
         await writing
+    with pytest.raises(asyncio.CancelledError):
+        await refreshing
     assert gate.cancelled
     assert not valve.display_off
     assert not valve.clients[-1].is_connected
@@ -302,6 +307,96 @@ async def test_commands_serialize_with_each_other_and_manual_refresh(
     assert [value for _, value in valve.display_writes] == [1, 0]
     assert not valve.display_off
     assert hass.states.get(entity_id(hass, "switch", "valve-a", "display_off")).state == "off"
+
+
+@pytest.mark.parametrize("firmware", [440, 618])
+@pytest.mark.parametrize("failure", ["write", "readback"])
+async def test_queued_refresh_reads_after_a_failed_display_setting(
+    hass, runtime_factory, bluetooth_io, transport, clock, firmware, failure,
+):
+    _, connection, valve = await setup_display(
+        hass, runtime_factory, bluetooth_io, transport, clock, firmware,
+    )
+    gate = valve.operations["display_setting"].block()
+    if failure == "write":
+        gate.failure = OSError("Valve write failed")
+    else:
+        valve.report_display_off = False
+    writing = asyncio.create_task(write_display(hass, True))
+    await clock.run(gate.started.wait())
+    refreshing = asyncio.create_task(connection.async_refresh())
+    await clock.drain()
+    assert not refreshing.done()
+    gate.release.set()
+    with pytest.raises(HomeAssistantError):
+        await clock.run(writing)
+    valve.report_display_off = True
+    attempts = len(transport.attempts)
+    await clock.run(refreshing)
+    # Refresh reconciles the actual device value even when a lost reply left
+    # the command's adoption uncertain; it must never replay that command.
+    expected = "on" if failure == "readback" else "off"
+    assert hass.states.get(entity_id(hass, "switch", "valve-a", "display_off")).state == expected
+    assert len(transport.attempts) == attempts + 1
+    assert all(not client.is_connected for client in valve.clients)
+    assert len(valve.display_writes) == 1
+
+
+@pytest.mark.parametrize("firmware", [440, 618])
+async def test_queued_refresh_waits_for_every_setting_after_one_fails(
+    hass, runtime_factory, bluetooth_io, transport, clock, firmware,
+):
+    _, connection, valve = await setup_display(
+        hass, runtime_factory, bluetooth_io, transport, clock, firmware,
+    )
+    gate = valve.operations["display_setting"].block()
+    gate.failure = OSError("First setting failed")
+    first = asyncio.create_task(write_display(hass, True))
+    await clock.run(gate.started.wait())
+    second = asyncio.create_task(write_display(hass, False))
+    refreshing = asyncio.create_task(connection.async_refresh())
+    await clock.drain()
+    gate.release.set()
+    with pytest.raises(HomeAssistantError):
+        await clock.run(first)
+    gate.failure = None
+    gate.block()
+    gate.started.clear()
+    await clock.run(gate.started.wait())
+    # Waiting must not end at the first failed command while another command
+    # still owns the valve and would prevent the refresh from reading it.
+    assert not refreshing.done()
+    attempts = len(transport.attempts)
+    gate.release.set()
+    await clock.run(asyncio.gather(second, refreshing))
+    assert hass.states.get(entity_id(hass, "switch", "valve-a", "display_off")).state == "off"
+    assert len(transport.attempts) == attempts + 1
+    assert [value for _, value in valve.display_writes] == [1, 0]
+
+
+@pytest.mark.parametrize("firmware", [440, 618])
+async def test_queued_refresh_reports_its_own_cleanup_guard_after_setting_timeout(
+    hass, runtime_factory, bluetooth_io, transport, clock, firmware,
+):
+    _, connection, valve = await setup_display(
+        hass, runtime_factory, bluetooth_io, transport, clock, firmware,
+    )
+    gate = valve.operations["display_setting"].block()
+    gate.ignore_cancellation = True
+    writing = asyncio.create_task(write_display(hass, True))
+    await clock.run(gate.started.wait())
+    refreshing = asyncio.create_task(connection.async_refresh())
+    await clock.drain()
+    with pytest.raises(HomeAssistantError):
+        await clock.run(writing)
+    assert connection.cleanup_pending
+    attempts = len(transport.attempts)
+    with pytest.raises(HomeAssistantError, match="cleanup"):
+        await clock.run(refreshing)
+    assert len(transport.attempts) == attempts
+    assert len(valve.display_writes) == 1
+    gate.release.set()
+    await clock.until(lambda: not connection.cleanup_pending)
 
 
 @pytest.mark.parametrize("firmware", [440, 618])

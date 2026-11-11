@@ -63,6 +63,9 @@ automatically replayed. A later ordinary read can reconcile the actual state.
 Persistent monitoring resumes after a failed setting without requiring another
 advertisement. Recovery observes the normal connection cooldown, authentication
 lockout and cleanup quarantine; it reads the valve without repeating the command.
+A manual refresh queued behind settings waits for those commands to settle,
+then checks its own availability, authentication and cleanup requirements. A
+failed command does not prevent the refresh from reading the actual valve state.
 Cancellation and unload retire the owned work; a cancellation-resistant
 backend remains quarantined until its pending I/O and disconnect settle.
 
