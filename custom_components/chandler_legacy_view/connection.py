@@ -103,6 +103,7 @@ _EVB019_REQUEST_PACKET_LENGTH = 20
 _DEVICE_LIST_RESPONSE_TIMEOUT_SECONDS = 5
 _DEVICE_LIST_MIN_RESPONSE_LENGTH = 18
 _DASHBOARD_RESPONSE_TIMEOUT_SECONDS = 5
+_DISPLAY_READBACK_TIMEOUT_SECONDS = 9
 _RESET_BUFFER_TIMEOUT_SECONDS = 5
 _DISCONNECT_TIMEOUT_SECONDS = 30
 _DASHBOARD_PACKET_COUNT = 6
@@ -481,7 +482,7 @@ class ValveConnection:
             cursor = session.notification_cursor
             started = self._hass.loop.time()
             await session.send_command(b'{"asdo":' + (b'1}' if enabled else b'0}'))
-            async with asyncio.timeout(9):
+            async with asyncio.timeout(_DISPLAY_READBACK_TIMEOUT_SECONDS):
                 while True:
                     packet = await session.next_packet(after=cursor)
                     self._handle_evb034_update(packet)
@@ -489,9 +490,8 @@ class ValveConnection:
                     # Coalescing can carry an older asdo alongside a new flow
                     # reading. Only this field's own receipt can confirm it.
                     confirmed = getattr(packet, "confirmed_at", {}).get("asdo", float("-inf"))
-                    if type(value) is int and value in (0, 1) and confirmed >= started:
-                        if bool(value) != enabled:
-                            raise HomeAssistantError("Valve did not adopt the display-off setting")
+                    if (type(value) is int and value in (0, 1)
+                            and bool(value) == enabled and confirmed >= started):
                         return
         else:
             # CsDataBufferEvb019.getSetDisplayOnOffBuffer: AdvancedSettings
@@ -500,10 +500,17 @@ class ValveConnection:
             payload[13:15] = bytes((0x47, int(enabled)))
             if not await self._async_send_payload(client, bytes(payload), command_name="Display-off setting"):
                 raise HomeAssistantError("Unable to send the display-off setting")
-            sent, received = await self._async_request_dashboard(client)
-            if (not sent or not received or self._dashboard_data is None
-                    or self._dashboard_data.display_off is not enabled):
-                raise HomeAssistantError("Valve did not confirm the display-off setting")
+            # Like the app's pending state, an old value can precede adoption.
+            # Retry only reads at the app's one-second cadence, never the write.
+            async with asyncio.timeout(_DISPLAY_READBACK_TIMEOUT_SECONDS):
+                while True:
+                    sent, received = await self._async_request_dashboard(client)
+                    if not sent:
+                        raise HomeAssistantError("Unable to read back the display-off setting")
+                    if (received and self._dashboard_data is not None
+                            and self._dashboard_data.display_off is enabled):
+                        return
+                    await asyncio.sleep(1)
 
     @property
     def entity_capabilities(self) -> ValveCapabilities:

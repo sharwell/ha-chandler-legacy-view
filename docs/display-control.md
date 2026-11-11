@@ -47,6 +47,13 @@ and requests a complete Dashboard readback. Evb034 requires an explicit valid
 cannot confirm adoption. Per-field receipt timestamps prevent a coalesced old
 `asdo` from being mistaken for command readback.
 
+A differing value leaves the command pending, matching the app's
+`checkUpdateEvb019` and `setDisplayOffStateEvb034` behavior. Confirmation has
+a nine-second deadline: Evb034 waits for a matching explicit update, while
+Evb019 requests Dashboard readback again with a one-second pause between
+reads. Only read requests repeat; the setting command is sent once. If the
+value never matches, the operation times out with an unconfirmed outcome.
+
 Only received valve values update the switch. Rejection, lost readback and
 write timeout raise errors without publishing an assumed requested value.
 An unconfirmed command makes the display control unavailable until a later

@@ -10,7 +10,9 @@ from homeassistant.helpers import entity_registry as er
 
 from custom_components.chandler_legacy_view.const import DATA_CONNECTION_MANAGER, DOMAIN
 from custom_components.chandler_legacy_view.freshness import RECOVERY_ALLOWANCE
+from ble import NOTIFY
 from evb034_packets import frames
+from packets import dashboard_frames
 from test_configured_authentication import entity_id
 
 
@@ -240,6 +242,115 @@ async def test_newer_setting_needs_explicit_readback_even_when_value_is_unchange
     valve.report_display_off = False
     with pytest.raises(HomeAssistantError, match="timed out"):
         await clock.run(write_display(hass, False))
+    assert len(valve.display_writes) == 1
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("persistent", [False, True])
+async def test_newer_old_value_in_flight_remains_pending_until_matching_readback(
+    hass, runtime_factory, bluetooth_io, transport, clock, enabled, persistent,
+):
+    _, connection, valve = await setup_display(
+        hass, runtime_factory, bluetooth_io, transport, clock, 618,
+    )
+    valve.display_off = not enabled
+    if persistent:
+        await connection.async_set_persistent_connection_enabled(True)
+        await clock.run(connection.async_poll())
+    gate = valve.operations["display_setting"].block()
+    writing = asyncio.create_task(write_display(hass, enabled))
+    await clock.run(gate.started.wait())
+    # A stream update can arrive after submission but before device adoption.
+    # Its old value is not a rejection of the pending command.
+    for packet in frames({"asdo": int(not enabled)}):
+        valve.clients[-1].notify(packet)
+    await clock.drain()
+    gate.release.set()
+    await clock.run(writing)
+    assert hass.states.get(entity_id(hass, "switch", "valve-a", "display_off")).state == (
+        "on" if enabled else "off"
+    )
+    assert valve.display_off is enabled
+    assert [value for _, value in valve.display_writes] == [int(enabled)]
+    assert valve.clients[-1].is_connected is persistent
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("persistent", [False, True])
+async def test_older_stale_dashboard_remains_pending_until_matching_readback(
+    hass, runtime_factory, bluetooth_io, transport, clock, enabled, persistent,
+):
+    _, connection, valve = await setup_display(
+        hass, runtime_factory, bluetooth_io, transport, clock, 440,
+    )
+    valve.display_off = not enabled
+    if persistent:
+        await connection.async_set_persistent_connection_enabled(True)
+        await clock.run(connection.async_poll())
+    for value in (not enabled, not enabled, enabled):
+        reply = dashboard_frames()
+        first = bytearray(reply[0])
+        first[18] = 0x10 if value else 0
+        reply[0] = bytes(first)
+        valve.dashboards.append(reply)
+    await clock.run(write_display(hass, enabled))
+    assert hass.states.get(entity_id(hass, "switch", "valve-a", "display_off")).state == (
+        "on" if enabled else "off"
+    )
+    assert valve.display_off is enabled
+    assert [value for _, value in valve.display_writes] == [int(enabled)]
+    assert valve.clients[-1].is_connected is persistent
+
+
+@pytest.mark.parametrize("firmware", [440, 618])
+async def test_unload_during_pending_readback_fences_late_confirmation(
+    hass, runtime_factory, bluetooth_io, transport, clock, firmware,
+):
+    entry, connection, valve = await setup_display(
+        hass, runtime_factory, bluetooth_io, transport, clock, firmware,
+    )
+    valve.report_display_off = False
+    writing = asyncio.create_task(write_display(hass, True))
+    await clock.until(lambda: len(valve.display_writes) == 1)
+    await clock.drain()
+    assert not writing.done() and valve.display_off
+    handlers = list(valve.clients[-1].notification_history)
+    assert await clock.run(hass.config_entries.async_unload(entry.entry_id))
+    with pytest.raises(asyncio.CancelledError):
+        await writing
+    assert not connection.cleanup_pending
+    assert not valve.clients[-1].is_connected
+    late = frames({"asdo": 1}) if firmware >= 600 else dashboard_frames()
+    if firmware < 600:
+        first = bytearray(late[0])
+        first[18] = 0x10
+        late[0] = bytes(first)
+    for handler in handlers:
+        for packet in late:
+            handler(NOTIFY, bytearray(packet))
+    await clock.drain()
+    assert hass.states.get(entity_id(hass, "switch", "valve-a", "display_off")).state == "unavailable"
+    assert len(valve.display_writes) == 1
+
+
+@pytest.mark.parametrize("firmware", [440, 618])
+async def test_nonmatching_readback_times_out_without_replaying_the_setting(
+    hass, runtime_factory, bluetooth_io, transport, clock, firmware,
+):
+    _, connection, valve = await setup_display(
+        hass, runtime_factory, bluetooth_io, transport, clock, firmware,
+    )
+    valve.accept_display_settings = False
+    writing = asyncio.create_task(write_display(hass, True))
+    await clock.run(valve.operations["display_setting"].started.wait())
+    started = clock.loop.time()
+    with pytest.raises(HomeAssistantError, match="timed out"):
+        await clock.run(writing)
+    # Old values remain pending for the documented confirmation window;
+    # neither a stream of them nor fast Dashboard replies can extend it.
+    assert 8 < clock.loop.time() - started < 11
+    assert hass.states.get(entity_id(hass, "switch", "valve-a", "display_off")).state == "unavailable"
+    assert not valve.display_off
     assert len(valve.display_writes) == 1
 
 
