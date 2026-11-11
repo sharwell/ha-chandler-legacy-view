@@ -7,12 +7,13 @@ import struct
 
 from .models import ValveDashboardData
 
-READING_KEYS = {"dh", "dm", "da", "dbl", "gpf", "dtgr", "dwu", "dpfd", "dwh", "dcdo"}
+READING_KEYS = {"dh", "dm", "da", "dbl", "gpf", "dtgr", "dwu", "dpfd", "dwh", "dcdo", "asdo"}
 READING_FIELDS = {
     "present_flow": "present_flow", "water_usage_today": "water_usage",
     "peak_flow_today": "peak_flow", "soft_water_remaining": "water_remaining_until_regeneration",
     "days_until_regeneration": "air_recharge", "water_hardness": "water_hardness",
     "battery": "battery_capacity", "time_of_day": "time_hour",
+    "display_off": "display_off",
 }
 
 
@@ -38,6 +39,8 @@ def valid_reading_keys(packet: Mapping, firmware: int, *, clack: bool) -> set[st
             keys.remove(key)
     if clack or firmware >= 609:
         keys.discard("da")  # The 24-hour clock does not consume this component.
+    if type(packet.get("asdo")) is not int or packet["asdo"] not in (0, 1):
+        keys.discard("asdo")
     return keys
 
 
@@ -58,6 +61,8 @@ def _battery_capacity(raw: float) -> int:
 def decode_dashboard(packet: Mapping, firmware: int, *, clack: bool = False) -> ValveDashboardData:
     """Retain absent readings as unknown; apply each field's own conversion."""
     values = {field.name: None for field in fields(ValveDashboardData)}
+    if type(packet.get("asdo")) is int and packet["asdo"] in (0, 1):
+        values["display_off"] = bool(packet["asdo"])
     divisor = 100 if clack or firmware >= 611 else 1
     for key, field, scale, truncate in (
         ("gpf", "present_flow", 100, False),

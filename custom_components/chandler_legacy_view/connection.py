@@ -275,6 +275,8 @@ class ValveConnection:
         self._session_read_start_revision = 0
         self._poll_start_revision = 0
         self._lock = asyncio.Lock()
+        self._setting_lock = asyncio.Lock()
+        self._setting_tasks: set[asyncio.Task] = set()
         self._unloaded = False
         self._next_connection_time: datetime | None = None
         self._cooldown_cancel: CALLBACK_TYPE | None = None
@@ -412,6 +414,96 @@ class ValveConnection:
         """Return the parsed data from the most recent Dashboard response."""
 
         return self._dashboard_data
+
+    @property
+    def display_off_supported(self) -> bool:
+        """Use the Advanced Settings UI gate, not the C4.10 raw flag gate."""
+        advertisement = self._advertisement
+        if advertisement is None or advertisement.model not in (None, "Evb019", "Evb034"):
+            return False
+        firmware = self._entity_capabilities.firmware_version
+        return self._entity_capabilities.is_twin_valve is True or (
+            firmware is not None and firmware >= 413
+        )
+
+    async def async_set_display_off(self, enabled: bool) -> None:
+        """Set only the display-off preference and require device readback."""
+        if type(enabled) is not bool:
+            raise ValueError("Display-off must be a boolean")
+        if not self.available or not self.display_off_supported:
+            raise HomeAssistantError("Display-off control is unavailable for this valve")
+        task = asyncio.create_task(self._async_set_display_off(enabled))
+        self._setting_tasks.add(task)
+        try:
+            await task
+        finally:
+            self._setting_tasks.discard(task)
+            self._schedule_next_poll()
+
+    async def _async_set_display_off(self, enabled: bool) -> None:
+        # A setting owns a finite session. Retire the polling session first so
+        # its reader cannot consume a command's readback or race the write.
+        async with self._setting_lock:
+            poll = self._poll_task
+            if poll is not None:
+                await asyncio.shield(poll)
+            await self._async_stop_persistent_session()
+            self._raise_if_cleanup_pending()
+            if self._next_connection_time is not None:
+                await asyncio.sleep(max(0, (self._next_connection_time - dt_util.utcnow()).total_seconds()))
+            async with self._lock:
+                if not self.available or not self.display_off_supported or self._authentication_failed:
+                    raise HomeAssistantError("Display-off control is unavailable or authentication is locked out")
+                if not await self._async_prepare_connection():
+                    raise HomeAssistantError("Another Bluetooth operation still owns this valve")
+                self._poll_task = asyncio.current_task()
+                try:
+                    if not await self._async_poll_locked(display_off=enabled):
+                        raise HomeAssistantError("Valve did not confirm the display-off setting")
+                    self._raise_if_cleanup_pending()
+                except BaseException:
+                    # The device may have adopted a command whose reply was
+                    # lost. A pre-command value cannot resolve that outcome.
+                    self._freshness.invalidate({"display_off"}, "display configuration was not confirmed")
+                    raise
+                finally:
+                    self._poll_task = None
+
+    async def _async_write_display_off(self, client: BaseBleakClient, enabled: bool) -> None:
+        """Use the reference's field-specific command; never rewrite status bits."""
+        if not self._has_dashboard_access() or not self.display_off_supported:
+            raise HomeAssistantError("Valve has not confirmed access to display-off configuration")
+        if client is self._evb034_client:
+            session = self._evb034_session
+            if session is None:
+                raise HomeAssistantError("Valve configuration session ended")
+            # Transport ACKs confirm receipt, not adoption of the setting.
+            cursor = session.notification_cursor
+            started = self._hass.loop.time()
+            await session.send_command(b'{"asdo":' + (b'1}' if enabled else b'0}'))
+            async with asyncio.timeout(9):
+                while True:
+                    packet = await session.next_packet(after=cursor)
+                    self._handle_evb034_update(packet)
+                    value = packet.get("asdo")
+                    # Coalescing can carry an older asdo alongside a new flow
+                    # reading. Only this field's own receipt can confirm it.
+                    confirmed = getattr(packet, "confirmed_at", {}).get("asdo", float("-inf"))
+                    if type(value) is int and value in (0, 1) and confirmed >= started:
+                        if bool(value) != enabled:
+                            raise HomeAssistantError("Valve did not adopt the display-off setting")
+                        return
+        else:
+            # CsDataBufferEvb019.getSetDisplayOnOffBuffer: AdvancedSettings
+            # filler, field selector 0x47 at 13, Active/Inactive at 14.
+            payload = bytearray(self._create_request_payload(ValveRequestCommand.ADVANCED_SETTINGS))
+            payload[13:15] = bytes((0x47, int(enabled)))
+            if not await self._async_send_payload(client, bytes(payload), command_name="Display-off setting"):
+                raise HomeAssistantError("Unable to send the display-off setting")
+            sent, received = await self._async_request_dashboard(client)
+            if (not sent or not received or self._dashboard_data is None
+                    or self._dashboard_data.display_off is not enabled):
+                raise HomeAssistantError("Valve did not confirm the display-off setting")
 
     @property
     def entity_capabilities(self) -> ValveCapabilities:
@@ -698,6 +790,7 @@ class ValveConnection:
         complete = advertisement.manufacturer_data_complete
         firmware = advertisement.firmware_version
         self._update_entity_capabilities(
+            firmware_version=firmware if complete else None,
             is_twin_valve=(
                 advertisement.is_twin_valve
                 if (firmware is not None or advertisement.is_twin_valve)
@@ -728,6 +821,7 @@ class ValveConnection:
         is_twin_valve: bool | None = None,
         valve_type: str | None = None,
         is_clack_valve: bool | None = None,
+        firmware_version: int | None = None,
     ) -> None:
         """Retain known support until newer, explicit metadata supersedes it.
 
@@ -740,6 +834,9 @@ class ValveConnection:
         if valve_type == "Unknown":
             valve_type = None
         updated = ValveCapabilities(
+            firmware_version=(
+                firmware_version if firmware_version is not None else previous.firmware_version
+            ),
             is_twin_valve=(
                 is_twin_valve if is_twin_valve is not None else previous.is_twin_valve
             ),
@@ -1096,6 +1193,8 @@ class ValveConnection:
         await asyncio.shield(task)
 
     async def _async_manual_refresh(self) -> None:
+        if self._setting_tasks:
+            await asyncio.shield(asyncio.gather(*self._setting_tasks))
         revision = self._reading_revision
         if not self.available:
             raise HomeAssistantError("Valve is unavailable for Bluetooth refresh")
@@ -1132,6 +1231,8 @@ class ValveConnection:
         """Prevent future polls and wait for any active poll to finish."""
 
         self._unloaded = True
+        for setting in self._setting_tasks:
+            setting.cancel()
         self._freshness.close()
         self._persistent_connection_enabled = False
         self._cancel_cooldown()
@@ -1156,6 +1257,8 @@ class ValveConnection:
     async def _async_finish_unload(self) -> None:
         """Wait for connection cleanup, including an active one-shot poll."""
 
+        if self._setting_tasks:
+            await asyncio.gather(*self._setting_tasks, return_exceptions=True)
         refresh = self._refresh_task
         if refresh is not None:
             with contextlib.suppress(asyncio.CancelledError, HomeAssistantError):
@@ -1170,7 +1273,7 @@ class ValveConnection:
     async def async_poll(self, *, automatic: bool = False) -> None:
         """Attempt to connect to the valve and fetch additional data."""
 
-        if not self.available:
+        if not self.available or self._setting_tasks:
             return
         if automatic and not self._automatic_poll_due():
             return
@@ -1189,22 +1292,7 @@ class ValveConnection:
             return
 
         async with self._lock:
-            owner = self._transport
-            if owner is not None and owner.retired:
-                if not owner.pending and owner.client is not None:
-                    await self._async_disconnect_client(owner.client)
-                self._transport_changed()
-                if self._transport is not None:
-                    _LOGGER.debug("Skipping poll for %s; old Bluetooth work is quarantined", self._address)
-                    return
-            owners = self._hass.data.setdefault(DATA_BLUETOOTH_OWNERS, {})
-            previous = owners.get(self._address)
-            if previous is not None and previous is not self:
-                _LOGGER.warning(
-                    "Cannot connect to valve %s: another runtime still owns "
-                    "its Bluetooth connection; wait for confirmed cleanup",
-                    self._address,
-                )
+            if not await self._async_prepare_connection():
                 return
             self._poll_task = asyncio.current_task()
             self._poll_start_revision = self._reading_revision
@@ -1215,13 +1303,32 @@ class ValveConnection:
             finally:
                 self._poll_task = None
 
-    async def _async_poll_locked(self) -> None:
+    async def _async_prepare_connection(self) -> bool:
+        """Keep polling and settings behind the same transport ownership gate."""
+        owner = self._transport
+        if owner is not None and owner.retired:
+            if not owner.pending and owner.client is not None:
+                await self._async_disconnect_client(owner.client)
+            self._transport_changed()
+            if self._transport is not None:
+                _LOGGER.debug("Skipping connection for %s; old Bluetooth work is quarantined", self._address)
+                return False
+        previous = self._hass.data.setdefault(DATA_BLUETOOTH_OWNERS, {}).get(self._address)
+        if previous is not None and previous is not self:
+            _LOGGER.warning(
+                "Cannot connect to valve %s: another runtime still owns "
+                "its Bluetooth connection; wait for confirmed cleanup", self._address,
+            )
+            return False
+        return True
+
+    async def _async_poll_locked(self, *, display_off: bool | None = None) -> bool:
         """Perform a Bluetooth connection cycle for the valve."""
 
         now = dt_util.utcnow()
         self._freshness.activate()
         if self._authentication_failed:
-            return
+            return False
         next_connection_time = self._next_connection_time
         if next_connection_time is not None and now < next_connection_time:
             remaining = max((next_connection_time - now).total_seconds(), 0)
@@ -1231,13 +1338,14 @@ class ValveConnection:
                 remaining,
             )
             self._schedule_cooldown_retry(remaining)
-            return
+            return False
 
         connection_attempted = False
         cleanup_client: BaseBleakClient | None = None
         owner: OwnedBluetoothOperations | None = None
         revision = self._reading_revision
         due = self._reading_attempt_due()
+        refreshed = False
 
         try:
             advertisement = self._advertisement
@@ -1245,7 +1353,7 @@ class ValveConnection:
                 _LOGGER.debug(
                     "Skipping poll for %s; no advertisement data is available", self._address
                 )
-                return
+                return False
 
             ble_device = bluetooth.async_ble_device_from_address(
                 self._hass, self._address, connectable=True
@@ -1254,7 +1362,7 @@ class ValveConnection:
                 _LOGGER.debug(
                     "Bluetooth device %s is not currently connectable", self._address
                 )
-                return
+                return False
 
             _LOGGER.debug(
                 "Connecting to valve %s to refresh diagnostic data", self._address
@@ -1279,19 +1387,19 @@ class ValveConnection:
                 _LOGGER.warning(
                     "Timed out while attempting to connect to valve %s", self._address
                 )
-                return
+                return False
             except BLEAK_RETRY_EXCEPTIONS as exc:
                 _LOGGER.debug(
                     "Unable to establish Bluetooth connection to valve %s: %s",
                     self._address,
                     exc,
                 )
-                return
+                return False
             except Exception:  # pragma: no cover - unexpected errors are logged
                 _LOGGER.exception(
                     "Unexpected error connecting to valve %s", self._address
                 )
-                return
+                return False
 
             cleanup_client = client
 
@@ -1300,10 +1408,18 @@ class ValveConnection:
                     self._connection_state_callback(self._address, True)
                 async with asyncio.timeout(POLL_EXCHANGE_TIMEOUT_SECONDS):
                     refreshed = await self._async_fetch_device_information(client)
+                    if display_off is not None:
+                        if not refreshed:
+                            raise HomeAssistantError("Valve did not provide authenticated readings before configuration")
+                        await self._async_write_display_off(client, display_off)
             except TimeoutError:
                 owner.invalidate()
+                if display_off is not None:
+                    raise HomeAssistantError("Display-off configuration timed out; its outcome is unconfirmed") from None
                 _LOGGER.warning("Reading exchange timed out for valve %s", self._address)
-            except Exception:  # pragma: no cover - future protocol work may raise
+            except Exception as exc:
+                if display_off is not None:
+                    raise HomeAssistantError(str(exc)) from exc
                 _LOGGER.exception(
                     "Error while retrieving extended data from valve %s", self._address
                 )
@@ -1325,6 +1441,7 @@ class ValveConnection:
                     owner.notifications_enabled = False
                 self._transport_changed()
                 self._schedule_next_poll()
+        return refreshed
 
     async def _async_fetch_device_information(
         self, client: BaseBleakClient
@@ -1602,7 +1719,7 @@ class ValveConnection:
         data = decode_dashboard(updated, firmware, clack=is_clack)
         if not any(getattr(data, field) is not None for field in (
             "time_hour", "battery_capacity", "present_flow", "water_usage", "peak_flow",
-            "water_hardness", "water_remaining_until_regeneration", "air_recharge",
+            "water_hardness", "water_remaining_until_regeneration", "air_recharge", "display_off",
         )):
             return False
         self._evb034_eligible.update(
@@ -1707,6 +1824,7 @@ class ValveConnection:
                            water_status=int(bool(status & 0x40)), bypass_status=int(bool(status & 0x20)))
         self._advertisement = replace(advertisement, **updates)
         self._update_entity_capabilities(
+            firmware_version=firmware,
             valve_type=updates.get("valve_type"), is_twin_valve=updates.get("is_twin_valve"),
             is_clack_valve=updates.get("is_clack_valve"),
         )
@@ -3025,6 +3143,7 @@ class ValveConnection:
 
         if not (packet[5] or packet[6]) or self._device_list_firmware_version is not None:
             self._update_entity_capabilities(
+                firmware_version=self._device_list_firmware_version,
                 is_twin_valve=self._device_list_is_twin_valve,
                 valve_type=self._device_list_valve_type,
             )

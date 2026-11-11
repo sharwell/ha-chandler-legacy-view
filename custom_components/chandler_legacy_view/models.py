@@ -13,16 +13,18 @@ _METERED_SOFTENER_VALVE_TYPES = {
 
 @dataclass(frozen=True, slots=True)
 class ValveCapabilities:
-    """Confirmed metadata for the Water System 6.18.2 Dashboard display rules.
+    """Confirmed metadata for Water System 6.18.2 entity eligibility.
 
     CsDashboardViewModel.setupValveOptions uses CsValveType.isMeteredSoftener
     for hardness, remaining water, and days. None of the currently exposed
     Dashboard rows has a firmware cutoff; the battery row excludes Clack.
+    Advanced Settings display-off requires firmware C4.13+ or a twin valve.
     """
 
     is_twin_valve: bool | None = None
     valve_type: str | None = None
     is_clack_valve: bool | None = None
+    firmware_version: int | None = None
 
     @property
     def is_metered_softener(self) -> bool | None:
@@ -103,7 +105,7 @@ class ValveDashboardData:
     bypass_setting_enabled: bool
     shutoff_active: bool
     bypass_active: bool
-    display_off: bool
+    display_off: bool | None
     filter_backwash: int
     air_recharge: int | None
     pos_time: int

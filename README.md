@@ -39,6 +39,20 @@ enabled or disabled setting; disable an existing Time of Day sensor manually
 to stop its updates. The integration still reads the valve clock during normal
 dashboard polling when this sensor is disabled.
 
+The **Display Off** configuration switch is available on supported C4.13+
+valves and twins, including supported newer BLE/Clack variants. Turning the
+switch **on blanks the valve's display**; turning it **off restores the
+display**. C4.10–C4.12 non-twin valves do not get this control. The switch
+reports confirmed valve data and becomes unavailable when that data expires
+or authentication is locked out. Merely loading the integration never sends
+a display-setting command.
+
+Changes wait for any active poll and the normal connection retry delay, then
+use a fresh authenticated connection. Persistent monitoring resumes after a
+successful change. A failed or unconfirmed change reports an error and is
+not automatically repeated. See [display-control evidence and hardware
+checks](docs/display-control.md) for protocol details and validation limits.
+
 Firmware and model information are accepted only from a recognized complete
 advertisement. Short status packets refresh presence without replacing trusted
 device metadata. After an integration reload, firmware may remain unknown until

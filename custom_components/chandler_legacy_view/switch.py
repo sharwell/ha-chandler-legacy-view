@@ -170,6 +170,61 @@ class ValveAuthenticationLockoutSwitch(ChandlerValveEntity, SwitchEntity):
             self.async_write_ha_state()
 
 
+class ValveDisplayOffSwitch(ChandlerValveEntity, SwitchEntity):
+    """Turn the valve's display-off setting on or off with confirmed state."""
+
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, advertisement: ValveAdvertisement, connection: ValveConnection) -> None:
+        super().__init__(advertisement)
+        self._connection = connection
+        self._attr_unique_id = f"{advertisement.address}_display_off"
+        self._attr_name = f"{self._attr_name} Display Off"
+
+    @property
+    def is_on(self) -> bool | None:
+        data = self._connection.dashboard_data
+        return data.display_off if data is not None else None
+
+    @property
+    def available(self) -> bool:
+        return (
+            self._connection.available and self._connection.display_off_supported
+            and not self._connection.authentication_lockout
+            and self._connection.reading_is_current("display_off")
+        )
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        for subscribe in (
+            self._connection.add_dashboard_listener,
+            self._connection.add_capability_listener,
+            self._connection.add_freshness_listener,
+            self._connection.add_authentication_listener,
+        ):
+            self.async_on_remove(subscribe(self._handle_update))
+
+    @callback
+    def _handle_update(self, *_args) -> None:
+        self.async_write_ha_state()
+
+    @callback
+    def async_handle_bluetooth_update(
+        self, advertisement: ValveAdvertisement, change: ValveDiscoveryChange,
+    ) -> None:
+        self.async_update_from_advertisement(advertisement)
+        self._attr_name = f"{self._attr_name} Display Off"
+        self.async_write_ha_state()
+
+    async def async_turn_on(self, **kwargs) -> None:
+        """Blank the valve display (the display-off flag is active)."""
+        await self._connection.async_set_display_off(True)
+
+    async def async_turn_off(self, **kwargs) -> None:
+        """Restore the valve display (the display-off flag is inactive)."""
+        await self._connection.async_set_display_off(False)
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -183,6 +238,29 @@ async def async_setup_entry(
 
     persistent_entities: dict[str, ValvePersistentConnectionSwitch] = {}
     auth_entities: dict[str, ValveAuthenticationLockoutSwitch] = {}
+    display_entities: dict[str, ValveDisplayOffSwitch] = {}
+    display_observers: set[str] = set()
+
+    def _ensure_display_entity(advertisement: ValveAdvertisement) -> list[SwitchEntity]:
+        if advertisement.address in display_entities:
+            return []
+        connection = connection_manager.get_connection(advertisement.address)
+        if connection is None:
+            return []
+        if advertisement.address not in display_observers:
+            display_observers.add(advertisement.address)
+            @callback
+            def _capabilities_changed() -> None:
+                new = _ensure_display_entity(advertisement)
+                if new:
+                    async_add_entities(new)
+            entry.async_on_unload(connection.add_capability_listener(_capabilities_changed))
+        if not connection.display_off_supported:
+            return []
+        entity = ValveDisplayOffSwitch(advertisement, connection)
+        entity.async_set_via_device_id(entry_data[DATA_DISCOVERY_DEVICE_ID])
+        display_entities[advertisement.address] = entity
+        return [entity]
 
     def _ensure_persistent_entity(
         advertisement: ValveAdvertisement,
@@ -241,6 +319,7 @@ async def async_setup_entry(
         initial_entities.extend(new_persistent)
         _, new_auth = _ensure_auth_entity(advertisement)
         initial_entities.extend(new_auth)
+        initial_entities.extend(_ensure_display_entity(advertisement))
 
     if initial_entities:
         async_add_entities(initial_entities)
@@ -256,6 +335,9 @@ async def async_setup_entry(
             auth_entity = auth_entities.get(advertisement.address)
             if auth_entity is not None:
                 auth_entity.async_handle_bluetooth_update(advertisement, change)
+            display_entity = display_entities.get(advertisement.address)
+            if display_entity is not None:
+                display_entity.async_handle_bluetooth_update(advertisement, change)
             return
 
         new_entities: list[SwitchEntity] = []
@@ -263,6 +345,7 @@ async def async_setup_entry(
         new_entities.extend(new_persistent)
         auth_entity, new_auth = _ensure_auth_entity(advertisement)
         new_entities.extend(new_auth)
+        new_entities.extend(_ensure_display_entity(advertisement))
 
         if new_entities:
             async_add_entities(new_entities)
@@ -271,6 +354,9 @@ async def async_setup_entry(
             persistent_entity.async_handle_bluetooth_update(advertisement, change)
         if auth_entity is not None:
             auth_entity.async_handle_bluetooth_update(advertisement, change)
+        display_entity = display_entities.get(advertisement.address)
+        if display_entity is not None and display_entity.hass is not None:
+            display_entity.async_handle_bluetooth_update(advertisement, change)
 
     remove_listener = discovery_manager.async_add_listener(_handle_discovery)
     entry.async_on_unload(remove_listener)

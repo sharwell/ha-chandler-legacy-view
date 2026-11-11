@@ -118,6 +118,11 @@ class Evb034Session:
         """Require continued access on this confirmed connection."""
         self._authenticated = True
 
+    @property
+    def notification_cursor(self) -> int:
+        """Exclude already received packets when awaiting command readback."""
+        return self._notification_serial
+
     async def wait_interval(self, seconds: float) -> None:
         """Wait for HA's interval, waking immediately if access/transport fails."""
         self.check_health()
