@@ -106,7 +106,11 @@ class ValvePreferences:
         options = dict(self.entry.options)
         original = options.get(VALVE_PREFERENCES, {})
         valves = dict(original) if isinstance(original, dict) else {}
-        stored = restore_state.async_get(self.hass).last_states
+        restore_data = restore_state.async_get(self.hass)
+        get_stored_state = getattr(restore_data, "async_get_stored_state", None)
+        if get_stored_state is None:
+            # HA versions before 2026.11 expose only the entity-ID mapping.
+            get_stored_state = restore_data.last_states.get
         for record in er.async_entries_for_config_entry(er.async_get(self.hass), self.entry.entry_id):
             if record.platform != DOMAIN:
                 continue
@@ -119,8 +123,10 @@ class ValvePreferences:
             if key in values or (key == PERSISTENT_INTERVAL and PERSISTENT_INTERVAL in options):
                 continue
             state = self.hass.states.get(record.entity_id)
-            if state is None and record.entity_id in stored:
-                state = stored[record.entity_id].state
+            if state is None:
+                stored = get_stored_state(record.entity_id)
+                if stored is not None:
+                    state = stored.state
             if state is None:
                 continue
             if key == PERSISTENT_ENABLED:

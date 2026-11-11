@@ -49,13 +49,14 @@ async def hass_factory(tmp_path, monkeypatch):
         translation.async_setup(instance)
         device_registry.async_setup(instance)
         await device_registry.async_load(instance)
-        await entity_registry.async_load(instance)
         for registry in (area_registry, category_registry, floor_registry,
                          label_registry, issue_registry):
             await registry.async_load(instance)
-        await restore_state.async_load(instance)
         instance.config_entries = ConfigEntries(instance, {})
         await instance.config_entries.async_initialize()
+        # HA 2026.11 derives entity registry settings from loaded config entries.
+        await entity_registry.async_load(instance)
+        await restore_state.async_load(instance)
         return instance
     yield create
     for instance in reversed(instances):

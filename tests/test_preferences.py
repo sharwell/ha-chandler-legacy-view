@@ -3,9 +3,12 @@
 import math
 
 import pytest
+from homeassistant.core import State
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import entity_registry as er, restore_state
+from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
 
 from custom_components import chandler_legacy_view as integration
 from custom_components.chandler_legacy_view.const import DATA_CONNECTION_MANAGER, DOMAIN
@@ -16,6 +19,20 @@ from custom_components.chandler_legacy_view.preferences import (
 )
 from packets import dashboard_frames
 from test_configured_authentication import entity_id, manager, update_options
+
+
+async def load_historical_states(hass, states, *, legacy=False):
+    """Load upgrade history through HA storage, without replacing its restore helper."""
+    await Store(hass, restore_state.STORAGE_VERSION, restore_state.STORAGE_KEY).async_save([
+        {
+            "state": State(record.entity_id, value).as_dict(),
+            "extra_data": None,
+            "last_seen": dt_util.utcnow().isoformat(),
+            **({} if legacy else {"entity_registry_id": record.id}),
+        }
+        for record, value in states if value is not None
+    ])
+    await restore_state.async_get(hass).async_load()
 
 
 async def number_write(hass, address, value):
@@ -163,16 +180,18 @@ async def test_invalid_stored_values_fall_back_without_becoming_user_choices(
     assert entry.options[VALVE_PREFERENCES]["valve-b"][PERSISTENT_ENABLED] is False
 
 
-@pytest.mark.parametrize("historical", ["180", "unknown", "unavailable", "10"])
+@pytest.mark.parametrize("source", ["live", "stored"])
+@pytest.mark.parametrize("historical", ["180", "unknown", "unavailable", "10", "nan", "301", None])
 async def test_migration_imports_only_recoverable_history_once(
-    hass, entry_factory, runtime_factory, bluetooth_io, clock, historical,
+    hass, entry_factory, runtime_factory, bluetooth_io, clock, historical, source,
 ):
     entry = entry_factory()
     registry = er.async_get(hass)
     number = registry.async_get_or_create("number", DOMAIN, "valve-a_persistent_poll_interval", config_entry=entry)
-    # Existing live HA state models an upgrade with a recoverable old value,
-    # rather than injecting an initialized production connection's defaults.
-    hass.states.async_set(number.entity_id, historical)
+    if source == "stored":
+        await load_historical_states(hass, [(number, historical)])
+    elif historical is not None:
+        hass.states.async_set(number.entity_id, historical)
     await runtime_factory(entry=entry)
     bluetooth_io.advertise()
     await hass.async_block_till_done()
@@ -185,22 +204,92 @@ async def test_migration_imports_only_recoverable_history_once(
     assert manager(hass, entry).get_connection("valve-a").persistent_poll_interval == 30
 
 
+@pytest.mark.parametrize("source", ["live", "stored"])
 async def test_authoritative_options_win_over_historical_states(
-    hass, entry_factory, runtime_factory, bluetooth_io,
+    hass, entry_factory, runtime_factory, bluetooth_io, source,
 ):
     entry = entry_factory(options={PERSISTENT_INTERVAL: 20, VALVE_PREFERENCES: {
         "valve-a": {PERSISTENT_ENABLED: False, PERSISTENT_INTERVAL: 40},
     }})
     registry = er.async_get(hass)
+    history = []
     for domain, suffix, state in (("switch", PERSISTENT_ENABLED, "on"), ("number", PERSISTENT_INTERVAL, "180")):
         record = registry.async_get_or_create(domain, DOMAIN, "valve-a_" + suffix, config_entry=entry)
-        hass.states.async_set(record.entity_id, state)
+        history.append((record, state))
+        if source == "live":
+            hass.states.async_set(record.entity_id, state)
+    if source == "stored":
+        await load_historical_states(hass, history)
     await runtime_factory(entry=entry)
     bluetooth_io.advertise()
     await hass.async_block_till_done()
     connection = manager(hass, entry).get_connection("valve-a")
     assert not connection.persistent_connection_enabled
     assert connection.persistent_poll_interval == 40
+
+
+@pytest.mark.parametrize("historical", ["on", "off", "unknown", "unavailable", None])
+async def test_migration_recovers_only_enabled_persistent_mode_from_storage(
+    hass, entry_factory, runtime_factory, bluetooth_io, historical,
+):
+    entry = entry_factory()
+    record = er.async_get(hass).async_get_or_create(
+        "switch", DOMAIN, "valve-a_" + PERSISTENT_ENABLED, config_entry=entry,
+    )
+    await load_historical_states(hass, [(record, historical)])
+    await runtime_factory(entry=entry)
+    bluetooth_io.advertise()
+    await hass.async_block_till_done()
+    saved = entry.options.get(VALVE_PREFERENCES, {}).get("valve-a", {})
+    assert saved == ({PERSISTENT_ENABLED: True} if historical == "on" else {})
+    assert hass.states.get(record.entity_id).state == ("on" if historical == "on" else "off")
+
+
+async def test_live_states_take_precedence_over_stored_upgrade_history(
+    hass, entry_factory, runtime_factory, bluetooth_io,
+):
+    entry = entry_factory()
+    registry = er.async_get(hass)
+    switch = registry.async_get_or_create("switch", DOMAIN, "valve-a_" + PERSISTENT_ENABLED, config_entry=entry)
+    number = registry.async_get_or_create("number", DOMAIN, "valve-a_" + PERSISTENT_INTERVAL, config_entry=entry)
+    await load_historical_states(hass, [(switch, "on"), (number, "180")])
+    hass.states.async_set(switch.entity_id, "off")
+    hass.states.async_set(number.entity_id, "60")
+    await runtime_factory(entry=entry)
+    bluetooth_io.advertise()
+    await hass.async_block_till_done()
+    assert entry.options[VALVE_PREFERENCES]["valve-a"] == {PERSISTENT_INTERVAL: 60}
+    assert hass.states.get(switch.entity_id).state == "off"
+    assert float(hass.states.get(number.entity_id).state) == 60
+
+
+@pytest.mark.skipif(
+    not hasattr(restore_state.RestoreStateData, "async_get_stored_state"),
+    reason="Registry-based restore identity was introduced in HA 2026.11",
+)
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_migration_follows_renamed_entity_without_importing_history_into_reused_id(
+    hass, entry_factory, runtime_factory, bluetooth_io, legacy,
+):
+    entry = entry_factory()
+    registry = er.async_get(hass)
+    original = registry.async_get_or_create("number", DOMAIN, "valve-a_" + PERSISTENT_INTERVAL, config_entry=entry)
+    await load_historical_states(hass, [(original, "180")], legacy=legacy)
+    renamed = registry.async_update_entity(original.entity_id, new_entity_id="number.renamed_interval")
+    replacement = registry.async_get_or_create(
+        "number", DOMAIN, "valve-b_" + PERSISTENT_INTERVAL,
+        config_entry=entry, suggested_object_id=original.entity_id.split(".", 1)[1],
+    )
+    assert replacement.entity_id == original.entity_id
+    # Reusing an entity ID must not apply a different valve's old preferences.
+    await hass.async_block_till_done()
+    await runtime_factory(entry=entry)
+    for address in ("valve-a", "valve-b"):
+        bluetooth_io.advertise(address)
+    await hass.async_block_till_done()
+    assert entry.options[VALVE_PREFERENCES] == {"valve-a": {PERSISTENT_INTERVAL: 180}}
+    assert float(hass.states.get(renamed.entity_id).state) == 180
+    assert manager(hass, entry).get_connection("valve-b").persistent_poll_interval == 10
 
 
 async def test_invalid_options_leave_preferences_and_credentials_unchanged(
