@@ -160,6 +160,77 @@ async def test_failed_write_does_not_publish_requested_state(
 
 
 @pytest.mark.parametrize("firmware", [440, 618])
+@pytest.mark.parametrize("failure", ["write", "rejection", "readback"])
+async def test_failed_setting_resumes_persistent_reads_without_an_advertisement(
+    hass, runtime_factory, bluetooth_io, transport, clock, firmware, failure,
+):
+    _, connection, valve = await setup_display(
+        hass, runtime_factory, bluetooth_io, transport, clock, firmware,
+    )
+    await connection.async_set_persistent_connection_enabled(True)
+    await clock.run(connection.async_poll())
+    assert valve.clients[-1].is_connected
+    await hass.async_start()
+    identifier = entity_id(hass, "switch", "valve-a", "display_off")
+    if failure == "write":
+        valve.operations["display_setting"].failure = OSError("Valve write failed")
+    elif failure == "rejection":
+        valve.accept_display_settings = False
+    else:
+        valve.report_display_off = False
+    with pytest.raises(HomeAssistantError):
+        await clock.run(write_display(hass, True))
+    assert hass.states.get(identifier).state == "unavailable"
+    assert connection.persistent_connection_enabled
+    assert not connection.cleanup_pending
+    old_clients = tuple(valve.clients)
+    assert all(not client.is_connected for client in old_clients)
+    attempts = len(transport.attempts)
+    valve.operations["display_setting"].failure = None
+    valve.accept_display_settings = True
+    valve.report_display_off = True
+
+    # The failed command must resume read-only monitoring after the normal
+    # cooldown, including when adoption succeeded but its reply was lost.
+    await clock.advance(29)
+    assert len(transport.attempts) == attempts
+    expected = "on" if failure == "readback" else "off"
+    await clock.until(lambda: hass.states.get(identifier).state == expected
+                      and valve.clients[-1].is_connected, budget=3)
+    assert len(transport.attempts) == attempts + 1
+    assert all(not client.is_connected for client in old_clients)
+    assert len(valve.display_writes) == 1
+
+
+@pytest.mark.parametrize("firmware", [440, 618])
+async def test_persistent_setting_recovery_waits_for_quarantined_io(
+    hass, runtime_factory, bluetooth_io, transport, clock, firmware,
+):
+    _, connection, valve = await setup_display(
+        hass, runtime_factory, bluetooth_io, transport, clock, firmware,
+    )
+    await connection.async_set_persistent_connection_enabled(True)
+    await clock.run(connection.async_poll())
+    await hass.async_start()
+    gate = valve.operations["display_setting"].block()
+    gate.ignore_cancellation = True
+    with pytest.raises(HomeAssistantError):
+        await clock.run(write_display(hass, True))
+    assert gate.cancelled and connection.cleanup_pending
+    attempts = len(transport.attempts)
+    await clock.advance(31)
+    assert len(transport.attempts) == attempts
+    identifier = entity_id(hass, "switch", "valve-a", "display_off")
+    assert hass.states.get(identifier).state == "unavailable"
+    gate.release.set()
+    await clock.until(lambda: not connection.cleanup_pending
+                      and valve.clients[-1].is_connected
+                      and hass.states.get(identifier).state == "off")
+    assert len(transport.attempts) == attempts + 1
+    assert len(valve.display_writes) == 1
+
+
+@pytest.mark.parametrize("firmware", [440, 618])
 async def test_unload_cancels_pending_setting_and_prevents_late_state(
     hass, runtime_factory, bluetooth_io, transport, clock, firmware,
 ):
@@ -234,18 +305,26 @@ async def test_commands_serialize_with_each_other_and_manual_refresh(
 
 
 @pytest.mark.parametrize("firmware", [440, 618])
+@pytest.mark.parametrize("persistent", [False, True])
 async def test_changed_pin_prevents_any_configuration_write(
-    hass, runtime_factory, bluetooth_io, transport, clock, firmware,
+    hass, runtime_factory, bluetooth_io, transport, clock, firmware, persistent,
 ):
     _, connection, valve = await setup_display(
         hass, runtime_factory, bluetooth_io, transport, clock, firmware,
     )
+    if persistent:
+        await connection.async_set_persistent_connection_enabled(True)
+        await clock.run(connection.async_poll())
+        await hass.async_start()
     valve.pin = "9753"
     with pytest.raises(HomeAssistantError):
         await clock.run(write_display(hass, True))
     assert valve.display_writes == []
     assert connection.authentication_lockout
     assert hass.states.get(entity_id(hass, "switch", "valve-a", "display_off")).state == "unavailable"
+    attempts = len(transport.attempts)
+    await clock.advance(31)
+    assert len(transport.attempts) == attempts
 
 
 async def test_newer_setting_needs_explicit_readback_even_when_value_is_unchanged(

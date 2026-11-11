@@ -440,6 +440,10 @@ class ValveConnection:
         finally:
             self._setting_tasks.discard(task)
             self._schedule_next_poll()
+            if self._persistent_connection_enabled and not self._setting_tasks:
+                # Retiring the old session may have requested a reconnect while
+                # settings still blocked polling. Resume reads after they settle.
+                self.schedule_poll()
 
     async def _async_set_display_off(self, enabled: bool) -> None:
         # A setting owns a finite session. Retire the polling session first so
