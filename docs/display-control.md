@@ -72,6 +72,10 @@ twins, C6.00/C6.18 and Clack identity, both setting directions, unchanged
 settings, unrelated status bits, persistent/on-demand operation, reload,
 external changes, credential rejection, missing readback, write failure,
 deadlines, concurrent requests, unload and cancellation-resistant I/O.
+Clack identity belongs to the shared simulated valve across connections;
+round-trip tests assert HA's reported variant, firmware prefix and battery
+exclusion after writes and reload on C6.00 and C6.18. The initial handshake
+alone does not establish Clack write coverage.
 
 This is simulated Bluetooth evidence. Live display behavior, physical
 disconnects, ESPHome proxy-slot release and real firmware response timing

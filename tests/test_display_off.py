@@ -27,13 +27,9 @@ async def setup_display(hass, runtime_factory, bluetooth_io, transport, clock,
     valve = transport.valve()
     valve.firmware_version = firmware
     valve.is_twin_valve = twin
+    valve.is_clack_valve = clack
     valve.report_display_off = report
     valve.authentication_required = firmware >= 419 or twin
-    if firmware >= 600:
-        valve.identification_packets.append(frames({
-            "dlf": firmware, "dlc": 23, "as": 1, "gbre": 1,
-            "dlvt": 1, "dli": int(twin), "dlic": int(clack),
-        }))
     await clock.run(connection.async_poll())
     await hass.async_block_till_done()
     return entry, connection, valve
@@ -43,6 +39,20 @@ async def write_display(hass, enabled):
     await hass.services.async_call("switch", "turn_on" if enabled else "turn_off", {
         "entity_id": entity_id(hass, "switch", "valve-a", "display_off"),
     }, blocking=True)
+
+
+def assert_reported_variant(hass, firmware, clack):
+    """Keep variant coverage tied to the identity and availability HA publishes."""
+    if firmware < 600:
+        return
+    presence = er.async_get(hass).async_get_entity_id("binary_sensor", DOMAIN, "valve-a")
+    attributes = hass.states.get(presence).attributes
+    assert attributes["is_clack_valve"] is clack
+    prefix = "L" if clack else "C"
+    assert attributes["firmware_version"] == f"{prefix}{firmware // 100}.{firmware % 100:02d}"
+    if clack:
+        battery = entity_id(hass, "sensor", "valve-a", "battery")
+        assert hass.states.get(battery).state == "unavailable"
 
 
 @pytest.mark.parametrize("firmware,twin,clack,supported", [
@@ -71,7 +81,7 @@ async def test_display_switch_follows_settings_ui_eligibility(
 
 @pytest.mark.parametrize("firmware,twin,clack", [
     (122, True, False), (413, False, False), (440, False, False),
-    (618, False, False), (618, False, True),
+    (600, False, True), (618, False, False), (618, False, True),
 ])
 @pytest.mark.parametrize("persistent", [False, True])
 async def test_display_writes_confirm_both_directions_and_survive_reconnect(
@@ -81,6 +91,7 @@ async def test_display_writes_confirm_both_directions_and_survive_reconnect(
         hass, runtime_factory, bluetooth_io, transport, clock, firmware, twin, clack,
     )
     identifier = entity_id(hass, "switch", "valve-a", "display_off")
+    assert_reported_variant(hass, firmware, clack)
     if persistent:
         await connection.async_set_persistent_connection_enabled(True)
         await clock.run(connection.async_poll())
@@ -92,6 +103,9 @@ async def test_display_writes_confirm_both_directions_and_survive_reconnect(
         assert valve.display_off is enabled
         assert valve.status_bits == 0x0F
         assert valve.clients[-1].is_connected is persistent
+        # Every setting reconnects. A Clack case must not silently become a
+        # standard valve when its first identification packet is consumed.
+        assert_reported_variant(hass, firmware, clack)
         if firmware < 600:
             data = connection.dashboard_data
             assert data.shutoff_setting_enabled and data.bypass_setting_enabled
@@ -110,6 +124,7 @@ async def test_display_writes_confirm_both_directions_and_survive_reconnect(
     await clock.run(restored.async_poll())
     assert entity_id(hass, "switch", "valve-a", "display_off") == identifier
     assert hass.states.get(identifier).state == "on"
+    assert_reported_variant(hass, firmware, clack)
 
 
 @pytest.mark.parametrize("firmware", [440, 618])

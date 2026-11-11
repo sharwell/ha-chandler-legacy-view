@@ -80,6 +80,7 @@ class Valve:
         self.connection_counter = 23
         self.firmware_version = None
         self.is_twin_valve = False
+        self.is_clack_valve = False
         self.legacy_reserved_counter_byte = 42
         self.device_lists = deque()
         self.auth_replies = deque()
@@ -380,7 +381,8 @@ class Client:
         await self.valve.operations["device_list"].run()
         default = {"dlf": self.valve.firmware_version, "dlc": self.connection_counter,
                    "as": 1 if self.valve.authentication_required else 2,
-                   "dlvt": 1, "dli": 0, "dlic": 0, "gbre": 1}
+                   "dlvt": 1, "dli": int(self.valve.is_twin_valve),
+                   "dlic": int(self.valve.is_clack_valve), "gbre": 1}
         scripted = bool(self.valve.identification_packets)
         reply = (self.valve.identification_packets.popleft() if scripted
                  else frames(default, min(512, self.mtu_size - 3)))
