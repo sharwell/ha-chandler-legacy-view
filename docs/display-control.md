@@ -33,7 +33,10 @@ ignored extracted Smali root's `com/chandlersystemsinc` directory.
 ## Command lifecycle
 
 Per-valve configuration requests run sequentially. An in-progress poll finishes
-first; an existing persistent session is retired before a fresh command
+first. An active read on a persistent connection also settles within its normal
+deadline before teardown, so a display change does not cancel a connection
+refresh or HA's `homeassistant.update_entity` action. The existing persistent
+session is then retired before a fresh command
 session is opened. This uses the existing connection ownership, cooldown,
 authentication, I/O deadlines and cleanup quarantine. A successful command
 session resumes persistent monitoring when requested; no monitoring preference

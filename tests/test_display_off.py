@@ -3,12 +3,15 @@
 import asyncio
 
 import pytest
+from homeassistant.components import homeassistant as core_component
 from homeassistant.const import EVENT_STATE_CHANGED
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 
-from custom_components.chandler_legacy_view.const import DATA_CONNECTION_MANAGER, DOMAIN
+from custom_components.chandler_legacy_view.const import (
+    DATA_CONNECTION_MANAGER, DOMAIN, PERSISTENT_EXCHANGE_TIMEOUT_SECONDS,
+)
 from custom_components.chandler_legacy_view.freshness import RECOVERY_ALLOWANCE
 from ble import NOTIFY
 from evb034_packets import frames
@@ -285,6 +288,118 @@ async def test_setting_deadline_retains_unsettled_io_and_does_not_replay(
     await clock.run(write_display(hass, True))
     assert hass.states.get(identifier).state == "on"
     assert len(valve.display_writes) == 2
+
+
+@pytest.mark.parametrize("firmware", [440, 618])
+@pytest.mark.parametrize("refresh_api", ["connection", "ha_service"])
+async def test_display_setting_finishes_an_active_persistent_refresh_first(
+    hass, runtime_factory, bluetooth_io, transport, clock, firmware, refresh_api,
+):
+    _, connection, valve = await setup_display(
+        hass, runtime_factory, bluetooth_io, transport, clock, firmware,
+    )
+    await connection.async_set_persistent_connection_enabled(True)
+    await clock.run(connection.async_poll())
+    previous_client = valve.clients[-1]
+    attempts = len(transport.attempts)
+    gate = valve.operations["dashboard"].block()
+    gate.started.clear()
+    valve.dashboards.append(dashboard_frames(gallons=987) if firmware < 600
+                            else frames({"dwu": 98700}))
+    if refresh_api == "ha_service":
+        await core_component.async_setup(hass, {})
+        reading = hass.services.async_call("homeassistant", "update_entity", {
+            "entity_id": entity_id(hass, "sensor", "valve-a", "water_usage_today"),
+        }, blocking=True)
+    else:
+        reading = connection.async_refresh()
+    refreshing = asyncio.create_task(reading)
+    await clock.run(gate.started.wait())
+    await clock.drain()
+    assert not refreshing.done()
+    writing = asyncio.create_task(write_display(hass, True))
+    await clock.drain()
+    # A display change must not tear down the connection owned by this read,
+    # or it cancels both refresh callers and HA's update_entity service.
+    assert not refreshing.done() and not gate.cancelled
+    assert previous_client.is_connected
+    assert len(transport.attempts) == attempts
+    assert valve.display_writes == []
+    gate.release.set()
+    await clock.run(refreshing)
+    assert connection.dashboard_data.water_usage == 987
+    assert valve.display_writes == []
+    await clock.run(writing)
+    assert hass.states.get(entity_id(hass, "switch", "valve-a", "display_off")).state == "on"
+    assert not previous_client.is_connected
+    assert valve.clients[-1].is_connected
+    assert len(transport.attempts) == attempts + 1
+    assert len(valve.display_writes) == 1
+
+
+@pytest.mark.parametrize("firmware", [440, 618])
+async def test_unload_stops_a_setting_waiting_for_an_active_ha_refresh(
+    hass, runtime_factory, bluetooth_io, transport, clock, firmware,
+):
+    entry, connection, valve = await setup_display(
+        hass, runtime_factory, bluetooth_io, transport, clock, firmware,
+    )
+    await core_component.async_setup(hass, {})
+    await connection.async_set_persistent_connection_enabled(True)
+    await clock.run(connection.async_poll())
+    gate = valve.operations["dashboard"].block()
+    gate.started.clear()
+    refreshing = asyncio.create_task(hass.services.async_call("homeassistant", "update_entity", {
+        "entity_id": entity_id(hass, "sensor", "valve-a", "water_usage_today"),
+    }, blocking=True))
+    await clock.run(gate.started.wait())
+    await clock.drain()
+    writing = asyncio.create_task(write_display(hass, True))
+    await clock.drain()
+    assert not refreshing.done() and not writing.done()
+    assert not gate.cancelled
+    attempts = len(transport.attempts)
+    assert await clock.run(hass.config_entries.async_unload(entry.entry_id))
+    results = await asyncio.gather(refreshing, writing, return_exceptions=True)
+    assert all(isinstance(result, asyncio.CancelledError) for result in results)
+    assert gate.cancelled
+    assert not connection.cleanup_pending
+    assert all(not client.is_connected for client in valve.clients)
+    assert valve.display_writes == []
+    gate.release.set()
+    await clock.advance(31)
+    assert len(transport.attempts) == attempts
+
+
+@pytest.mark.parametrize("firmware", [440, 618])
+async def test_active_refresh_keeps_its_deadline_while_a_display_setting_waits(
+    hass, runtime_factory, bluetooth_io, transport, clock, firmware,
+):
+    _, connection, valve = await setup_display(
+        hass, runtime_factory, bluetooth_io, transport, clock, firmware,
+    )
+    await core_component.async_setup(hass, {})
+    await connection.async_set_persistent_connection_enabled(True)
+    await clock.run(connection.async_poll())
+    gate = valve.operations["dashboard"].block()
+    gate.started.clear()
+    refreshing = asyncio.create_task(hass.services.async_call("homeassistant", "update_entity", {
+        "entity_id": entity_id(hass, "sensor", "valve-a", "water_usage_today"),
+    }, blocking=True))
+    await clock.run(gate.started.wait())
+    await clock.drain()
+    writing = asyncio.create_task(write_display(hass, True))
+    started = clock.loop.time()
+    # Waiting for the owned read must preserve its real failure deadline,
+    # rather than canceling it or waiting indefinitely for the stalled valve.
+    with pytest.raises(HomeAssistantError):
+        await clock.run(refreshing, budget=PERSISTENT_EXCHANGE_TIMEOUT_SECONDS + 1)
+    assert clock.loop.time() - started < PERSISTENT_EXCHANGE_TIMEOUT_SECONDS + 1
+    assert valve.display_writes == []
+    gate.release.set()
+    await clock.run(writing)
+    assert hass.states.get(entity_id(hass, "switch", "valve-a", "display_off")).state == "on"
+    assert len(valve.display_writes) == 1
 
 
 @pytest.mark.parametrize("firmware", [440, 618])

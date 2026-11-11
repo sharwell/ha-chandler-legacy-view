@@ -452,6 +452,11 @@ class ValveConnection:
             poll = self._poll_task
             if poll is not None:
                 await asyncio.shield(poll)
+            read = self._session_read_task
+            if read is not None and not read.done():
+                # Teardown cancels session reads and their refresh callers. Let
+                # the active bounded read settle before retiring its connection.
+                await asyncio.shield(asyncio.gather(read, return_exceptions=True))
             await self._async_stop_persistent_session()
             self._raise_if_cleanup_pending()
             if self._next_connection_time is not None:
