@@ -80,6 +80,7 @@ class Valve:
         self.connection_counter = 23
         self.firmware_version = None
         self.is_twin_valve = False
+        self.is_clack_valve = False
         self.legacy_reserved_counter_byte = 42
         self.device_lists = deque()
         self.auth_replies = deque()
@@ -96,10 +97,15 @@ class Valve:
         self.packet_requests = []
         self.dashboard_notifications = 0
         self.stream_enabled = True
+        self.display_off = False
+        self.accept_display_settings = True
+        self.report_display_off = True
+        self.display_writes = []
+        self.status_bits = 0
         self.legacy_service_discovery = False
         self.operations = {name: Operation() for name in
                            ("connect", "identify", "device_list", "authenticate", "dashboard", "reset", "disconnect", "timeout",
-                            "start_notify", "stop_notify", "services")}
+                            "start_notify", "stop_notify", "services", "display_setting")}
 
     def authenticated(self, counter=23):
         self.device_lists.append([device_list_frame(status=0, counter=counter)])
@@ -123,6 +129,8 @@ class Client:
         self.peer_outgoing = asyncio.Queue()
         self.peer_access = asyncio.Event()
         self.peer_latest_data = {"dwu": 567}
+        if valve.report_display_off:
+            self.peer_latest_data["asdo"] = int(valve.display_off)
         if not valve.authentication_required:
             self.peer_access.set()
         self.dashboard_access = not valve.authentication_required
@@ -184,11 +192,16 @@ class Client:
         return self.valve.firmware_version == 419 and not self.valve.is_twin_valve
 
     def device_list_reply(self, status, counter):
-        return device_list_frame(
+        packet = bytearray(device_list_frame(
             status=status,
             counter=self.valve.legacy_reserved_counter_byte if self.counter_in_advertisement else counter,
             firmware=self.valve.firmware_version, twin=self.valve.is_twin_valve,
-        )
+        ))
+        if (self.valve.firmware_version is not None and self.valve.firmware_version < 419
+                and not self.valve.is_twin_valve and not self.valve.authentication_required):
+            assert self.valve.pin == "1234"
+            packet[7:12] = bytes.fromhex("5cf6ead9c0")
+        return bytes(packet)
 
     async def write_gatt_char(self, uuid, payload, *, response):
         self.require_connected()
@@ -218,8 +231,16 @@ class Client:
         elif payload == b"u" * 20:
             operation = "dashboard"
             self.valve.dashboard_requests += 1
-            replies = ((self.valve.dashboards.popleft() if self.valve.dashboards else dashboard_frames())
-                       if self.dashboard_access else [])
+            default = dashboard_frames()
+            first = bytearray(default[0])
+            first[18] = self.valve.status_bits | (0x10 if self.valve.display_off else 0)
+            default[0] = bytes(first)
+            replies = ((self.valve.dashboards.popleft() if self.valve.dashboards else default)
+                       if self.dashboard_access and (self.valve.report_display_off or not self.valve.display_writes) else [])
+        elif (len(payload) == 20 and payload[:13] == b"v" * 13
+              and payload[13] == 0x47 and payload[14] in (0, 1) and payload[15:] == b"v" * 5):
+            await self.write_display_setting(payload[14])
+            return
         elif payload == b"r" * 20:
             operation, replies = "reset", []
         else:
@@ -227,6 +248,14 @@ class Client:
         await self.valve.operations[operation].run()
         for packet in replies:
             self.notify(packet)
+
+    async def write_display_setting(self, value):
+        """Model one persisted field without mutating the other status bits."""
+        self.valve.display_writes.append((self, value))
+        await self.valve.operations["display_setting"].run()
+        self.require_connected()
+        if self.dashboard_access and self.valve.accept_display_settings:
+            self.valve.display_off = bool(value)
 
     async def write_evb034(self, payload):
         """Reference peer: EA starts notifications; raw PIN precedes framed JSON."""
@@ -294,9 +323,17 @@ class Client:
         self.valve.packet_requests.append(request)
         command = json.loads(request)
         # Packet-session tests can send several app configuration fields in one
-        # JSON message; only battery sampling needs a modeled setting response.
+        # JSON message; battery sampling and display-off have modeled responses.
         if command.get("gbre") == 1:
             await self.peer_outgoing.put((frames({"gbre": 1}, min(512, self.mtu_size - 3)), False))
+        if "asdo" in command:
+            assert type(command["asdo"]) is int and command["asdo"] in (0, 1)
+            await self.write_display_setting(command["asdo"])
+            if self.valve.report_display_off:
+                self.peer_latest_data["asdo"] = int(self.valve.display_off)
+                await self.peer_outgoing.put((frames({"asdo": int(self.valve.display_off)}, min(512, self.mtu_size - 3)), False))
+            else:
+                self.peer_latest_data.pop("asdo", None)
 
     @staticmethod
     def _peer_packet(reply):
@@ -344,7 +381,8 @@ class Client:
         await self.valve.operations["device_list"].run()
         default = {"dlf": self.valve.firmware_version, "dlc": self.connection_counter,
                    "as": 1 if self.valve.authentication_required else 2,
-                   "dlvt": 1, "dli": 0, "dlic": 0, "gbre": 1}
+                   "dlvt": 1, "dli": int(self.valve.is_twin_valve),
+                   "dlic": int(self.valve.is_clack_valve), "gbre": 1}
         scripted = bool(self.valve.identification_packets)
         reply = (self.valve.identification_packets.popleft() if scripted
                  else frames(default, min(512, self.mtu_size - 3)))

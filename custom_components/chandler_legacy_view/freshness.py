@@ -17,7 +17,7 @@ RECOVERY_ALLOWANCE = max(
 )
 READINGS = frozenset({
     "present_flow", "water_usage_today", "peak_flow_today", "soft_water_remaining",
-    "days_until_regeneration", "water_hardness", "battery", "time_of_day",
+    "days_until_regeneration", "water_hardness", "battery", "time_of_day", "display_off",
 })
 
 
