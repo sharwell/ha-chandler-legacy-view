@@ -99,6 +99,7 @@ class Valve:
         self.stream_enabled = True
         self.display_off = False
         self.accept_display_settings = True
+        self.display_setting_acceptance = deque()
         self.report_display_off = True
         self.display_writes = []
         self.status_bits = 0
@@ -254,7 +255,9 @@ class Client:
         self.valve.display_writes.append((self, value))
         await self.valve.operations["display_setting"].run()
         self.require_connected()
-        if self.dashboard_access and self.valve.accept_display_settings:
+        accepted = (self.valve.display_setting_acceptance.popleft()
+                    if self.valve.display_setting_acceptance else self.valve.accept_display_settings)
+        if self.dashboard_access and accepted:
             self.valve.display_off = bool(value)
 
     async def write_evb034(self, payload):

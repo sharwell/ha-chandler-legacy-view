@@ -32,16 +32,32 @@ ignored extracted Smali root's `com/chandlersystemsinc` directory.
 
 ## Command lifecycle
 
-Per-valve configuration requests run sequentially. An in-progress poll finishes
-first. An active read on a persistent connection also settles within its normal
-deadline before teardown, so a display change does not cancel a connection
-refresh or HA's `homeassistant.update_entity` action. The existing persistent
-session is then retired before a fresh command
-session is opened. This uses the existing connection ownership, cooldown,
-authentication, I/O deadlines and cleanup quarantine. A successful command
-session resumes persistent monitoring when requested; no monitoring preference
-is changed. This intentionally trades a reconnect for simple ownership of the
-first user-facing device-setting transaction.
+Per-valve configuration requests share a finite batch. An in-progress poll
+finishes first. An active read on a persistent connection also settles within
+its normal deadline before teardown, so a display change does not cancel a
+connection refresh or HA's `homeassistant.update_entity` action. The existing
+persistent session is then retired before a fresh authenticated connection is
+opened for the batch. Explicit configuration changes bypass the ordinary
+30-second connection cooldown; authentication lockout, connection ownership,
+I/O deadlines and cleanup quarantine still apply. Polling and read-only recovery
+retain their normal cooldown.
+
+Only the latest unsent display value is pushed. Requests superseded before
+transmission finish with that value's confirmed result rather than sending
+intermediate values. A command already on the wire finishes its readback before
+the latest pending value is applied on the same connection. Its confirmed result
+is preserved if a later command fails. The batch uses the existing finite
+exchange deadline, and its callers finish after connection cleanup or handoff
+to persistent monitoring. An on-demand connection closes once its pending
+changes are drained; no extra idle connection window is introduced.
+
+New requests arriving during cleanup begin another batch after the old owner
+is released. A failed command is never requeued. Newer explicit requests that
+were not sent can begin a fresh batch through the same ownership and cleanup
+checks. Canceling an unsent request withdraws its desired value; canceling one
+caller does not interrupt other callers' pending or in-flight work. Unload
+cancels the worker and all outstanding callers, including an unstarted worker.
+Persistent monitoring resumes when requested; no monitoring preference changes.
 
 The initial authenticated readings must succeed, and freshly learned identity
 must still permit the setting. Evb019 then sends the field-specific command

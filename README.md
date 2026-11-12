@@ -47,10 +47,14 @@ reports confirmed valve data and becomes unavailable when that data expires
 or authentication is locked out. Merely loading the integration never sends
 a display-setting command.
 
-Changes wait for any active poll and the normal connection retry delay, then
-use a fresh authenticated connection. Persistent monitoring resumes after a
-successful change. A failed or unconfirmed change reports an error and is
-not automatically repeated. See [display-control evidence and hardware
+Changes wait for active reads and confirmed connection cleanup, then use a
+fresh authenticated connection. Explicit configuration changes skip the normal
+30-second connection cooldown. Queued changes share that connection; repeated
+changes that have not been sent yet collapse to the latest requested value.
+A command already sent still requires confirmation before the next value is
+applied. Persistent monitoring resumes afterward. A failed or unconfirmed
+command reports an error and is not automatically repeated. See
+[display-control evidence and hardware
 checks](docs/display-control.md) for protocol details and validation limits.
 
 Firmware and model information are accepted only from a recognized complete
