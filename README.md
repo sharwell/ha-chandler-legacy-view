@@ -130,4 +130,4 @@ device protocol becomes better understood.
 
 ### Local Codex initialization prompt
 
-> Read AGENTS.md and README.md to familiarize yourself with this repository. After performing any work which resulted in uncommitted changes to repository files, provide a commit message for the work. Commit messages should be provided in fenced code blocks for easy copy/paste.
+> Read AGENTS.md and README.md to familiarize yourself with this repository.
