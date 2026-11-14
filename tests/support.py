@@ -22,6 +22,7 @@ class BluetoothIO:
 
     def __init__(self):
         self.advertisement_callbacks = []
+        self.packet_callbacks = []
         self.unavailable_callbacks = []
         self.history = {}
 
@@ -38,6 +39,17 @@ class BluetoothIO:
         self.unavailable_callbacks.append(registration)
         return lambda: self.unavailable_callbacks.remove(registration)
 
+    def register_packet(self, hass, callback, address):
+        """Subscribe without replay, as HA's per-address packet API does."""
+        registration = (callback, address)
+        self.packet_callbacks.append(registration)
+        return lambda: self.packet_callbacks.remove(registration)
+
+    def last_service_info(self, hass, address, connectable=True):
+        """Return the simulated scanner's accepted history."""
+        info = self.history.get(address)
+        return info if info and (info.connectable or not connectable) else None
+
     def service_info(self, address="valve-a", *, name="CS_Meter_Soft", rssi=-50,
                      payload=MODERN_422, raw=None, manufacturer_data=None):
         return BluetoothServiceInfoBleak(
@@ -50,14 +62,20 @@ class BluetoothIO:
         )
 
     def queued_advertisement(self, info):
+        packet_callbacks = [callback for callback, address in self.packet_callbacks
+                            if address == info.address]
         callbacks = [callback for callback, matcher, _ in self.advertisement_callbacks
                      if fnmatchcase(info.name, matcher["local_name"])]
-        return lambda: [callback(info, BluetoothChange.ADVERTISEMENT)
-                        for callback in callbacks]
+        def deliver():
+            for callback in packet_callbacks:
+                callback(info)
+            self.history[info.address] = info
+            for callback in callbacks:
+                callback(info, BluetoothChange.ADVERTISEMENT)
+        return deliver
 
     def advertise(self, address="valve-a", **kwargs):
         info = self.service_info(address, **kwargs)
-        self.history[address] = info
         self.queued_advertisement(info)()
         return info
 

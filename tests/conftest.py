@@ -107,6 +107,9 @@ def bluetooth_io(monkeypatch):
     io = BluetoothIO()
     monkeypatch.setattr(discovery, "async_register_callback", io.register)
     monkeypatch.setattr(discovery, "async_track_unavailable", io.track_unavailable)
+    if hasattr(discovery.bluetooth, "async_register_advertisement_callback"):
+        monkeypatch.setattr(discovery.bluetooth, "async_register_advertisement_callback", io.register_packet)
+    monkeypatch.setattr(discovery.bluetooth, "async_last_service_info", io.last_service_info)
     return io
 
 

@@ -68,6 +68,18 @@ validated DeviceList response can also resolve the session's firmware and
 authentication format when advertisements are incomplete. Advertisement and
 device-registry firmware remain unknown until a complete advertisement arrives.
 
+On Home Assistant versions offering per-device advertisement callbacks
+(2026.10 onward), complete raw reports from Home Assistant's preferred
+connectable scanner can refresh valve status and the advertised clock even
+when Home Assistant's merged manufacturer data appears unchanged. Discovery,
+availability, and versions without this API retain the existing callback path;
+the minimum Home Assistant version remains 2026.8.0. Duplicate raw reports are
+ignored, and subscriptions and pending updates are removed on unload.
+Short reports still preserve the last accepted status, and separate reports
+are not joined together. Recovery on the C4.40 valves reported in issue #52
+still needs live validation; simulated Bluetooth checks establish the callback
+behavior, not the affected hardware's delivery pattern.
+
 This repository currently focuses on the scaffolding required for discovery and
 entity creation. Additional device metadata, richer entities, diagnostics, and
 configuration options will follow as device details become available.
