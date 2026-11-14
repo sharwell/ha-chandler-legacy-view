@@ -47,10 +47,14 @@ reports confirmed valve data and becomes unavailable when that data expires
 or authentication is locked out. Merely loading the integration never sends
 a display-setting command.
 
-Changes wait for any active poll and the normal connection retry delay, then
-use a fresh authenticated connection. Persistent monitoring resumes after a
-successful change. A failed or unconfirmed change reports an error and is
-not automatically repeated. See [display-control evidence and hardware
+Changes wait for active reads and confirmed connection cleanup, then use a
+fresh authenticated connection. Explicit configuration changes skip the normal
+30-second connection cooldown. Queued changes share that connection; repeated
+changes that have not been sent yet collapse to the latest requested value.
+A command already sent still requires confirmation before the next value is
+applied. Persistent monitoring resumes afterward. A failed or unconfirmed
+command reports an error and is not automatically repeated. See
+[display-control evidence and hardware
 checks](docs/display-control.md) for protocol details and validation limits.
 
 Firmware and model information are accepted only from a recognized complete
@@ -63,6 +67,18 @@ connection alone does not count as a successful dashboard update. A complete,
 validated DeviceList response can also resolve the session's firmware and
 authentication format when advertisements are incomplete. Advertisement and
 device-registry firmware remain unknown until a complete advertisement arrives.
+
+On Home Assistant versions offering per-device advertisement callbacks
+(2026.10 onward), complete raw reports from Home Assistant's preferred
+connectable scanner can refresh valve status and the advertised clock even
+when Home Assistant's merged manufacturer data appears unchanged. Discovery,
+availability, and versions without this API retain the existing callback path;
+the minimum Home Assistant version remains 2026.8.0. Duplicate raw reports are
+ignored, and subscriptions and pending updates are removed on unload.
+Short reports still preserve the last accepted status, and separate reports
+are not joined together. Recovery on the C4.40 valves reported in issue #52
+still needs live validation; simulated Bluetooth checks establish the callback
+behavior, not the affected hardware's delivery pattern.
 
 This repository currently focuses on the scaffolding required for discovery and
 entity creation. Additional device metadata, richer entities, diagnostics, and
@@ -126,4 +142,4 @@ device protocol becomes better understood.
 
 ### Local Codex initialization prompt
 
-> Read AGENTS.md and README.md to familiarize yourself with this repository. After performing any work which resulted in uncommitted changes to repository files, provide a commit message for the work. Commit messages should be provided in fenced code blocks for easy copy/paste.
+> Read AGENTS.md and README.md to familiarize yourself with this repository.

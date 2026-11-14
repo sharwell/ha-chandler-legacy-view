@@ -7,7 +7,7 @@ import contextlib
 import inspect
 import logging
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timedelta
 from enum import Enum, IntEnum
 from random import SystemRandom
@@ -66,6 +66,16 @@ class _ValveGattProfile:
     service_uuid: str
     notify_char_uuid: str
     write_char_uuid: str
+
+
+@dataclass
+class _DisplayBatch:
+    """Keep unsent desired values separate from commands already on the wire."""
+
+    pending: list[tuple[bool, asyncio.Future[None]]] = field(default_factory=list)
+    active: list[asyncio.Future[None]] = field(default_factory=list)
+    confirmed: list[asyncio.Future[None]] = field(default_factory=list)
+    task: asyncio.Task[None] | None = None
 
 
 _EVB019_GATT_PROFILES: tuple[_ValveGattProfile, ...] = (
@@ -278,6 +288,7 @@ class ValveConnection:
         self._lock = asyncio.Lock()
         self._setting_lock = asyncio.Lock()
         self._setting_tasks: set[asyncio.Task] = set()
+        self._display_batch: _DisplayBatch | None = None
         self._unloaded = False
         self._next_connection_time: datetime | None = None
         self._cooldown_cancel: CALLBACK_TYPE | None = None
@@ -428,24 +439,69 @@ class ValveConnection:
         )
 
     async def async_set_display_off(self, enabled: bool) -> None:
-        """Set only the display-off preference and require device readback."""
+        """Queue a desired value, coalescing unsent changes and requiring readback."""
         if type(enabled) is not bool:
             raise ValueError("Display-off must be a boolean")
         if not self.available or not self.display_off_supported:
             raise HomeAssistantError("Display-off control is unavailable for this valve")
-        task = asyncio.create_task(self._async_set_display_off(enabled))
-        self._setting_tasks.add(task)
+        batch = self._display_batch
+        if batch is None:
+            batch = self._display_batch = _DisplayBatch()
+        completed = self._hass.loop.create_future()
+        batch.pending.append((enabled, completed))
+        if batch.task is None:
+            self._start_display_batch(batch)
         try:
-            await task
+            await completed
         finally:
-            self._setting_tasks.discard(task)
-            self._schedule_next_poll()
-            if self._persistent_connection_enabled and not self._setting_tasks:
-                # Retiring the old session may have requested a reconnect while
-                # settings still blocked polling. Resume reads after they settle.
-                self.schedule_poll()
+            if completed.cancelled():
+                waiting = batch.active + batch.confirmed + [future for _, future in batch.pending]
+                if batch.task is not None and not any(not future.done() for future in waiting):
+                    batch.task.cancel()
 
-    async def _async_set_display_off(self, enabled: bool) -> None:
+    def _start_display_batch(self, batch: _DisplayBatch) -> None:
+        task = asyncio.create_task(self._async_set_display_off(batch))
+        batch.task = task
+        self._setting_tasks.add(task)
+        task.add_done_callback(lambda finished: self._finish_display_batch(batch, finished))
+
+    @callback
+    def _finish_display_batch(self, batch: _DisplayBatch, task: asyncio.Task) -> None:
+        """Finish callers after cleanup, including a worker canceled before startup."""
+        self._setting_tasks.discard(task)
+        error = None if task.cancelled() else task.exception()
+        cancelled = task.cancelled() or self._unloaded
+        finished = batch.active + batch.confirmed
+        confirmed = set(batch.confirmed) if not self.cleanup_pending else set()
+        if self._unloaded or (error is not None and not finished):
+            # A failed connection has not selected a command yet. Fail its
+            # callers once rather than automatically retrying their request.
+            finished += [future for _, future in batch.pending]
+            batch.pending.clear()
+        for future in finished:
+            if future.done():
+                continue
+            if cancelled:
+                future.cancel()
+            elif error is not None and future not in confirmed:
+                future.set_exception(error)
+            else:
+                future.set_result(None)
+        batch.active.clear()
+        batch.confirmed.clear()
+        batch.pending = [(value, future) for value, future in batch.pending if not future.done()]
+        if batch.pending and not self._unloaded:
+            # These are newer, unsent user requests. Never requeue the active
+            # command after a failure with uncertain device adoption.
+            self._start_display_batch(batch)
+        else:
+            self._display_batch = None
+            batch.task = None
+        self._schedule_next_poll()
+        if self._persistent_connection_enabled and not self._setting_tasks:
+            self.schedule_poll()
+
+    async def _async_set_display_off(self, batch: _DisplayBatch) -> None:
         # A setting owns a finite session. Retire the polling session first so
         # its reader cannot consume a command's readback or race the write.
         async with self._setting_lock:
@@ -459,8 +515,6 @@ class ValveConnection:
                 await asyncio.shield(asyncio.gather(read, return_exceptions=True))
             await self._async_stop_persistent_session()
             self._raise_if_cleanup_pending()
-            if self._next_connection_time is not None:
-                await asyncio.sleep(max(0, (self._next_connection_time - dt_util.utcnow()).total_seconds()))
             async with self._lock:
                 if not self.available or not self.display_off_supported or self._authentication_failed:
                     raise HomeAssistantError("Display-off control is unavailable or authentication is locked out")
@@ -468,7 +522,7 @@ class ValveConnection:
                     raise HomeAssistantError("Another Bluetooth operation still owns this valve")
                 self._poll_task = asyncio.current_task()
                 try:
-                    if not await self._async_poll_locked(display_off=enabled):
+                    if not await self._async_poll_locked(display_batch=batch):
                         raise HomeAssistantError("Valve did not confirm the display-off setting")
                     self._raise_if_cleanup_pending()
                 except BaseException:
@@ -478,6 +532,18 @@ class ValveConnection:
                     raise
                 finally:
                     self._poll_task = None
+
+    async def _async_write_display_batch(self, client: BaseBleakClient, batch: _DisplayBatch) -> None:
+        """Push the latest unsent value, then drain changes received during readback."""
+        while batch.pending:
+            pending, batch.pending = batch.pending, []
+            pending = [(value, future) for value, future in pending if not future.done()]
+            if not pending:
+                continue
+            batch.active = [future for _, future in pending]
+            await self._async_write_display_off(client, pending[-1][0])
+            batch.confirmed.extend(batch.active)
+            batch.active = []
 
     async def _async_write_display_off(self, client: BaseBleakClient, enabled: bool) -> None:
         """Use the reference's field-specific command; never rewrite status bits."""
@@ -1348,7 +1414,7 @@ class ValveConnection:
             return False
         return True
 
-    async def _async_poll_locked(self, *, display_off: bool | None = None) -> bool:
+    async def _async_poll_locked(self, *, display_batch: _DisplayBatch | None = None) -> bool:
         """Perform a Bluetooth connection cycle for the valve."""
 
         now = dt_util.utcnow()
@@ -1356,7 +1422,7 @@ class ValveConnection:
         if self._authentication_failed:
             return False
         next_connection_time = self._next_connection_time
-        if next_connection_time is not None and now < next_connection_time:
+        if display_batch is None and next_connection_time is not None and now < next_connection_time:
             remaining = max((next_connection_time - now).total_seconds(), 0)
             _LOGGER.debug(
                 "Skipping poll for %s; retrying after %.1f seconds",
@@ -1434,17 +1500,17 @@ class ValveConnection:
                     self._connection_state_callback(self._address, True)
                 async with asyncio.timeout(POLL_EXCHANGE_TIMEOUT_SECONDS):
                     refreshed = await self._async_fetch_device_information(client)
-                    if display_off is not None:
+                    if display_batch is not None:
                         if not refreshed:
                             raise HomeAssistantError("Valve did not provide authenticated readings before configuration")
-                        await self._async_write_display_off(client, display_off)
+                        await self._async_write_display_batch(client, display_batch)
             except TimeoutError:
                 owner.invalidate()
-                if display_off is not None:
+                if display_batch is not None:
                     raise HomeAssistantError("Display-off configuration timed out; its outcome is unconfirmed") from None
                 _LOGGER.warning("Reading exchange timed out for valve %s", self._address)
             except Exception as exc:
-                if display_off is not None:
+                if display_batch is not None:
                     raise HomeAssistantError(str(exc)) from exc
                 _LOGGER.exception(
                     "Error while retrieving extended data from valve %s", self._address

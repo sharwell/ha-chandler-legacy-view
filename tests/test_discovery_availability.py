@@ -1,6 +1,7 @@
 """Discovery contracts through real HA objects and simulated scanner callbacks."""
 
 import pytest
+from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import BluetoothScanningMode
 from custom_components.chandler_legacy_view.const import VALVE_MATCHERS
 from custom_components.chandler_legacy_view.discovery import ValveDiscoveryChange as Change
@@ -34,6 +35,10 @@ async def test_one_connectable_watcher_per_address(discovery_manager, bluetooth_
     bluetooth_io.advertise()
     bluetooth_io.advertise(rssi=-55)
     bluetooth_io.advertise("valve-b")
+    if hasattr(bluetooth, "async_register_advertisement_callback"):
+        assert [address for _, address in bluetooth_io.packet_callbacks] == ["valve-a", "valve-b"]
+    else:
+        assert bluetooth_io.packet_callbacks == []
     assert [(address, connectable) for _, address, connectable in bluetooth_io.unavailable_callbacks] == [("valve-a", True), ("valve-b", True)]
     bluetooth_io.expire()
     assert set(discovery_manager.devices) == {"valve-b"}
@@ -152,6 +157,7 @@ async def test_unload_releases_all_subscriptions(discovery_manager, bluetooth_io
     assert bluetooth_io.advertisement_callbacks == []
     assert bluetooth_io.unavailable_callbacks == []
     assert discovery_manager.devices == {}
+    assert bluetooth_io.packet_callbacks == []
 
 
 async def test_queued_callbacks_cannot_revive_unloaded_manager(discovery_manager, bluetooth_io, events):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from collections.abc import Callable
@@ -9,6 +10,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Dict, Mapping
 
+from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import (
     BluetoothChange,
     BluetoothScanningMode,
@@ -495,6 +497,11 @@ class ValveDiscoveryManager:
         self._config_entry_id = config_entry_id
         self._callbacks: list[CALLBACK_TYPE] = []
         self._unavailable_callbacks: dict[str, CALLBACK_TYPE] = {}
+        self._packet_callbacks: dict[str, CALLBACK_TYPE] = {}
+        self._pending_packets: dict[tuple[str, int], asyncio.Handle] = {}
+        self._packet_sequences: dict[str, int] = {}
+        self._processed_packet_sequences: dict[str, int] = {}
+        self._last_packet_info: dict[str, BluetoothServiceInfoBleak] = {}
         self._listeners: list[ValveListener] = []
         # Keep metadata through absence so partial advertisements can recover it.
         self._devices: Dict[str, ValveAdvertisement] = {}
@@ -503,7 +510,11 @@ class ValveDiscoveryManager:
         self._unloaded = False
 
     async def async_setup(self) -> None:
-        """Start listening for Bluetooth advertisements."""
+        """Subscribe to discovery and history replay on the HA event loop.
+
+        Known valves also receive raw per-address updates when HA exposes that
+        API. Discovery and unavailable callbacks remain active on every version.
+        """
 
         _LOGGER.debug("Setting up Bluetooth discovery for Chandler valves")
         for matcher in VALVE_MATCHERS:
@@ -517,7 +528,11 @@ class ValveDiscoveryManager:
             )
 
     async def async_unload(self) -> None:
-        """Cancel Bluetooth callbacks and clear tracked devices."""
+        """Cancel subscriptions and queued packet work, then clear tracked devices.
+
+        Run on the HA event loop; repeated calls are safe. This manager must
+        not be reused for discovery after unloading.
+        """
 
         _LOGGER.debug("Unloading Bluetooth discovery for Chandler valves")
         self._unloaded = True
@@ -527,6 +542,15 @@ class ValveDiscoveryManager:
         while self._unavailable_callbacks:
             _, remove = self._unavailable_callbacks.popitem()
             remove()
+        while self._packet_callbacks:
+            _, remove = self._packet_callbacks.popitem()
+            remove()
+        for handle in self._pending_packets.values():
+            handle.cancel()
+        self._pending_packets.clear()
+        self._packet_sequences.clear()
+        self._processed_packet_sequences.clear()
+        self._last_packet_info.clear()
         self._listeners.clear()
         self._devices.clear()
         self._unavailable_addresses.clear()
@@ -635,7 +659,80 @@ class ValveDiscoveryManager:
         if self._unloaded:
             return
 
-        if change is BluetoothChange.ADVERTISEMENT:
+        if change is not BluetoothChange.ADVERTISEMENT:
+            _LOGGER.debug(
+                "Ignoring Bluetooth change %s for %s", change, service_info.address
+            )
+            return
+
+        # A normal callback supersedes queued packets already received for this
+        # address, including the same report delivered through both APIs.
+        self._processed_packet_sequences[service_info.address] = (
+            self._packet_sequences.get(service_info.address, 0)
+        )
+        self._async_process_advertisement(service_info)
+
+    def _async_queue_packet(self, service_info: BluetoothServiceInfoBleak) -> None:
+        """Queue raw updates for a discovered valve on the HA event loop.
+
+        Per-packet callbacks precede HA's history and source selection. Defer
+        consumption until that bookkeeping finishes. Normal discovery still
+        owns name matching, history replay, and updates without raw bytes.
+        """
+        address = service_info.address
+        if (
+            self._unloaded
+            or address not in self._devices
+            or not service_info.connectable
+            or service_info.raw is None
+        ):
+            return
+        sequence = self._packet_sequences.get(address, 0) + 1
+        self._packet_sequences[address] = sequence
+        self._pending_packets[address, sequence] = self._hass.loop.call_soon(
+            self._async_process_packet, service_info, sequence
+        )
+
+    def _async_process_packet(
+        self, service_info: BluetoothServiceInfoBleak, sequence: int
+    ) -> None:
+        """Consume a queued raw report from HA's selected connectable source.
+
+        A later normal update supersedes earlier queued reports. Do not revive
+        unavailable devices from rejected sources or repeat unchanged packets.
+        """
+        address = service_info.address
+        self._pending_packets.pop((address, sequence), None)
+        if (
+            self._unloaded
+            or sequence <= self._processed_packet_sequences.get(address, 0)
+        ):
+            return
+        self._processed_packet_sequences[address] = sequence
+        preferred = bluetooth.async_last_service_info(
+            self._hass, address, connectable=True
+        )
+        if preferred is None or preferred.source != service_info.source:
+            return
+        # The strongest overall source can be non-connectable. Its presence
+        # must not prevent recovery through HA's preferred connectable source.
+        previous = self._last_packet_info.get(address)
+        # Even an identical report must restore scanner reachability when an
+        # active data session was the only reason the valve stayed available.
+        if (
+            previous is not None
+            and previous.source == service_info.source
+            and previous.raw == service_info.raw
+            and previous.name == service_info.name
+            and address not in self._unavailable_addresses
+        ):
+            return
+        self._async_process_advertisement(service_info)
+
+    def _async_process_advertisement(self, service_info: BluetoothServiceInfoBleak) -> None:
+        """Publish one accepted discovery or raw update, preserving partial metadata."""
+
+        if not self._unloaded:
             if not _matches_valve_prefix(service_info.name):
                 _LOGGER.debug(
                     "Ignoring Bluetooth advertisement from %s with name %r",
@@ -780,9 +877,18 @@ class ValveDiscoveryManager:
                 "complete" if classification.manufacturer_data_complete else "partial",
             )
         else:
-            _LOGGER.debug(
-                "Ignoring Bluetooth change %s for %s", change, service_info.address
-            )
             return
 
+        self._last_packet_info[service_info.address] = service_info
+        if service_info.address not in self._packet_callbacks:
+            # HA 2026.8 has only change-driven callbacks. Keep discovery and
+            # availability on that API on every version; add raw updates when
+            # the public per-address API is present (HA 2026.10 onward).
+            register_packet = getattr(
+                bluetooth, "async_register_advertisement_callback", None
+            )
+            if register_packet is not None:
+                self._packet_callbacks[service_info.address] = register_packet(
+                    self._hass, self._async_queue_packet, service_info.address
+                )
         self._notify_listeners(advertisement, ValveDiscoveryChange.AVAILABLE)
