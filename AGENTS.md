@@ -10,10 +10,13 @@
   before choosing an approach. Follow existing Python and Home Assistant idioms.
 - Keep changes tied to the requested outcome. Preserve unrelated user work;
   avoid speculative abstractions, dependencies, and broad cleanup. Introduce
-  infrastructure and dependencies with their first real consumer.
+  infrastructure, dependencies, runtime choices, modules, and abstractions
+  with their first real consumer.
 - Use existing tools and configuration for mechanical rules. This repository
   has no configured formatter or linter; do not invent required commands or
-  introduce tooling merely to impose a style preference.
+  introduce tooling merely to impose a style preference. If formatting is
+  configured later, format supported files, review the diff, then validate;
+  repeat preparation when subsequent edits invalidate it.
 - Explain the resulting behavior, material tradeoffs, checks, and remaining
   limits so a reader can assess the work without the originating conversation.
 
@@ -31,19 +34,28 @@
 - Preserve the test isolation configured in `pyproject.toml`: the upstream
   Home Assistant pytest plugin is disabled, storage is temporary, and external
   socket I/O is blocked. The local fixtures create real Home Assistant objects;
-  do not replace them with framework stubs or enable host services to run tests.
+  introducing framework stubs requires the concrete isolation evidence described
+  under Testing. Do not enable host services to run normal tests.
 - Choose checks for the change: review prose, links, and formatting for
   documentation-only work; run relevant behavior tests for implementation and
   the supported-target suites for compatibility changes. Keep the standard
   suite part of normal implementation validation. Repeat or broaden checks
   when a new change, failure, or unresolved concern warrants it.
 - Retain dependency pins and CI action commit pins. Avoid incidental upgrades,
-  unpinned downloads, and new tooling without a task-specific need. Inspect
-  generator destinations and preserve unrelated outputs and saved evidence.
+  moving tags, unpinned downloads, and new tooling without a task-specific need.
+  Pin introduced tools and components at their first consumer; preserve the
+  existing dependency manager, any lockfiles, and integrity checks.
+- Use changed-file commands or explicit paths when unrelated work is present.
+  Formatting must preserve the Git index; keep repository-wide style passes
+  separately scoped. Respect generated output, private data, caches, unsupported
+  formats, and deliberate tool exclusions. Inspect generator destinations,
+  validate affected generators, and preserve unrelated outputs and evidence.
 - Report actual commands, outcomes, relevant versions/platforms, and gaps.
   Missing tools or blocked checks remain unverified; do not change system
   security policy, install system tools, or operate hardware just to obtain a
   passing local result. Review the final diff and check `git diff --check`.
+  Distinguish formatting, generation, compilation, execution, packaging, and
+  device acceptance when reporting what the checks establish.
 
 ## Git authorization and message construction
 
@@ -129,9 +141,12 @@ paragraphs; the implementation-summary guideline does not require a bullet list.
 - Discover whether native issue types are supported and which types are
   available. For new issues, use the appropriate supported type according to
   repository conventions; a similarly named label is not a substitute. If a
-  connector omits the field, use GitHub's API to read or set it and verify the
-  saved type through an interface that exposes it. Distinguish unsupported
-  types from tool limitations or API/access failures, and report any unresolved
+  connector cannot read or write the type, use GitHub's API for that operation.
+  Set the type during creation or on the created issue while preserving its
+  identity, intended content, and metadata. Verify the saved type through an
+  interface that exposes it; an omitted field does not verify the type or show
+  that types are unsupported. Distinguish unsupported types from tool limitations
+  or API/access failures, and report any unresolved
   limitation without claiming the type was verified.
 - For investigations, state the questions and expected deliverable,
   including evidence, significant version differences, and remaining
@@ -183,6 +198,11 @@ paragraphs; the implementation-summary guideline does not require a bullet list.
   recovery or multiple valves sharing connection capacity. Such issues
   extend the evidence from earlier steps. Documentation-only steps can
   use document review and formatting checks without tests for prose.
+- For larger work, select the immediate development environment and intended
+  Home Assistant deployment environment explicitly. CI's Ubuntu/Windows matrix
+  does not select the actual deployment target. Preserve required portability
+  and defer unrelated packaging or deployment investigations until their first
+  useful validation point; impose no universal platform order.
 - Record validation requirements and remaining gaps, including necessary
   Home Assistant versions, adapters, proxies, or valve hardware. Follow
   the testing guidance below when distinguishing simulated I/O from live
@@ -266,46 +286,96 @@ paragraphs; the implementation-summary guideline does not require a bullet list.
 - Prefer controlled clocks, events, and existing fixtures over sleeps. Bound
   waits and release test-owned resources; preserve genuine randomness when
   independent keys or tokens are part of the behavior being tested.
+- Assert observable errors and emitted commands as well as state and persistent
+  effects. Avoid incidental ordering, arbitrary object counts, and whole-output
+  snapshots unless they are explicit contracts. Explain internal assertions
+  protecting ownership, resource bounds, or security. Use real temporary files
+  for file behavior when practical.
+- Keep shared fakes small and focused while preserving relevant failures, event
+  ordering, ownership, cancellation, and completion at the external boundary.
+- Name scenarios by their condition and expected outcome, and make assertion
+  failures useful. Documentation-only and reversible, low-impact edits do not
+  need tests that merely restate prose or the implementation.
 
 ## Documentation and API contracts
 
 - Write for the reader's task or decision. Establish purpose, useful behavior,
   and scope before mechanics; supply enough context for readers who did not
-  follow the discussion. Give distinct reference tasks useful entry points.
+  follow the discussion. Describe applicability accurately without implying
+  unsupported uses or excluding supported ones. Organize the whole piece so
+  each section advances the reader's goal; give distinct reference tasks useful
+  entry points instead of forcing them into one narrative.
 - Keep summaries dependable when read alone. Put material qualifications with
   the claims or operations they change. Use familiar terms, direct labels,
-  examples, or tables when they reduce interpretation. Preserve facts and
-  limits when shortening; scale detail to the reader's needs.
+  examples, or tables when they reduce interpretation. Label comparisons,
+  units, and relationships directly. Preserve facts and limits when shortening;
+  scale detail to the audience, importance, and complexity, and stop when the
+  reader's needs are met. Use predictable organization and local context for
+  readers entering or skipping sections,
+  rather than recurring instructions about what to skip. Review both the whole
+  piece and standalone statements for dependable conclusions when skimmed.
 - Code and public interfaces establish implemented behavior; `README.md` and
   maintained guides such as `docs/polling.md` explain current use. GitHub Issues
   owns planned scope; completed issues, PRs, commits, and older revisions retain
   historical rationale and evidence. Scope claims to the relevant branch or
-  release. Issue closure alone does not prove implementation or readiness.
-- Distinguish plans, chosen approaches, observed behavior, and accepted
-  readiness. Update current contracts and usage guides with behavior changes;
-  preserve useful explanations while updating status, versions, and evidence.
-  Keep hardware and firmware evidence gaps explicit even after implementation.
+  release. Identify what content means independently of its container: an open
+  issue may describe a current defect, and a closed PR a rejected proposal.
+  Closure alone does not prove implementation or readiness.
+- Permit summaries, links, and repeated contracts at points of use when they
+  serve independent reader needs. Keep the primary source identifiable and
+  weigh reader benefit against upkeep; avoid a second complete progress record.
+- For a pre-MVP project, state that it is not ready for its intended use,
+  explain the useful outcome, identify major gaps, and link authoritative scope
+  in Issues. Keep a concise vision in the overview when needed to understand
+  the project today. After MVP, lead adoption with available capabilities and
+  use; put future ambitions where they do not dominate current users' path.
+  Establish readiness from evidence rather than inferring it from scaffolding
+  wording or successful local checks.
+- Distinguish required outcomes, preferred representations, tentative or chosen
+  approaches, observed behavior, and accepted readiness. Label planned
+  capabilities and performance targets. Update current contracts and usage
+  guides with behavior changes; preserve useful explanations while updating
+  status, versions, and evidence. Keep hardware and firmware evidence gaps
+  explicit even after implementation.
+  A status edit cannot substitute for implementation or acceptance evidence.
+  Let maintained contracts and usage guides become authoritative for current
+  callers while completed planning records retain historical requirements and
+  evidence without having to track later guide changes.
 - Remove superseded instructions from the affected version's active guides.
   Retain migration advice, operative rationale, and evidence for current
   limitations where useful. Do not create duplicate archives or rewrite
   historical records solely to synchronize them with current guides.
-- For new or touched reusable Python APIs and shared types, document caller
-  contracts in native docstrings at the declaration callers use. Inspect
-  analogous members and reuse accurate terminology for equivalent behavior.
-  Make consequential differences apparent in corresponding descriptions.
-- Explain inputs, units, ranges, defaults, sentinel values, success/failure,
-  partial results, exceptions, and side effects that types do not express.
-  Document meaningful fields and options. Include ownership, lifetime,
-  initialization, event-loop context, cancellation, and blocking when relevant;
-  distinguish an accepted request from confirmed valve output.
+- For new or touched reusable Python APIs, shared types, meaningful shared
+  members, and requested documentation work, document caller contracts so
+  callers need not read the implementation. Use native docstrings at the
+  declaration callers use. Inspect analogous members; without a local precedent,
+  follow idiomatic Python/HA conventions. Reuse accurate terminology and
+  structure for equivalent behavior, including repeated parameter meanings;
+  make consequential differences apparent in corresponding descriptions.
+  These requirements apply without an automated documentation-coverage check.
+- Explain accepted inputs, formats, units, ranges, defaults, actual preconditions,
+  and meaningful empty, omitted, null, or sentinel values that types do not
+  express. Name parameters, fields, options, and individual callback arguments
+  where this prevents inference. Cover success, failure, partial or unchanged
+  output, exceptions, rejection, fallback, and best-effort behavior.
+- Document meaningful members of public options, results, shared records, and
+  enums by how values affect behavior. Include side effects, environmental
+  dependence, ownership, lifetime, initialization order, event-loop context,
+  cancellation, and blocking where relevant to correct use; distinguish an
+  accepted request from confirmed valve output.
 - Favor predictable related APIs during authorized implementation work.
   Documentation-only work does not authorize redesign. State actual enforced
-  behavior without inventing validation, recovery, or concurrency guarantees.
-  Keep implementation rationale beside the implementation; explain evidenced
-  workarounds with affected HA/backend/firmware versions and supporting evidence.
+  behavior without inventing validation, recovery, error results, or concurrency
+  guarantees. Keep implementation rationale beside the implementation; explain evidenced
+  workarounds with affected HA/backend/firmware versions, the failure avoided,
+  and supporting evidence.
 - Preserve accurate wording and make proportional repairs instead of stylistic
-  rewrites. Comments do not enforce contracts or replace behavior tests. Do not
-  introduce a documentation tool or another language's tags just for these rules.
+  rewrites; repeated review should produce little further change. Use a short
+  example when it prevents likely misuse. For scripts, document paths,
+  prerequisites, exit/exception behavior, and file/subprocess/network effects
+  where needed. Comments do not enforce contracts or replace behavior tests.
+  Do not introduce a documentation tool or another language's tags for these
+  rules.
 
 ## Writing and review presentation
 
@@ -324,13 +394,17 @@ alongside the documentation practices above.
 
 ## Sensitive data and live systems
 
-- Keep real credentials, tokens, private device identities/addresses, raw
-  captures, databases, and sensitive logs out of tracked files, diagnostics,
-  issues, PRs, and shared packages. Use fictional test fixtures and examples;
-  ordinary tests must not require household configuration or live credentials.
-- Before writing sensitive evidence, verify that its repository-local storage
-  is ignored. `local-artifacts/` currently has a local ignore rule; verify that
-  rule in the checkout instead of assuming the directory name is sufficient.
+- Keep real credentials, tokens, QR payloads, private installation addresses and
+  device identities, raw captures, databases, and sensitive logs out of tracked
+  files, diagnostics, issues, PRs, and shared packages. Use fictional test
+  fixtures and examples; ordinary tests must not require private configuration,
+  household inventory, a VPN, or real credentials. Client-visible environment
+  variables are not private storage. Preserve useful
+  requested measurements and configuration records without treating them as
+  permission to expose identifying details.
+- Before writing sensitive evidence, verify that its repository-local private
+  storage is ignored. `local-artifacts/` currently has a local ignore rule;
+  verify it in the checkout instead of assuming the directory name is sufficient.
   Preserve intentional evidence and deliverables rather than blanket-deleting
   or ignoring every output directory. Redact identifying details before sharing.
 - Keep unrelated private reference names, links, and machine paths out of
@@ -339,9 +413,10 @@ alongside the documentation practices above.
   sharing package for secrets, local paths, stale artifacts, and raw evidence.
 - Local tests, simulation, and package preparation do not authorize installing
   into a live Home Assistant instance, changing valve settings or firmware,
-  deployment, uploads, publication, or account changes. Establish the authorized
-  operation, target, and scope before an external write; reuse authorization
-  that still applies without adding a redundant approval step.
+  provisioning, signing, deployment, uploads, publication, or account changes.
+  Establish the authorized operation, target, and scope before an external
+  write; reuse authorization that still applies without a redundant approval
+  step.
 - Keep live investigations read-only unless the relevant change is authorized.
   Judge operations by their effects: Bluetooth discovery, authentication, or a
   nominal read can affect a real device. Do not probe mutation endpoints to
