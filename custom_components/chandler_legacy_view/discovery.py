@@ -558,7 +558,12 @@ class ValveDiscoveryManager:
 
     @property
     def devices(self) -> Dict[str, ValveAdvertisement]:
-        """Return a snapshot of the currently reachable devices."""
+        """Return a new mapping of effectively available addresses to shared records.
+
+        Availability combines connectable scanner presence with live sessions.
+        Advertisement objects are not copied; retained metadata for unavailable
+        valves is excluded from this mapping.
+        """
 
         return {
             address: advertisement
@@ -575,7 +580,12 @@ class ValveDiscoveryManager:
         )
 
     def async_set_connection_state(self, address: str, connected: bool) -> None:
-        """Keep a live session available even when the valve stops advertising."""
+        """Set an active session's presence and notify on availability transitions.
+
+        Use on the HA event loop. Unknown addresses and unloaded managers are
+        ignored. A session can keep presence available after adverts expire;
+        this does not establish freshness of individual readings.
+        """
 
         if self._unloaded or address not in self._devices:
             return
@@ -625,7 +635,12 @@ class ValveDiscoveryManager:
                 )
 
     def async_add_listener(self, listener: ValveListener) -> CALLBACK_TYPE:
-        """Register a listener for valve metadata and availability changes."""
+        """Subscribe listener(advertisement, change), returning an idempotent remover.
+
+        No initial state is replayed; use devices for the current snapshot.
+        Callbacks run synchronously on the HA event loop with shared records.
+        Listener exceptions are logged without preventing other listeners.
+        """
 
         self._listeners.append(listener)
 
@@ -636,7 +651,12 @@ class ValveDiscoveryManager:
         return _remove_listener
 
     def async_set_device_metadata(self, advertisement: ValveAdvertisement) -> None:
-        """Publish metadata learned from validated active identification."""
+        """Replace a known valve's record and update its registry metadata.
+
+        The caller supplies validated identification metadata. Ignore unknown
+        addresses or unloaded managers; notify listeners only while effectively
+        available. Run synchronously on the HA event loop.
+        """
         address = advertisement.address
         if self._unloaded or address not in self._devices:
             return

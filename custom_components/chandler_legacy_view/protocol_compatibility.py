@@ -16,7 +16,12 @@ def password_digits(
     status: int, byte_a: int, byte_b: int, byte_c: int, byte_d: int,
     *, signed_bytes: bool,
 ) -> tuple[int, int, int, int]:
-    """Decode the shared arithmetic with the selected byte interpretation."""
+    """Decode four PIN digits using the selected interpretation of wire bytes.
+
+    ``signed_bytes=True`` matches Java signed-byte conversion before division
+    toward zero; False preserves the diagnostic unsigned interpretation.
+    Returned values can be outside 0–9; callers must validate digit ranges.
+    """
 
     def signed(value: int) -> int:
         return (value + 128) % 256 - 128
@@ -73,7 +78,11 @@ class PreviousProtocol:
             self.protocol = "counter"
 
     def observe_device_list(self, packet: bytes) -> None:
-        """Record access only if the previous decoder accepts this response."""
+        """Record old-decoder acceptance from a complete validated Evb019 response.
+
+        The caller must supply at least 12 bytes; this diagnostic does not
+        perform framing or length validation itself.
+        """
 
         self.last_status = packet[7]
         self.firmware_fields = (packet[5], packet[6])
@@ -108,7 +117,12 @@ class PreviousProtocol:
 def previous_dashboard_packet_index(
     packet: bytes, existing_packets: Mapping[int, bytes],
 ) -> int | None:
-    """Reproduce the old collector solely to establish complete acceptance."""
+    """Return the old collector's next accepted index, or None for rejection.
+
+    ``existing_packets`` is the current response's index-to-bytes mapping and
+    is not modified. This diagnostic reproduces old acceptance, not a fallback
+    parser or permission to accept a packet in the production decoder.
+    """
 
     length = len(packet)
     if not 5 <= length <= 20:

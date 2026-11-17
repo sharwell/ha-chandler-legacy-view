@@ -10,7 +10,8 @@ from ble import NOTIFY
 from packets import dashboard_frames
 
 
-async def test_persistent_refreshes_publish_new_readings_on_same_session(hass, runtime_factory, bluetooth_io, transport, clock):
+@pytest.mark.parametrize("interval", [1, 10])
+async def test_persistent_refreshes_publish_new_readings_on_same_session(hass, runtime_factory, bluetooth_io, transport, clock, interval):
     await runtime_factory()
     bluetooth_io.advertise()
     await hass.async_block_till_done()
@@ -19,6 +20,8 @@ async def test_persistent_refreshes_publish_new_readings_on_same_session(hass, r
     persistent = registry.async_get_entity_id("switch", DOMAIN, "valve-a_persistent_connection")
     assert usage is not None
     assert persistent is not None
+    number = registry.async_get_entity_id("number", DOMAIN, "valve-a_persistent_poll_interval")
+    await hass.services.async_call("number", "set_value", {"entity_id": number, "value": interval}, blocking=True)
     assert hass.states.get(usage).state == "unknown"
     valve = transport.valve()
     valve.dashboards.extend(dashboard_frames(gallons=reading) for reading in (123, 456, 789))
@@ -43,7 +46,7 @@ async def test_persistent_refreshes_publish_new_readings_on_same_session(hass, r
         # otherwise a one-shot disconnect could conceal a subscription leak.
         for reading in (456, 789):
             await clock.until(lambda: hass.states.get(usage).state == str(reading)
-                              and not session.notifications, budget=15)
+                              and not session.notifications, budget=interval + 1)
             assert valve.clients == [session]
             assert session.is_connected
             assert session.disconnects == 0

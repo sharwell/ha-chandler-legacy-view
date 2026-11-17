@@ -25,20 +25,35 @@ class Evb034ProtocolError(ValueError):
 
 
 class ReceivedPacket(dict):
-    """Carry each field's monotonic receipt time through partial coalescing."""
+    """Packet fields with original monotonic receipt seconds in confirmed_at.
+
+    Merging another ReceivedPacket carries its per-field timestamps forward.
+    This mapping does not itself validate fields or establish session health.
+    """
 
     def __init__(self):
         super().__init__()
         self.confirmed_at: dict[str, float] = {}
 
     def update(self, other):
+        """Merge fields and, for ReceivedPacket inputs, their receipt timestamps.
+
+        Plain mappings do not create or clear timestamps; the receiver sets
+        confirmed_at when constructing a newly received packet.
+        """
         super().update(other)
         if isinstance(other, ReceivedPacket):
             self.confirmed_at.update(other.confirmed_at)
 
 
 def frame_payload(payload: bytes, size: int) -> tuple[bytes, ...]:
-    """Add first/last flags and a little-endian CCITT CRC to each chunk."""
+    """Frame 1–2048 payload bytes with first/last flags and CCITT CRC16.
+
+    ``size`` is the maximum complete ATT value length (MTU minus three),
+    including the Chandler header and CRC, and must be within 14–512 bytes.
+    Return ordered immutable frames; raise Evb034ProtocolError for invalid
+    lengths. This only frames bytes; it does not validate JSON or perform I/O.
+    """
     if not 14 <= size <= 512 or not payload or len(payload) > MAX_PACKET_BYTES:
         raise Evb034ProtocolError("Invalid packet or negotiated write size")
     chunks = []
@@ -68,6 +83,12 @@ class Evb034Session:
 
     CsBleViewModel.onBleDeviceFullConnected sends EA; the initial PIN is raw.
     Only authenticated configuration JSON uses CsBleQueueProcessor framing.
+
+    Use on one event loop for one BLE connection. ``write(bytes)`` is an
+    awaitable transport write; ``size`` is the ATT value limit, not the MTU.
+    ``on_packet(packet)`` synchronously observes authenticated receipt before
+    HA publication, and ``on_failure(error)`` reports the first receiver error.
+    Call identify once to start the receiver and always close it at teardown.
     """
 
     def __init__(
@@ -96,7 +117,11 @@ class Evb034Session:
         self._on_failure = on_failure
 
     def notification(self, _sender, data: bytearray) -> None:
-        """Ignore callbacks after this client relinquishes ownership."""
+        """Queue one complete ATT notification on the session's event loop.
+
+        Copy data, record its receipt time, and ignore calls after close/failure.
+        Queue overflow fails the session; do not split or join notifications.
+        """
         if self._closed or self._failure is not None:
             return
         self._notification_serial += 1
@@ -124,7 +149,11 @@ class Evb034Session:
         return self._notification_serial
 
     async def wait_interval(self, seconds: float) -> None:
-        """Wait for HA's interval, waking immediately if access/transport fails."""
+        """Wait seconds, or raise Evb034ProtocolError on access/receiver failure.
+
+        Ordinary interval expiry returns normally; it does not confirm a fresh
+        reading. Caller cancellation propagates without closing the session.
+        """
         self.check_health()
         try:
             async with asyncio.timeout(seconds):
@@ -141,7 +170,10 @@ class Evb034Session:
             raise Evb034ProtocolError("Session closed")
 
     async def close(self) -> None:
-        """Invalidate callbacks and drain the owned receiver task."""
+        """Invalidate callbacks, drain the receiver, and discard pending packets.
+
+        Repeated calls are safe. The caller still owns the BLE disconnect.
+        """
         self._closed = True
         self._ready.set()
         if self._reader is not None:
@@ -173,7 +205,13 @@ class Evb034Session:
                 await self._ready.wait()
 
     async def identify(self) -> dict:
-        """Receive identification after EA, without an Evb019 read command."""
+        """Start receipt and send EA until validated firmware identification arrives.
+
+        Return the accumulated identification fields and receipt timestamps.
+        Raise Evb034ProtocolError for invalid/already-started sessions, or
+        propagate transport errors/timeouts. The receiver remains owned until
+        close, including when identification fails.
+        """
         if self._reader is not None:
             raise Evb034ProtocolError("Session already identified")
         self._reader = asyncio.create_task(self._receive_loop())
@@ -196,7 +234,13 @@ class Evb034Session:
         raise Evb034ProtocolError("Identification missing")
 
     async def authenticate(self, payload: bytes) -> dict:
-        """Match the direct pre-authentication write in CsBleViewModel.write."""
+        """Write the raw PIN buffer and return a later explicit access response.
+
+        ``payload`` must have min(20, ATT value limit) bytes. The caller must
+        interpret packet ``as`` and call mark_authenticated only after access
+        is confirmed. A returned response need not mean credentials succeeded;
+        invalid length, receiver/transport failure, and timeout raise.
+        """
         if len(payload) != min(20, self.write_size):
             raise Evb034ProtocolError("Invalid authentication buffer length")
         async with self._operation_lock:
@@ -209,7 +253,14 @@ class Evb034Session:
                         return packet
 
     async def send_command(self, payload: bytes) -> None:
-        """Send configuration JSON with bounded ACK/NAK retries."""
+        """Send a nonempty JSON object with bounded ACK/NAK retries.
+
+        Caller must establish authenticated access first. Return after frame
+        ACKs, not confirmation that the valve applied the setting; a matching
+        reading must confirm that separately. Invalid JSON/framing or exhausted
+        retries raise Evb034ProtocolError; transport errors/timeouts propagate.
+        Failure/cancellation can leave the physical command outcome uncertain.
+        """
         try:
             command = json.loads(payload)
         except (ValueError, UnicodeError) as exc:
@@ -251,7 +302,13 @@ class Evb034Session:
                 self._acks.clear()
 
     async def next_packet(self, *, after: int = 0) -> dict:
-        """Wait a bounded time for a complete update from this client."""
+        """Consume the next packet whose notification serial is greater than after.
+
+        ``after`` is a notification_cursor value; older queued entries are
+        discarded. Coalesced fields can have older receipt times, so use their
+        confirmed_at values when checking individual command readback. Raise
+        on session failure or after a nine-second wait without a matching entry.
+        """
         async with asyncio.timeout(TIMEOUT * 3):
             while True:
                 serial, packet = await self._wait_ready(self._packets, TIMEOUT * 3)

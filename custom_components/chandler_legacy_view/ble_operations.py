@@ -13,6 +13,8 @@ class OwnedBluetoothOperations:
     Only external I/O is detached on a timeout. Production parsing continues
     in its original caller, and notification callbacks are fenced immediately.
     The owner cannot be released until detached I/O and disconnect both finish.
+    Use on one event loop. ``changed`` is a synchronous callback invoked when
+    an external task settles, including after its original caller has left.
     """
 
     def __init__(self, changed: Callable[[], None]) -> None:
@@ -26,7 +28,11 @@ class OwnedBluetoothOperations:
 
     @property
     def released(self) -> bool:
-        """Require backend disconnect confirmation and completion of old I/O."""
+        """Return whether retired I/O and cleanup are settled and the client is down.
+
+        This uses the backend's connection state, not a physical adapter or
+        proxy-slot observation.
+        """
 
         return (
             self.retired
@@ -42,7 +48,11 @@ class OwnedBluetoothOperations:
         self.notifications_enabled = False
 
     def guard_notification(self, handler):
-        """Retain the ownership check even if subscribe completes very late."""
+        """Wrap handler(sender, data), discarding calls after invalidation/retirement.
+
+        The wrapper preserves the handler's synchronous calling convention
+        and does not catch its exceptions or copy its arguments.
+        """
 
         def guarded(sender, data):
             if self.notifications_enabled and not self.expired and not self.retired:
@@ -57,7 +67,15 @@ class OwnedBluetoothOperations:
         *,
         connecting: bool = False,
     ):
-        """Bound the wait, retaining a strong reference until the I/O finishes."""
+        """Await external I/O for at most timeout seconds, retaining unfinished work.
+
+        Return the awaitable's result or propagate its exception. Expiry of this
+        wait or caller cancellation invalidates the generation and requests
+        cancellation of the external task, without waiting for resistant I/O.
+        If connecting is True, retain even a late successful result as this
+        owner's client so cleanup can disconnect it. A return or raised timeout
+        alone does not establish release.
+        """
 
         task = asyncio.ensure_future(awaitable)
         self.pending.add(task)

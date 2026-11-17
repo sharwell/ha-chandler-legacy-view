@@ -21,7 +21,11 @@ INHERIT_ON_DEMAND_INTERVAL = "inherit_on_demand_interval"
 
 
 def on_demand_interval(value) -> float:
-    """On-demand options use minutes; never confuse them with persistent seconds."""
+    """Return a finite on-demand option in minutes, within 1–1440 inclusive.
+
+    Accept float-convertible values except booleans. Invalid inputs raise
+    ValueError, TypeError, or OverflowError; this does not convert to seconds.
+    """
     if isinstance(value, bool):
         raise ValueError("On-demand interval must be a number")
     value = float(value)
@@ -31,6 +35,7 @@ def on_demand_interval(value) -> float:
 
 
 def default_on_demand_interval(options) -> float:
+    """Return the entry default in minutes, or 15 for missing/invalid values."""
     try:
         return on_demand_interval(options.get(ON_DEMAND_INTERVAL, 15))
     except (ValueError, TypeError, OverflowError):
@@ -38,16 +43,21 @@ def default_on_demand_interval(options) -> float:
 
 
 def persistent_interval(value) -> float:
-    """Reject malformed values instead of silently changing user intent."""
+    """Return a finite persistent interval in seconds, within 1–300 inclusive.
+
+    Accept float-convertible values except booleans. Invalid inputs raise
+    ValueError, TypeError, or OverflowError instead of selecting a default.
+    """
     if isinstance(value, bool):
         raise ValueError("Persistent interval must be a number")
     value = float(value)
     if not math.isfinite(value) or not MIN_PERSISTENT_POLL_INTERVAL_SECONDS <= value <= MAX_PERSISTENT_POLL_INTERVAL_SECONDS:
-        raise ValueError("Persistent interval must be between 5 and 300 seconds")
+        raise ValueError("Persistent interval must be between 1 and 300 seconds")
     return value
 
 
 def default_interval(options) -> float:
+    """Return the entry default in seconds, or 10 for missing/invalid values."""
     try:
         return persistent_interval(options.get(PERSISTENT_INTERVAL, DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS))
     except (ValueError, TypeError, OverflowError):
@@ -55,28 +65,46 @@ def default_interval(options) -> float:
 
 
 def valve_preferences(options, address) -> dict:
+    """Return a shallow copy of an address's overrides, or an empty dict.
+
+    Malformed override containers are treated as empty. Editing the returned
+    mapping alone does not change entry options.
+    """
     values = options.get(VALVE_PREFERENCES, {})
     value = values.get(address, {}) if isinstance(values, dict) else {}
     return dict(value) if isinstance(value, dict) else {}
 
 
 class ValvePreferences:
-    """Read current options and merge every write into the latest entry data."""
+    """Read current options and merge every write into the latest entry data.
+
+    Use on HA's event loop. These are local settings; writes update the config
+    entry and may notify its update listener, without directly contacting a
+    valve. On-demand options use minutes; persistent options use seconds.
+    """
 
     def __init__(self, hass, entry):
         self.hass = hass
         self.entry = entry
 
     def enabled(self, address) -> bool:
+        """Return True only for an explicitly saved persistent-mode True value."""
         return valve_preferences(self.entry.options, address).get(PERSISTENT_ENABLED) is True
 
     def interval(self, address) -> float:
+        """Return effective persistent seconds, falling back from invalid overrides."""
         try:
             return persistent_interval(valve_preferences(self.entry.options, address)[PERSISTENT_INTERVAL])
         except (KeyError, ValueError, TypeError, OverflowError):
             return default_interval(self.entry.options)
 
     def set(self, address, key, value) -> None:
+        """Save an explicit valve override, preserving other current options.
+
+        The caller must validate key/value semantics. Equal-to-default writes
+        still create overrides; this method does not remove an override to
+        restore inheritance.
+        """
         options = dict(self.entry.options)
         original = options.get(VALVE_PREFERENCES, {})
         valves = dict(original) if isinstance(original, dict) else {}

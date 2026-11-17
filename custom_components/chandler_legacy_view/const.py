@@ -26,7 +26,7 @@ PLATFORMS: Final[list[Platform]] = [
 
 # Persistent connection configuration
 DEFAULT_PERSISTENT_POLL_INTERVAL_SECONDS: Final = 10.0
-MIN_PERSISTENT_POLL_INTERVAL_SECONDS: Final = 5.0
+MIN_PERSISTENT_POLL_INTERVAL_SECONDS: Final = 1.0
 MAX_PERSISTENT_POLL_INTERVAL_SECONDS: Final = 300.0
 
 # Storage keys used inside ``hass.data``

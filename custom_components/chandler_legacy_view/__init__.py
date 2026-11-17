@@ -34,14 +34,19 @@ _LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up the Chandler Legacy View integration via YAML."""
+    """Initialize shared integration storage; valve setup uses UI config entries."""
 
     hass.data.setdefault(DOMAIN, {})
     return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up Chandler Legacy View from a config entry."""
+    """Set up discovery, polling, and entities for a UI config entry.
+
+    Raise ConfigEntryNotReady while this entry's previous Bluetooth owner is
+    quarantined. Setup can retry after confirmed cleanup instead of opening
+    a replacement connection over unfinished external work.
+    """
 
     hass.data.setdefault(DOMAIN, {})
 
@@ -101,7 +106,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 def get_configured_passcode(entry: ConfigEntry, address: str | None = None) -> str | None:
-    """Return the configured passcode for a valve address."""
+    """Return the valve override, entry default, or factory passcode ``1234``.
+
+    With no address, use the entry default. Blank and ``0000`` values fall
+    back to the next applicable default. Strip whitespace without validating
+    the resulting PIN or contacting the valve.
+    """
 
     overrides = entry.options.get(CONF_DEVICE_PASSCODES, {})
     if address is not None:
@@ -123,7 +133,12 @@ def get_configured_passcode(entry: ConfigEntry, address: str | None = None) -> s
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a Chandler Legacy View config entry."""
+    """Unload platforms and local runtime, retaining any quarantined I/O owner.
+
+    Return False if HA refuses platform unload. True means logical unload
+    completed; it does not prove physical Bluetooth release. Replacement
+    setup waits for an unconfirmed old owner to settle.
+    """
 
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if not unload_ok:
@@ -154,7 +169,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Handle a config entry reload request."""
+    """Apply monitoring preferences live, or reload when credentials changed."""
 
     runtime = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     manager = runtime[DATA_CONNECTION_MANAGER] if runtime else None

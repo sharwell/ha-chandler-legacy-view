@@ -43,8 +43,9 @@ async def number_write(hass, address, value):
     await hass.async_block_till_done()
 
 
+@pytest.mark.parametrize("interval", [1, 10])
 async def test_number_writes_defaults_overrides_and_offline_options_share_one_value(
-    hass, runtime_factory, bluetooth_io, transport,
+    hass, runtime_factory, bluetooth_io, transport, interval,
 ):
     entry = await runtime_factory()
     for address in ("valve-a", "valve-b"):
@@ -53,11 +54,11 @@ async def test_number_writes_defaults_overrides_and_offline_options_share_one_va
     original = manager(hass, entry)
     number = entity_id(hass, "number", "valve-a", "persistent_poll_interval")
     record = er.async_get(hass).async_get(number)
-    await number_write(hass, "valve-a", 10)
-    assert entry.options[VALVE_PREFERENCES]["valve-a"][PERSISTENT_INTERVAL] == 10
+    await number_write(hass, "valve-a", interval)
+    assert entry.options[VALVE_PREFERENCES]["valve-a"][PERSISTENT_INTERVAL] == interval
     await update_options(hass, entry, {PERSISTENT_INTERVAL: 20})
     assert manager(hass, entry) is original
-    assert float(hass.states.get(number).state) == 10
+    assert float(hass.states.get(number).state) == interval
     assert original.get_connection("valve-b").persistent_poll_interval == 20
     bluetooth_io.expire()
     await hass.async_block_till_done()
@@ -72,6 +73,32 @@ async def test_number_writes_defaults_overrides_and_offline_options_share_one_va
     assert float(hass.states.get(number).state) == 20
     assert er.async_get(hass).async_get(number) == record
     assert transport.attempts == []
+
+
+async def test_one_second_options_defaults_and_overrides_are_selectable(
+    hass, runtime_factory, bluetooth_io,
+):
+    entry = await runtime_factory()
+    for address in ("valve-a", "valve-b"):
+        bluetooth_io.advertise(address)
+    await hass.async_block_till_done()
+    for user_input, expected in [
+        ({PERSISTENT_INTERVAL: 1}, (1, 1)),
+        ({PERSISTENT_INTERVAL: 10, "device_address": "valve-a",
+          "device_persistent_interval": 1}, (1, 10)),
+    ]:
+        flow = await hass.config_entries.options.async_init(entry.entry_id)
+        # Validate the actual selectors as well as the options handler so the
+        # form cannot reject a one-second value accepted by the runtime.
+        validated = flow["data_schema"](user_input)
+        result = await hass.config_entries.options.async_configure(flow["flow_id"], user_input=validated)
+        assert result["type"] is FlowResultType.CREATE_ENTRY
+        await hass.async_block_till_done()
+        for address, interval in zip(("valve-a", "valve-b"), expected):
+            number = entity_id(hass, "number", address, "persistent_poll_interval")
+            assert float(hass.states.get(number).state) == interval
+    assert entry.options[PERSISTENT_INTERVAL] == 10
+    assert entry.options[VALVE_PREFERENCES]["valve-a"][PERSISTENT_INTERVAL] == 1
 
 
 async def test_restored_mode_and_interval_govern_real_session_and_survive_cleanup(
@@ -109,13 +136,14 @@ async def test_restored_mode_and_interval_govern_real_session_and_survive_cleanu
 
 @pytest.mark.parametrize("disabled", [False, True])
 @pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("interval", [1, 180])
 async def test_real_storage_restores_before_first_poll_even_with_disabled_controls(
-    hass, hass_factory, runtime_factory, bluetooth_io, transport, clock, disabled, enabled,
+    hass, hass_factory, runtime_factory, bluetooth_io, transport, clock, disabled, enabled, interval,
 ):
     entry = await runtime_factory()
     bluetooth_io.advertise()
     await hass.async_block_till_done()
-    await number_write(hass, "valve-a", 180)
+    await number_write(hass, "valve-a", interval)
     switch = entity_id(hass, "switch", "valve-a", "persistent_connection")
     await update_options(hass, entry, {ON_DEMAND_INTERVAL: 60, "device_address": "valve-a", "device_on_demand_interval": 120})
     number = entity_id(hass, "number", "valve-a", "persistent_poll_interval")
@@ -133,21 +161,21 @@ async def test_real_storage_restores_before_first_poll_even_with_disabled_contro
     await saved_entry.async_setup_locked(restored)
     connection = restored.data[DOMAIN][entry.entry_id][DATA_CONNECTION_MANAGER].get_connection("valve-a")
     assert connection.persistent_connection_enabled is enabled
-    assert connection.persistent_poll_interval == 180
+    assert connection.persistent_poll_interval == interval
     assert connection.on_demand_poll_interval == 7200
     if disabled:
         assert restored.states.get(switch) is None
         assert restored.states.get(number) is None
     else:
         assert restored.states.get(switch).state == ("on" if enabled else "off")
-        assert float(restored.states.get(number).state) == 180
+        assert float(restored.states.get(number).state) == interval
     await clock.run(connection.async_poll())
     assert transport.valve().clients[-1].is_connected is enabled
     assert await clock.run(restored.config_entries.async_unload(entry.entry_id))
     assert saved_entry.options[VALVE_PREFERENCES]["valve-a"][PERSISTENT_ENABLED] is enabled
 
 
-@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf, 4, 301])
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf, 0, 0.5, 301])
 async def test_invalid_local_interval_does_not_change_saved_configuration(
     hass, runtime_factory, bluetooth_io, value,
 ):

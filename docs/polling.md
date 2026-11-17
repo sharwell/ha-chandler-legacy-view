@@ -14,12 +14,30 @@ in the options description. Defaults and overrides survive reloads/restarts;
 editing them recalculates due times from the last validated reading.
 
 Persistent mode retains one connection and uses its separate **Persistent
-Poll Interval**, in seconds (5–300; default 10). Its default and valve overrides
+Poll Interval**, in seconds (1–300; default 10). Its default and valve overrides
 are also in Configure. The existing interval number remains a working local
 configuration control, including while the valve is unreachable. Writing it
 always saves a valve override. Persistent interval edits apply to the current
-session without restarting it. Evb034 notifications are acknowledged promptly
-even when publication uses a longer interval.
+session without restarting it. Evb019 waits this interval between reading
+exchanges; response time adds to the elapsed time between updates.
+Evb034 notifications are acknowledged promptly even when publication uses a
+longer interval. For Evb034, the persistent interval controls Home Assistant
+publication cadence, not the valve's own reporting interval.
+
+## Upgrading saved monitoring preferences
+
+Persistent mode and interval choices are stored in entry options independently
+of whether their control entities are enabled. Monitoring preference edits do
+not reload the integration; changing persistent mode starts or stops its
+session as requested. Credential changes retain the reload behavior.
+
+Older releases did not persist these controls. During the one-time migration,
+the integration can recover a saved persistent **on** state or a valid,
+non-default interval from Home Assistant's current or restored entity states.
+Existing entry options take precedence. Old **off** or **10-second** states,
+and unknown/unavailable states, cannot establish a deliberate selection.
+Choices whose history was already lost cannot be reconstructed; check the
+settings after upgrading.
 
 ## Refresh readings
 
@@ -98,6 +116,38 @@ quarantine. Replacement setup retries until release is confirmed. Consult the
 Bluetooth adapter/proxy logs when this persists. A completed integration unload
 does not itself prove that a physical connection or proxy slot was released.
 
+### Operation and cleanup budgets
+
+These are integration wait limits, in seconds; they do not guarantee that a
+stalled Bluetooth backend has stopped its external work when the wait ends.
+
+| Operation | Wait limit |
+| --- | --- |
+| Connection establishment | 20 seconds |
+| Individual GATT operation | 10 seconds |
+| Complete initial exchange, including authentication attempts | 60 seconds |
+| Persistent Evb019 reading exchange | 30 seconds |
+| Evb034 wire write/ACK or partial-frame assembly deadline | 3 seconds |
+| Request-notification unsubscribe allowance | 5 seconds |
+| Reset or Evb034 stream-close cleanup allowance | 5 seconds |
+| Disconnect allowance | 30 seconds |
+| Total caller wait for persistent switch-off or unload cleanup | 45 seconds |
+
+A complete initial attempt has a 120-second budget: connection, exchange,
+request unsubscribe, reset/stream close, and disconnect. Each cleanup phase
+has its own allowance; a reset failure does not consume the disconnect budget.
+The 45-second lifecycle wait is a separate caller deadline, not a new lifetime
+limit for a healthy persistent session. Repeated caller cancellation does not
+restart that deadline or relinquish unfinished external work.
+
+Switching persistent mode off retains the **off** preference even when the
+action reports unconfirmed cleanup. Logical entry unload can likewise finish
+with the old owner quarantined. Late callbacks from the old session cannot
+update replacement-session readings; replacement setup waits for old I/O and
+disconnect to settle.
+Manual refresh reports unsuccessful reads to the calling action/automation;
+it does not treat a completed wait as a successful reading.
+
 ## Reading expiration
 
 Expired Dashboard readings become unavailable
@@ -106,6 +156,18 @@ is unavailable. On-demand maximum age is the declared interval plus five
 minutes of recovery allowance: 20 minutes by default, or 65 minutes for an
 hourly custom schedule. Persistent maximum age is the greater of three
 persistent intervals or two minutes (15 minutes at a five-minute interval).
+
+The exact maximum-age calculations use seconds:
+
+| Mode | Maximum confirmation age |
+| --- | --- |
+| On-demand | `I + max(300, 2 * A + C + 15)` |
+| Persistent | `max(3 * P, 120)` |
+
+`I` is the expected on-demand interval, `P` the persistent interval, `A` the
+complete-attempt budget (120 seconds), and `C` the connection cooldown (30
+seconds). These budgets currently give a 300-second on-demand recovery
+allowance. They bound integration waits without proving physical release.
 
 A due read and its permitted retry can make readings unavailable sooner if
 both fail. Failed early manual refreshes do not expire current readings or
@@ -121,23 +183,46 @@ edits recalculate from the original confirmation time; increasing an interval
 cannot revive an expired value. New valid data restores the value and
 availability together. Firmware/type/Clack applicability still takes precedence.
 
-Evb034 uses session health for fields with a valid baseline: receiving a valid
-field makes that field eligible, and later valid reading updates renew all
-eligible fields in the same authenticated session. Fields can first appear
-later in a session. A clock needs all required components before eligibility.
-Fields never received stay unavailable; their entities and registry enablement
-are unchanged. Existing firmware/type/Clack restrictions still apply.
+### Evb034 session-health policy
 
-Metadata, ACKs, nulls and invalid data do not renew session health. Silence
-uses the same deadlines above. Access loss, receiver failure or a detected
-unexpected disconnect invalidates the session baseline, and reconnect starts
-with no eligible fields. A completed on-demand snapshot remains available
-between reads until its deadline. First availability and recovery publish the
-current snapshot immediately, while ordinary updates retain the configured
-publication interval.
+Evb034 uses an integration policy assumption: a valid received field establishes
+eligibility, and later valid authenticated reading activity renews every
+eligible field in that session. **One field's producer can stop updating while
+other reading traffic keeps its retained value marked fresh.** This detects
+loss of session reading activity, not every individual producer failure.
 
-This is a deliberate policy assumption: other reading updates can keep one
-field marked fresh even if that field's producer has stopped. The APK does
-not prove a reporting guarantee for each field. See
-[Evb034 reporting evidence](evb034-reporting.md) for the decision and remaining
-hardware validation.
+- A baseline requires an explicit valid authenticated value; zero and unchanged
+  values are valid. Session initialization must finish before the baseline can
+  be published as available. A field may first appear later in the session;
+  fields never received remain unavailable.
+- A clock needs valid hour and minute components, plus AM/PM on non-Clack
+  C6.00–6.08. C6.09+ and Clack use a 24-hour clock. Required components
+  must come from the current session; their original receipt times survive
+  buffering and coalescing.
+- A complete validated packet with a usable known reading component renews
+  eligible baselines. Metadata, ACKs, keepalives, null-only packets, and invalid
+  data do not. A null or invalid field does not erase an existing valid baseline.
+- Silence uses the maximum-age and due-failure rules above. Access loss,
+  receiver failure, or a detected unexpected disconnect invalidates eligibility;
+  a new authenticated connection starts with no eligible fields. Late old
+  callbacks cannot establish a baseline in its replacement.
+- A completed on-demand read retains its snapshot between connections until
+  expiration; deliberate disconnect does not immediately expire it. Stopping
+  a healthy persistent session first publishes already-received buffered
+  readings with their original confirmation times.
+- Receipt and HA publication are separate. First availability and recovery
+  publish the current snapshot and availability together; ordinary updates
+  retain the configured publication interval. Republishing retained values
+  cannot manufacture a new receipt time or revive an expired baseline.
+- Eligibility affects availability, not entity creation or registry enablement.
+  Existing firmware/type/Clack restrictions still apply.
+
+The reviewed APK establishes delta merging and null handling, not guaranteed
+per-field report intervals or change-only producer health. These firmware
+guarantees and physical adapter/proxy recovery remain unverified by the
+simulated regression checks. [The #105 reporting record](https://github.com/sharwell/ha-chandler-legacy-view/issues/105#issuecomment-6960677235)
+holds the reporting investigation, selected decision, and remaining capture
+requirements.
+
+Historical implementation decisions and original validation results are
+preserved in [the #106 completion record](https://github.com/sharwell/ha-chandler-legacy-view/issues/106#issuecomment-6960379940).

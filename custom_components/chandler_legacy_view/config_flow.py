@@ -32,6 +32,8 @@ from .const import (
     DATA_DISCOVERY_MANAGER,
     DEFAULT_VALVE_PASSCODE,
     DOMAIN,
+    MAX_PERSISTENT_POLL_INTERVAL_SECONDS,
+    MIN_PERSISTENT_POLL_INTERVAL_SECONDS,
 )
 from .entity import friendly_name_from_advertised_name
 from .preferences import (
@@ -102,7 +104,7 @@ class ChandlerLegacyViewConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
-    """Allow updates to passcode configuration for Chandler valves."""
+    """Edit entry defaults and per-valve passcodes and monitoring intervals."""
 
     def __init__(self, config_entry: ConfigEntry) -> None:
         """Initialize the options flow handler."""
@@ -250,7 +252,11 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
                 NumberSelectorConfig(min=1, max=1440, step=1, unit_of_measurement="min", mode=NumberSelectorMode.BOX)
             ),
             vol.Optional(PERSISTENT_INTERVAL, default=default_interval(self._config_entry.options)): NumberSelector(
-                NumberSelectorConfig(min=5, max=300, step=1, unit_of_measurement="s", mode=NumberSelectorMode.BOX)
+                NumberSelectorConfig(
+                    min=MIN_PERSISTENT_POLL_INTERVAL_SECONDS,
+                    max=MAX_PERSISTENT_POLL_INTERVAL_SECONDS,
+                    step=1, unit_of_measurement="s", mode=NumberSelectorMode.BOX,
+                )
             ),
             vol.Optional(
                 CONF_DEFAULT_PASSCODE,
@@ -269,7 +275,11 @@ class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
             )
             schema_dict[vol.Optional(CONF_DEVICE_PASSCODE)] = PASSCODE_SELECTOR
             schema_dict[vol.Optional("device_persistent_interval")] = NumberSelector(
-                NumberSelectorConfig(min=5, max=300, step=1, unit_of_measurement="s", mode=NumberSelectorMode.BOX)
+                NumberSelectorConfig(
+                    min=MIN_PERSISTENT_POLL_INTERVAL_SECONDS,
+                    max=MAX_PERSISTENT_POLL_INTERVAL_SECONDS,
+                    step=1, unit_of_measurement="s", mode=NumberSelectorMode.BOX,
+                )
             )
             schema_dict[vol.Optional(INHERIT_PERSISTENT_INTERVAL, default=False)] = BooleanSelector()
             schema_dict[vol.Optional("device_on_demand_interval")] = NumberSelector(
