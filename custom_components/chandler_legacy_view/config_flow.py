@@ -102,7 +102,7 @@ class ChandlerLegacyViewConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class ChandlerLegacyViewOptionsFlowHandler(config_entries.OptionsFlow):
-    """Allow updates to passcode configuration for Chandler valves."""
+    """Edit entry defaults and per-valve passcodes and monitoring intervals."""
 
     def __init__(self, config_entry: ConfigEntry) -> None:
         """Initialize the options flow handler."""

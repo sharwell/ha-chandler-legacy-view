@@ -18,6 +18,11 @@ READING_FIELDS = {
 
 
 def number(packet: Mapping, key: str) -> float | None:
+    """Return an explicit finite int/float in 0..2**31-1, or None.
+
+    Reject booleans, strings, nulls, and missing keys; do not coerce them.
+    The returned number keeps its original numeric type.
+    """
     value = packet.get(key)
     if type(value) not in (int, float):
         return None
@@ -27,12 +32,19 @@ def number(packet: Mapping, key: str) -> float | None:
 
 
 def integer(packet: Mapping, key: str) -> int | None:
+    """Truncate an accepted number toward zero, or return None as number does."""
     value = number(packet, key)
     return int(value) if value is not None else None
 
 
 def valid_reading_keys(packet: Mapping, firmware: int, *, clack: bool) -> set[str]:
-    """Recognize explicit usable components without borrowing retained values."""
+    """Return usable reading keys from this delta, without borrowing old values.
+
+    ``firmware`` uses major * 100 + minor. ``clack`` selects the Clack clock
+    interpretation. Check clock components individually; a key in this set
+    does not establish a complete clock. ``asdo`` must be integer 0 or 1.
+    The input mapping is not changed.
+    """
     keys = {key for key in READING_KEYS.intersection(packet) if number(packet, key) is not None}
     for key, maximum in (("dh", 23), ("dm", 59), ("da", 1)):
         if key in keys and integer(packet, key) > maximum:
@@ -59,7 +71,14 @@ def _battery_capacity(raw: float) -> int:
 
 
 def decode_dashboard(packet: Mapping, firmware: int, *, clack: bool = False) -> ValveDashboardData:
-    """Retain absent readings as unknown; apply each field's own conversion."""
+    """Decode a packet snapshot, leaving absent or invalid readings as None.
+
+    ``firmware`` uses major * 100 + minor. Clack or firmware >= 611 uses
+    hundredths for usage/remaining gallons; Clack or firmware >= 609 uses
+    a 24-hour clock. Remaining gallons follow the reference's JVM float/int
+    conversion. This does not merge deltas, enforce support/freshness, or
+    mutate packet; callers supply any retained session values explicitly.
+    """
     values = {field.name: None for field in fields(ValveDashboardData)}
     if type(packet.get("asdo")) is int and packet["asdo"] in (0, 1):
         values["display_off"] = bool(packet["asdo"])

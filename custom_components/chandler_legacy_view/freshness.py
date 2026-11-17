@@ -23,13 +23,25 @@ READINGS = frozenset({
 
 @dataclass(frozen=True)
 class FreshnessPolicy:
+    """Current mode, expected interval, and maximum confirmation age in seconds.
+
+    ``mode`` labels diagnostics; it does not choose an expiration algorithm.
+    ``interval`` is the expected reading cadence, while ``maximum_age`` is the
+    allowed age of a confirmation, including any recovery allowance.
+    """
     mode: str
     interval: float
     maximum_age: float
 
 
 class ReadingFreshness:
-    """Keep absolute deadlines and sticky expiry until a new confirmation."""
+    """Keep absolute deadlines and sticky expiry until a new confirmation.
+
+    Use on HA's event loop. ``policy()`` returns the current FreshnessPolicy,
+    or None to suspend expiration enforcement. ``changed()`` synchronously
+    reports availability changes; the caller owns reading values/publication.
+    Receipt times use ``hass.loop.time()`` seconds, never wall-clock datetimes.
+    """
 
     def __init__(self, hass, address, policy, changed):
         self.hass = hass
@@ -45,14 +57,21 @@ class ReadingFreshness:
         self._closed = False
 
     def activate(self) -> None:
+        """Start initial-acquisition deadlines once; do nothing after close."""
         if self.started is None and not self._closed:
             self.started = self.hass.loop.time()
             self.recalculate()
 
     def current(self, key) -> bool:
+        """Return whether key is unexpired, or True when policy is disabled.
+
+        An unexpired key need not have a confirmed value. The consumer must
+        separately check data presence and protocol-specific eligibility.
+        """
         return self.policy() is None or key not in self.expired
 
     def close(self) -> None:
+        """Cancel the deadline timer and prevent further confirmation changes."""
         self._closed = True
         if self._cancel is not None:
             self._cancel()
@@ -79,7 +98,11 @@ class ReadingFreshness:
         return bool(added)
 
     def invalidate(self, keys, reason: str) -> None:
-        """End session authority immediately, retaining the data for diagnostics."""
+        """Expire keys and notify once if availability changed; retain stored times.
+
+        ``reason`` is diagnostic text. A disabled policy or closed tracker
+        makes this a no-op; reading values remain owned by the consumer.
+        """
         if self._closed or (policy := self.policy()) is None:
             return
         if self._expire(keys, reason, policy):
@@ -90,6 +113,9 @@ class ReadingFreshness:
 
         Expired values remain unavailable until the consumer can publish the
         updated snapshot and availability together.
+        ``keys`` must already be eligible under the caller's session policy;
+        this method does not establish eligibility. ``received`` is the original
+        monotonic receipt time in seconds, not the publication time.
         """
         if self._closed:
             return
@@ -103,7 +129,13 @@ class ReadingFreshness:
             self.recalculate(notify=False)
 
     def confirm(self, confirmations: dict[str, float]) -> None:
-        """Prepare availability before the caller publishes the new values."""
+        """Apply per-key monotonic receipt seconds before publishing new values.
+
+        Ignore confirmations older than a retained confirmation. Already-aged
+        buffered data stays expired; recovery needs a receipt newer than the
+        one retained at expiry. This updates deadlines without calling changed,
+        so the caller can publish availability and its matching data together.
+        """
         if self._closed or not confirmations:
             return
         self.activate()
@@ -137,6 +169,11 @@ class ReadingFreshness:
             self.changed()
 
     def recalculate(self, *, notify=True) -> None:
+        """Recompute expiration/timers from original receipt times and current policy.
+
+        ``notify=False`` suppresses changed() while the caller prepares a state
+        publication. Interval increases do not clear an already expired key.
+        """
         if self._cancel is not None:
             self._cancel()
             self._cancel = None

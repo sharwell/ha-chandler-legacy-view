@@ -19,6 +19,10 @@ class ValveCapabilities:
     for hardness, remaining water, and days. None of the currently exposed
     Dashboard rows has a firmware cutoff; the battery row excludes Clack.
     Advanced Settings display-off requires firmware C4.13+ or a twin valve.
+
+    None means unresolved, including for the boolean flags; it does not mean
+    False. ``firmware_version`` is the numeric major * 100 + minor value,
+    such as 618 for C6.18. Frozen instances can be shared by entities.
     """
 
     is_twin_valve: bool | None = None
@@ -39,7 +43,17 @@ class ValveCapabilities:
 
 @dataclass(slots=True)
 class ValveAdvertisement:
-    """Representation of a Bluetooth advertisement emitted by a valve."""
+    """Parsed valve metadata and status, including retained discovery metadata.
+
+    ``address`` is the device identity and ``rssi`` is in dBm when known.
+    ``firmware_version`` is major * 100 + minor, without a C/D/L prefix.
+    ``manufacturer_data_complete`` controls whether advertisement parsing can
+    replace trusted firmware metadata; active identification can supply metadata
+    separately. Short status observations can leave retained metadata intact.
+    Optional flags/counters use None for unknown.
+    This mutable record may be shared with listeners; it is not a deep copy
+    of the scanner's nested data mappings.
+    """
 
     address: str
     name: str | None
@@ -88,7 +102,19 @@ class ValveAdvertisement:
 
 @dataclass(slots=True)
 class ValveDashboardData:
-    """Normalized Dashboard readings; absent Evb034 fields remain unknown."""
+    """Dashboard values shared by the Evb019 and Evb034 reading sensors.
+
+    Flow/peak flow use gallons per minute, volumes use gallons, hardness uses
+    grains per gallon, and battery capacity is a percentage. ``air_recharge``
+    carries the days-until-regeneration/backwash countdown despite its legacy
+    name. Clock hours retain the protocol's 12/24-hour representation with
+    ``is_pm`` for conversion by the sensor. ``display_off=True`` means blank.
+
+    Absent Evb034 values remain None, including unused legacy-only fields;
+    zero is a real reading. This object carries values, not freshness or
+    support guarantees: consumers must also check connection eligibility and
+    expiration before presenting them as available.
+    """
 
     time_hour: int | None
     time_minute: int | None

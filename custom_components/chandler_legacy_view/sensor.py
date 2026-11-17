@@ -18,8 +18,7 @@ from homeassistant.const import (
     UnitOfVolumeFlowRate,
 )
 
-# Home Assistant does not currently expose a dedicated water hardness unit
-# constant, so we keep using the unit string Chandler devices report.
+# Preserve the valve hardness unit as grains per gallon in HA's sensor state.
 WATER_HARDNESS_GRAINS_PER_GALLON = "grains_per_gallon"
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -49,6 +48,7 @@ class ValveDashboardSensor(ChandlerValveEntity, SensorEntity):
         await self._connection.async_refresh()
 
     async def async_update_ha_state(self, force_refresh: bool = False) -> None:
+        """Publish state, propagating explicitly requested refresh failures to HA."""
         # HA's default implementation catches async_update errors and only
         # logs them. The explicit action must report an unsuccessful refresh
         # to the calling automation instead of implying that it completed.

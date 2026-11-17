@@ -91,32 +91,9 @@ or waits for a newer display command to settle before refreshing.
 Cancellation and unload retire the owned work; a cancellation-resistant
 backend remains quarantined until its pending I/O and disconnect settle.
 
-## Validation and remaining hardware checks
+## Validation limits
 
-Automated tests use production connection/discovery managers, protocol code,
-Home Assistant entities, state events, service calls and registries. The shared
-fake is at the scanner/GATT boundary. Tests cover the C4.10–C4.13 boundary,
-twins, C6.00/C6.18 and Clack identity, both setting directions, unchanged
-settings, unrelated status bits, persistent/on-demand operation, reload,
-external changes, credential rejection, missing readback, write failure,
-deadlines, concurrent requests, unload and cancellation-resistant I/O.
-Clack identity belongs to the shared simulated valve across connections;
-round-trip tests assert HA's reported variant, firmware prefix and battery
-exclusion after writes and reload on C6.00 and C6.18. The initial handshake
-alone does not establish Clack write coverage.
-
-This is simulated Bluetooth evidence. Live display behavior, physical
-disconnects, ESPHome proxy-slot release and real firmware response timing
-still need hardware confirmation. For each tested combination, record the
-valve model/type, firmware, HA version, adapter or proxy and ESPHome versions.
-
-1. Compare the initial switch value with Legacy View and the physical display.
-2. Turn Display Off on, then off, verifying the physical display and subsequent
-   HA/app readback each time. Confirm other configuration and water operation
-   remain unchanged.
-3. Repeat in persistent and on-demand modes, then reload and verify the valve's
-   setting is reread. Change it in the phone app and confirm a later HA read
-   reflects the change.
-4. Check recovery after an interrupted exchange and phone-app handoff. Record
-   uncertain outcomes separately from explicit rejection, and obtain physical
-   connection/proxy-capacity evidence at the relevant hardware boundary.
+Automated checks use simulated Bluetooth I/O. Live display behavior, physical
+disconnects, ESPHome proxy-slot release, and real firmware response timing
+still need hardware evidence. The regression-coverage inventory and pending
+hardware checklist are preserved in [the #80 validation record](https://github.com/sharwell/ha-chandler-legacy-view/issues/80#issuecomment-6961127196).

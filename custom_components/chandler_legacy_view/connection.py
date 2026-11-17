@@ -130,7 +130,12 @@ _CRC_ALLOWED_POLYNOMIALS: tuple[int, ...] = tuple(
 
 
 async def _async_wait_for_cleanup(task: asyncio.Task[None]) -> None:
-    """Finish cleanup before propagating cancellation of its caller."""
+    """Wait within the cleanup budget, delaying propagation of caller cancellation.
+
+    Keep joining the same task after repeated cancellation. Budget expiry
+    leaves the worker owned and running; if cancellation was requested, that
+    cancellation still takes precedence over the wait's timeout/result.
+    """
 
     cancelled: asyncio.CancelledError | None = None
     deadline = asyncio.get_running_loop().time() + CONNECTION_TEARDOWN_BUDGET_SECONDS
@@ -255,7 +260,12 @@ class ValvePasscodeConfiguration:
 
 
 class ValveConnection:
-    """Handle an active Bluetooth data poll for a valve."""
+    """Own one valve's reads, settings, freshness, and Bluetooth cleanup.
+
+    Use on HA's event loop. A requested persistent connection is a monitoring
+    preference, not proof of a live link. Retired external I/O remains owned
+    until release is confirmed, including after this runtime is unloaded.
+    """
 
     def __init__(
         self,
@@ -405,7 +415,11 @@ class ValveConnection:
 
     @property
     def last_success(self) -> datetime | None:
-        """Return the timestamp of the last successful poll."""
+        """Return the last successful reading's UTC datetime, or None before success.
+
+        This is a wall-clock representation of receipt; individual reading
+        expiration uses monotonic confirmation times instead.
+        """
 
         return self._last_success
 
@@ -423,7 +437,11 @@ class ValveConnection:
 
     @property
     def dashboard_data(self) -> ValveDashboardData | None:
-        """Return the parsed data from the most recent Dashboard response."""
+        """Return the retained Dashboard value object, or None before acquisition.
+
+        This is shared data, not a copy or a freshness guarantee. Check
+        reading_is_current and the field's presence before publishing it.
+        """
 
         return self._dashboard_data
 
@@ -439,7 +457,16 @@ class ValveConnection:
         )
 
     async def async_set_display_off(self, enabled: bool) -> None:
-        """Queue a desired value, coalescing unsent changes and requiring readback."""
+        """Set display-off (True blanks the display) and await confirmed readback.
+
+        Require an actual bool; invalid types raise ValueError. Unavailable
+        or unsupported controls raise HomeAssistantError. Failed/unconfirmed
+        exchanges raise control or transport/timeout errors.
+        Unsent changes coalesce to the latest value; a sent command is not
+        automatically replayed after an uncertain outcome. Completion includes
+        cleanup or handoff to persistent monitoring. Canceling an unsent caller
+        withdraws its intent; an already sent command may have affected the valve.
+        """
         if type(enabled) is not bool:
             raise ValueError("Display-off must be a boolean")
         if not self.available or not self.display_off_supported:
@@ -624,6 +651,12 @@ class ValveConnection:
         return FreshnessPolicy("on-demand", interval, interval + RECOVERY_ALLOWANCE)
 
     def reading_is_current(self, key: str) -> bool:
+        """Return freshness eligibility for a READINGS key, not value presence.
+
+        Evb034 also needs a baseline in the current eligible session. Evb019
+        may be unexpired while initial acquisition still has no value; callers
+        must check the corresponding Dashboard field separately.
+        """
         if self._evb034_client is not None or (
             self._advertisement is not None and self._advertisement.model == "Evb034"
         ):
@@ -631,6 +664,11 @@ class ValveConnection:
         return self._freshness.current(key)
 
     def add_freshness_listener(self, listener: Callable[[], None]) -> CALLBACK_TYPE:
+        """Subscribe to freshness changes without an initial callback.
+
+        Return a remover to call once when the listener is no longer needed.
+        Callbacks run synchronously on the HA event loop.
+        """
         self._freshness_listeners.append(listener)
         return lambda: self._freshness_listeners.remove(listener)
 
@@ -684,7 +722,11 @@ class ValveConnection:
     def add_authentication_listener(
         self, listener: Callable[[bool], None]
     ) -> CALLBACK_TYPE:
-        """Register a callback for authentication lockout updates."""
+        """Subscribe listener(locked) and schedule its initial lockout value.
+
+        Return an idempotent remover. Initial delivery is queued on the HA
+        event loop; later lockout changes invoke listeners synchronously.
+        """
 
         self._authentication_listeners.append(listener)
 
@@ -722,7 +764,11 @@ class ValveConnection:
         self._set_authentication_failed(False)
 
     def add_preference_listener(self, listener: Callable[[], None]) -> CALLBACK_TYPE:
-        """Subscribe enabled local controls to effective configuration changes."""
+        """Subscribe to effective preference changes without an initial callback.
+
+        Return a remover to call once at teardown. Synchronous callbacks run
+        on the HA event loop; no Bluetooth exchange is required to subscribe.
+        """
         self._preference_listeners.append(listener)
         return lambda: self._preference_listeners.remove(listener)
 
@@ -743,7 +789,13 @@ class ValveConnection:
         self._recalculate_freshness()
 
     async def async_set_persistent_connection_enabled(self, enabled: bool, *, persist: bool = True) -> None:
-        """Enable or disable persistent connections for this valve."""
+        """Set persistent monitoring intent, saving a valve override by default.
+
+        ``persist=False`` applies already-saved options without rewriting them.
+        Enabling schedules work; it does not await an authenticated connection.
+        Disabling waits for bounded cleanup and can raise HomeAssistantError
+        if release remains quarantined, while retaining the disabled preference.
+        """
 
         if persist and self._preferences is not None:
             self._preferences.set(self._address, PERSISTENT_ENABLED, bool(enabled))
@@ -787,7 +839,13 @@ class ValveConnection:
             )
 
     async def async_set_persistent_poll_interval(self, seconds: float, *, persist: bool = True) -> None:
-        """Update the poll interval used during persistent connections."""
+        """Apply 5–300 persistent seconds, saving an explicit override by default.
+
+        Invalid values raise HomeAssistantError without updating preferences.
+        Equal-to-default writes still save overrides. ``persist=False`` applies
+        saved options only. Changes recalculate freshness and wake publication
+        scheduling without restarting a healthy session.
+        """
 
         try:
             value = persistent_interval(seconds)
@@ -819,7 +877,10 @@ class ValveConnection:
         return self._passcode_getter(self._address)
 
     def get_configured_passcode(self) -> str | None:
-        """Return the configured passcode for this valve, if available."""
+        """Return the configured PIN, falling back to ``1234`` for missing/blank data.
+
+        Strip whitespace without validating the PIN or contacting the valve.
+        """
 
         configuration = self._get_passcode_configuration()
         passcode = configuration.value
@@ -836,7 +897,12 @@ class ValveConnection:
     def add_dashboard_listener(
         self, listener: Callable[[ValveDashboardData | None], None]
     ) -> CALLBACK_TYPE:
-        """Register a callback for Dashboard data updates."""
+        """Subscribe listener(data) and queue retained data when already present.
+
+        Return an idempotent remover. Initial delivery uses the HA event loop;
+        later callbacks run synchronously. Data is shared, not copied, and
+        consumers still check support, field presence, and freshness.
+        """
 
         self._dashboard_listeners.append(listener)
 
@@ -887,7 +953,11 @@ class ValveConnection:
         )
 
     def add_capability_listener(self, listener: Callable[[], None]) -> CALLBACK_TYPE:
-        """Subscribe to confirmed entity support changes while an entity is enabled."""
+        """Subscribe to confirmed support changes without an initial callback.
+
+        Return an idempotent remover. Callbacks take no arguments and run
+        synchronously on the HA event loop.
+        """
 
         self._capability_listeners.append(listener)
 
@@ -1128,7 +1198,7 @@ class ValveConnection:
     async def _async_persistent_keepalive_loop(
         self, client: BaseBleakClient
     ) -> None:
-        """Keep the BLE connection alive and poll on a frequent schedule."""
+        """Retain a session for periodic Evb019 reads or Evb034 stream publication."""
 
         try:
             # From this point, this coroutine's finally block owns cleanup.
@@ -1267,7 +1337,14 @@ class ValveConnection:
         return result
 
     async def async_refresh(self) -> None:
-        """Complete one manual valve refresh, shared by every selected sensor."""
+        """Await a validated valve read, coalescing concurrent refresh callers.
+
+        Join existing reads or a persistent session and wait for settings and
+        connection cooldown as needed. A completed attempt without a validated
+        reading raises HomeAssistantError; transport errors may also propagate.
+        Canceling this caller leaves shared work running; unload cancels the
+        owned refresh and performs cleanup.
+        """
         task = self._refresh_task
         if task is None or task.done():
             task = asyncio.create_task(self._async_manual_refresh())
@@ -1320,7 +1397,13 @@ class ValveConnection:
             raise HomeAssistantError("Valve refresh did not produce a validated reading")
 
     async def async_unload(self) -> None:
-        """Prevent future polls and wait for any active poll to finish."""
+        """Stop scheduling, cancel owned work, and await bounded cleanup.
+
+        Raise HomeAssistantError for quarantined release or TimeoutError when
+        the caller's cleanup budget expires. Cancellation preserves cleanup
+        ownership; successful return uses backend evidence, not a physical
+        proxy-slot measurement. An unloaded connection cannot be reused.
+        """
 
         self._unloaded = True
         for setting in self._setting_tasks:
@@ -1363,7 +1446,12 @@ class ValveConnection:
             self._transport_changed()
 
     async def async_poll(self, *, automatic: bool = False) -> None:
-        """Attempt to connect to the valve and fetch additional data."""
+        """Attempt a read if available and no existing session/work owns the valve.
+
+        ``automatic=True`` also enforces automatic-polling eligibility. This
+        may return without a read because of cooldown, lockout, or ownership;
+        use async_refresh when a caller needs a validated-reading result/error.
+        """
 
         if not self.available or self._setting_tasks:
             return
@@ -1650,7 +1738,7 @@ class ValveConnection:
         return dashboard_response_received
 
     async def _async_fetch_evb034(self, client: BaseBleakClient) -> bool:
-        """Identify and authenticate a connection before requesting its readings."""
+        """Identify/authenticate Evb034, then consume its notification readings."""
         self._evb034_packet = None
         self._evb034_eligible.clear()
         self._evb034_received_readings.clear()
@@ -1783,7 +1871,11 @@ class ValveConnection:
                     return True
 
     def _handle_evb034_update(self, packet: dict) -> bool:
-        """Apply one authenticated stream update; return whether a reading changed."""
+        """Apply an authenticated update; return whether a new receipt was published.
+
+        Unchanged values still count when newly confirmed. Metadata alone or
+        a repeated receipt timestamp does not count as a reading publication.
+        """
         if "as" in packet and (type(packet["as"]) is not int or packet["as"] != 2):
             self._device_list_authentication_state = ValveAuthenticationState.UNKNOWN
             raise Evb034ProtocolError("Session lost authentication")
@@ -3272,9 +3364,8 @@ class ValveConnection:
             )
             return None
 
-        # Chandler Legacy View only targets Evb019 hardware, which always reports
-        # serial numbers through the DeviceList response. Classic firmware variants
-        # handled elsewhere do not apply to this integration.
+        # This decoder handles the Evb019 DeviceList serial bytes. Evb034 uses
+        # packet fields dlsa/dlsb in _publish_evb034_metadata instead.
         serial = "".join(f"{packet[index]:02X}" for index in range(13, 17)).strip()
         if not serial or serial == _DEFAULT_SERIAL_NUMBER:
             return None
@@ -3495,6 +3586,7 @@ class ValveConnectionManager:
         return self._auth_configuration != self._current_auth_configuration()
 
     async def async_apply_preferences(self) -> None:
+        """Apply saved monitoring preferences concurrently to tracked connections."""
         await asyncio.gather(*(connection.async_apply_preferences() for connection in self._connections.values()))
 
     async def async_setup(self) -> None:
@@ -3518,7 +3610,11 @@ class ValveConnectionManager:
             )
 
     async def async_unload(self) -> bool:
-        """Cancel scheduled work and disconnect listeners."""
+        """Stop scheduling/listeners and return whether all valve cleanup confirmed.
+
+        False leaves unconfirmed external ownership retained for safe retry.
+        The result does not independently prove physical connection release.
+        """
 
         if self._remove_listener is not None:
             self._remove_listener()
@@ -3613,12 +3709,19 @@ class ValveConnectionManager:
         return connection
 
     def get_connections(self) -> Iterable[ValveConnection]:
-        """Return an iterable over the tracked valve connections."""
+        """Return a live values view of tracked connections, including unavailable ones.
+
+        Membership changes with discovery/cleanup; materialize a snapshot
+        before retaining it across work that can change the manager.
+        """
 
         return self._connections.values()
 
     def get_connection(self, address: str) -> ValveConnection | None:
-        """Return the connection for a specific valve address, if available."""
+        """Return a tracked connection by address, or None if not yet tracked.
+
+        A returned connection may be radio-unavailable or awaiting cleanup.
+        """
 
         return self._connections.get(address)
 

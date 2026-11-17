@@ -28,7 +28,11 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class ValvePersistentPollIntervalNumber(ChandlerValveEntity, NumberEntity):
-    """Configure the polling interval used while a persistent connection is active."""
+    """Save a valve's persistent interval in seconds, including while offline.
+
+    Every valid write creates an explicit override, even when equal to the
+    inherited default; it does not request an immediate Bluetooth read.
+    """
 
     _attr_entity_category = EntityCategory.CONFIG
     _attr_native_unit_of_measurement = UnitOfTime.SECONDS
