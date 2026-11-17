@@ -43,7 +43,7 @@ def default_on_demand_interval(options) -> float:
 
 
 def persistent_interval(value) -> float:
-    """Return a finite persistent interval in seconds, within 5–300 inclusive.
+    """Return a finite persistent interval in seconds, within 1–300 inclusive.
 
     Accept float-convertible values except booleans. Invalid inputs raise
     ValueError, TypeError, or OverflowError instead of selecting a default.
@@ -52,7 +52,7 @@ def persistent_interval(value) -> float:
         raise ValueError("Persistent interval must be a number")
     value = float(value)
     if not math.isfinite(value) or not MIN_PERSISTENT_POLL_INTERVAL_SECONDS <= value <= MAX_PERSISTENT_POLL_INTERVAL_SECONDS:
-        raise ValueError("Persistent interval must be between 5 and 300 seconds")
+        raise ValueError("Persistent interval must be between 1 and 300 seconds")
     return value
 
 

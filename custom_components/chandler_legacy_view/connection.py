@@ -839,7 +839,7 @@ class ValveConnection:
             )
 
     async def async_set_persistent_poll_interval(self, seconds: float, *, persist: bool = True) -> None:
-        """Apply 5–300 persistent seconds, saving an explicit override by default.
+        """Apply 1–300 persistent seconds, saving an explicit override by default.
 
         Invalid values raise HomeAssistantError without updating preferences.
         Equal-to-default writes still save overrides. ``persist=False`` applies

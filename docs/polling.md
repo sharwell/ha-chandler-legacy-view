@@ -14,14 +14,15 @@ in the options description. Defaults and overrides survive reloads/restarts;
 editing them recalculates due times from the last validated reading.
 
 Persistent mode retains one connection and uses its separate **Persistent
-Poll Interval**, in seconds (5–300; default 10). Its default and valve overrides
+Poll Interval**, in seconds (1–300; default 10). Its default and valve overrides
 are also in Configure. The existing interval number remains a working local
 configuration control, including while the valve is unreachable. Writing it
 always saves a valve override. Persistent interval edits apply to the current
-session without restarting it. Evb034 notifications are acknowledged promptly
-even when publication uses a longer interval. For Evb034, the persistent
-interval controls Home Assistant publication cadence, not the valve's own
-reporting interval.
+session without restarting it. Evb019 waits this interval between reading
+exchanges; response time adds to the elapsed time between updates.
+Evb034 notifications are acknowledged promptly even when publication uses a
+longer interval. For Evb034, the persistent interval controls Home Assistant
+publication cadence, not the valve's own reporting interval.
 
 ## Upgrading saved monitoring preferences
 

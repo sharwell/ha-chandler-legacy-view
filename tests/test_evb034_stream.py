@@ -11,6 +11,25 @@ from test_evb034_authentication import setup_valve
 from test_evb034_entities import sensor_id
 
 
+async def test_one_second_publication_consumes_notifications_on_same_session(
+    hass, runtime_factory, bluetooth_io, transport, clock,
+):
+    _, connection, valve, _ = await setup_valve(hass, runtime_factory, bluetooth_io, transport)
+    await connection.async_set_persistent_poll_interval(1)
+    await connection.async_set_persistent_connection_enabled(True)
+    await clock.run(connection.async_poll())
+    owner = valve.clients[0]
+    usage = sensor_id(hass, "water_usage_today")
+    assert float(hass.states.get(usage).state) == 5.67
+    valve.dashboards.append(frames({"dwu": 78900}))
+    # A five-second runtime clamp would delay this valve-pushed update even
+    # though the receiver acknowledges the notification immediately.
+    await clock.until(lambda: float(hass.states.get(usage).state) == 789, budget=2.5)
+    assert valve.clients == [owner] and owner.is_connected
+    assert valve.packet_requests == []
+    assert all(payload not in (b"t" * 20, b"u" * 20) for _, payload in valve.writes)
+
+
 async def test_long_publication_interval_keeps_acknowledging_the_live_peer(
     hass, runtime_factory, bluetooth_io, transport, clock,
 ):
