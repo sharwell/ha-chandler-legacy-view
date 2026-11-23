@@ -12,6 +12,7 @@ multiple valves by Bluetooth address.
 | --- | --- |
 | Discovery and presence | Recognizes Chandler Bluetooth names/manufacturer data, registers each valve separately, and tracks reachability through connectable scanners or an active session. |
 | Dashboard readings | Exposes flow, daily usage/peak flow, hardness, remaining water, days until regeneration/backwash, battery, and valve time where applicable. Model/type/Clack restrictions and missing-data/freshness rules govern availability. |
+| Regeneration and backwash status | Shows whether the cycle is active, the confirmed step, valve movement, and time left in the current step where reported. Applicable valves also show brine soak or aeration status. |
 | Monitoring | Reads on demand every 15 minutes by default, supports manual refresh, and offers optional persistent monitoring with saved entry defaults and per-valve overrides. |
 | Configuration controls | Provides Persistent Connection, Persistent Poll Interval, Authentication Lockout where applicable, and a confirmed Display Off setting on supported valves. |
 | Device metadata | Reports model, firmware, and available type/variant diagnostics without requiring YAML configuration. |

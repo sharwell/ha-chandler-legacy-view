@@ -148,6 +148,25 @@ disconnect to settle.
 Manual refresh reports unsuccessful reads to the calling action/automation;
 it does not treat a completed wait as a successful reading.
 
+## Regeneration and backwash status
+
+Use **Current cycle** to identify the confirmed stationary step. On valves
+that report movement, **Valve moving** shows when the valve is changing
+positions. Its `moving_to` attribute shows the destination when known.
+For example, a valve moving toward Backwash can report destination
+`backwash` before **Current cycle** reports Backwash.
+
+**Cycle time remaining** reports seconds for the current step, including
+brine soak where supported. It is unavailable while the valve moves or
+when no valid estimate is reported. A confirmed finished cycle can report
+zero. Cycle names depend on the valve program and follow the live
+Legacy View Dashboard. On Clack filters, the Dashboard calls position 2
+Air Draw, which can differ from the label in the cycle timing screen.
+
+Use **Regeneration/backwash active** to tell when the valve has finished.
+Fresh Evb034 cycle notifications can publish cycle changes between regular
+Dashboard updates. Cycle readings require their own updates to stay fresh.
+
 ## Reading expiration
 
 Expired Dashboard readings become unavailable

@@ -1,4 +1,30 @@
 {
+  "entity": {
+    "sensor": {
+      "current_cycle": {
+        "name": "Current cycle",
+        "state": {
+          "service": "Service",
+          "standby": "Standby",
+          "shutoff": "Shutoff",
+          "backwash": "Backwash",
+          "brine_draw": "Brine Draw",
+          "second_backwash": "Second Backwash",
+          "rapid_rinse": "Rapid Rinse",
+          "brine_fill": "Brine Fill",
+          "brine_soak": "Brine Soak",
+          "decompress": "Decompress",
+          "air_release": "Air Release",
+          "rest": "Rest",
+          "air_draw": "Air Draw",
+          "air_chlorine_draw": "Air / Chlorine Draw",
+          "chlorine_rinse": "Chlorine Rinse",
+          "chlorine_contact": "Chlorine Contact",
+          "chlorine_feed": "Chlorine Feed"
+        }
+      }
+    }
+  },
   "config": {
     "step": {
       "user": {

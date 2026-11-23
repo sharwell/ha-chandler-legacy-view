@@ -31,6 +31,7 @@ from .const import (
     DOMAIN,
 )
 from .connection import ValveConnection, ValveConnectionManager
+from .cycle_entity import ValveCurrentCycleSensor, ValveCycleTimeSensor, async_add_cycle_entities
 from .discovery import ValveDiscoveryChange, ValveDiscoveryManager
 from .entity import ChandlerValveEntity, advertisement_is_clack_valve
 from .models import ValveAdvertisement, ValveDashboardData
@@ -429,6 +430,10 @@ async def async_setup_entry(
 ) -> None:
     """Set up dashboard-driven sensors for Chandler valves."""
 
+    async_add_cycle_entities(
+        hass, entry, async_add_entities,
+        lambda adv, conn: [ValveCurrentCycleSensor(adv, conn), ValveCycleTimeSensor(adv, conn)],
+    )
     entry_data = hass.data[DOMAIN][entry.entry_id]
     discovery_manager: ValveDiscoveryManager = entry_data[DATA_DISCOVERY_MANAGER]
     connection_manager: ValveConnectionManager = entry_data[DATA_CONNECTION_MANAGER]

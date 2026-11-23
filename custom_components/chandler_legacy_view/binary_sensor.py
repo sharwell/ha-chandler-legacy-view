@@ -13,6 +13,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DATA_DISCOVERY_DEVICE_ID, DATA_DISCOVERY_MANAGER, DOMAIN
+from .cycle_entity import ValveCycleBinarySensor, async_add_cycle_entities
 from .discovery import ValveDiscoveryChange, ValveDiscoveryManager
 from .entity import (
     ChandlerValveEntity,
@@ -237,6 +238,15 @@ async def async_setup_entry(
 ) -> None:
     """Set up valve presence binary sensors from a config entry."""
 
+    async_add_cycle_entities(
+        hass, entry, async_add_entities,
+        lambda adv, conn: [
+            ValveCycleBinarySensor(adv, conn, "active", "regeneration_active", "Regeneration/backwash active"),
+            ValveCycleBinarySensor(adv, conn, "moving", "valve_moving", "Valve moving"),
+            ValveCycleBinarySensor(adv, conn, "soaking", "brine_soak_active", "Brine soak active"),
+            ValveCycleBinarySensor(adv, conn, "aerating", "aeration_active", "Aeration active"),
+        ],
+    )
     entry_data = hass.data[DOMAIN][entry.entry_id]
     manager: ValveDiscoveryManager = entry_data[DATA_DISCOVERY_MANAGER]
     entities: dict[str, dict[str, ChandlerValveEntity]] = {}

@@ -43,11 +43,14 @@ from .const import (
     PERSISTENT_EXCHANGE_TIMEOUT_SECONDS,
 )
 from .ble_operations import OwnedBluetoothOperations
+from .cycle import CYCLE_READING, EVB034_MOVING, evb019_cycle
 from .device_registry import async_update_device_serial_number
 from .discovery import ValveDiscoveryChange, ValveDiscoveryManager, _map_valve_type
-from .models import ValveAdvertisement, ValveCapabilities, ValveDashboardData
+from .models import ValveAdvertisement, ValveCapabilities, ValveCycleStatus, ValveDashboardData
 from .evb034 import Evb034ProtocolError, Evb034Session
-from .evb034_data import READING_KEYS, READING_FIELDS, decode_dashboard, integer, valid_reading_keys
+from .evb034_data import (
+    CYCLE_FIELDS, READING_FIELDS, READING_KEYS, decode_dashboard, integer, valid_reading_keys,
+)
 from .freshness import FreshnessPolicy, ReadingFreshness, READINGS, RECOVERY_ALLOWANCE
 from .preferences import ValvePreferences, PERSISTENT_ENABLED, PERSISTENT_INTERVAL, persistent_interval
 from .protocol_compatibility import (
@@ -950,6 +953,7 @@ class ValveConnection:
                 if complete or previous.valve_type is None
                 else None
             ),
+            valve_type_full=advertisement.valve_type_full if complete else None,
         )
 
     def add_capability_listener(self, listener: Callable[[], None]) -> CALLBACK_TYPE:
@@ -972,6 +976,7 @@ class ValveConnection:
         *,
         is_twin_valve: bool | None = None,
         valve_type: str | None = None,
+        valve_type_full: int | None = None,
         is_clack_valve: bool | None = None,
         firmware_version: int | None = None,
     ) -> None:
@@ -993,6 +998,9 @@ class ValveConnection:
                 is_twin_valve if is_twin_valve is not None else previous.is_twin_valve
             ),
             valve_type=valve_type if valve_type is not None else previous.valve_type,
+            valve_type_full=(
+                valve_type_full if valve_type_full is not None else previous.valve_type_full
+            ),
             is_clack_valve=(
                 is_clack_valve if is_clack_valve is not None else previous.is_clack_valve
             ),
@@ -1900,21 +1908,24 @@ class ValveConnection:
         received_at = self._evb034_last_update_time
         if received_at is None or received_at == self._evb034_published_time:
             return False
-        data = decode_dashboard(updated, firmware, clack=is_clack)
-        if not any(getattr(data, field) is not None for field in (
-            "time_hour", "battery_capacity", "present_flow", "water_usage", "peak_flow",
-            "water_hardness", "water_remaining_until_regeneration", "air_recharge", "display_off",
-        )):
-            return False
-        self._evb034_eligible.update(
-            key for key, field in READING_FIELDS.items() if getattr(data, field) is not None
+        data = decode_dashboard(
+            updated, firmware, clack=is_clack, capabilities=self._entity_capabilities,
         )
+        present = {key for key, field in READING_FIELDS.items() if getattr(data, field) is not None}
+        if not present and not self._evb034_eligible:
+            return False
+        self._evb034_eligible.update(present)
         self._dashboard_data = data
         self._evb034_published_time = received_at
-        self._record_confirmation(received_at)
-        self._freshness.confirm({key: received_at for key in self._evb034_eligible})
+        if present:
+            self._record_confirmation(received_at)
+        confirmations = {
+            key: received_at for key in self._evb034_eligible if key != CYCLE_READING
+        }
+        self._freshness.confirm(confirmations)
+        self._confirm_evb034_cycle(data.cycle)
         self._notify_dashboard_listeners(data)
-        return True
+        return bool(present)
 
     def _observe_evb034_readings(self, client, packet) -> None:
         """Keep the selected session-health policy independent of publication."""
@@ -1933,13 +1944,22 @@ class ValveConnection:
         is_clack = clack == 1 if clack in (0, 1) else self._entity_capabilities.is_clack_valve is True
         times = getattr(packet, "confirmed_at", {})
         advanced = []
-        for key in valid_reading_keys(packet, firmware, clack=is_clack):
+        cycle_received = False
+        changes: dict[str, float] = {}
+        valid = valid_reading_keys(packet, firmware, clack=is_clack)
+        for key in valid | (CYCLE_FIELDS.keys() & packet.keys()):
             received = times.get(key)
             if received is None or received <= self._evb034_received_times.get(key, float("-inf")):
                 continue
-            self._evb034_received_readings[key] = packet[key]
+            value = packet[key] if key in valid else None
+            if key in CYCLE_FIELDS:
+                cycle_received = True
+                if self._evb034_received_readings.get(key) != value:
+                    changes[key] = received
+            self._evb034_received_readings[key] = value
             self._evb034_received_times[key] = received
             advanced.append(received)
+        self._discard_previous_cycle_fields(changes)
         if advanced:
             received = max(advanced)
             self._evb034_last_update_time = max(received, self._evb034_last_update_time or received)
@@ -1947,17 +1967,59 @@ class ValveConnection:
                 return
             # This intentionally confirms session liveness for every known
             # field; it does not prove that each field's producer is healthy.
-            self._freshness.renew_session(self._evb034_eligible, received)
+            self._freshness.renew_session(self._evb034_eligible - {CYCLE_READING}, received)
             baseline = {**identity, **self._evb034_received_readings}
-            data = decode_dashboard(baseline, firmware, clack=is_clack)
-            eligible = {key for key, field in READING_FIELDS.items() if getattr(data, field) is not None}
-            if eligible - self._evb034_eligible or any(
-                not self._freshness.current(key) for key in self._evb034_eligible
+            data = decode_dashboard(
+                baseline, firmware, clack=is_clack, capabilities=self._entity_capabilities,
+            )
+            eligible = {
+                key for key, field in READING_FIELDS.items()
+                if key != CYCLE_READING and getattr(data, field) is not None
+            }
+            if (
+                eligible - self._evb034_eligible
+                or any(not self._freshness.current(key)
+                       for key in self._evb034_eligible - {CYCLE_READING})
+                or (cycle_received and not self._evb034_eligible)
             ):
                 # First availability and recovery publish the latest snapshot
                 # immediately, so an old value is never briefly resurrected.
                 # The recursive observer sees no new receipt and does nothing.
                 self._handle_evb034_update(packet)
+            elif cycle_received:
+                # Publish changes to the live cycle without changing the
+                # configured publication cadence for the other readings.
+                previous = self._dashboard_data.cycle
+                if data.cycle != previous:
+                    self._dashboard_data = replace(self._dashboard_data, cycle=data.cycle)
+                self._confirm_evb034_cycle(data.cycle)
+                if data.cycle != previous:
+                    self._notify_dashboard_listeners(self._dashboard_data)
+
+    def _confirm_evb034_cycle(self, cycle: ValveCycleStatus | None) -> None:
+        if cycle is None:
+            self._evb034_eligible.discard(CYCLE_READING)
+            return
+        self._evb034_eligible.add(CYCLE_READING)
+        received = max(
+            self._evb034_received_times[key] for key in CYCLE_FIELDS
+            if self._evb034_received_readings.get(key) is not None
+        )
+        self._freshness.confirm({CYCLE_READING: received})
+
+    def _discard_previous_cycle_fields(self, changes: dict[str, float]) -> None:
+        # A new phase without a position/time value cannot reuse a previous
+        # phase's position or countdown as the new destination or dwell time.
+        if "gra" in changes or (
+            "grs" in changes and self._evb034_received_readings.get("grs") in EVB034_MOVING
+        ):
+            cutoff = max(changes.get("gra", 0), changes.get("grs", 0))
+            if self._evb034_received_times.get("drcp", cutoff) < cutoff:
+                self._evb034_received_readings["drcp"] = None
+        cutoff = max(changes.get(key, 0) for key in ("gra", "grs", "drcp", "dps"))
+        for key in ("drtr", "drst"):
+            if self._evb034_received_times.get(key, cutoff) < cutoff:
+                self._evb034_received_readings[key] = None
 
     def _invalidate_evb034_session(self, client, reason: str) -> None:
         if client is not self._evb034_client:
@@ -2011,6 +2073,7 @@ class ValveConnection:
             firmware_version=firmware,
             valve_type=updates.get("valve_type"), is_twin_valve=updates.get("is_twin_valve"),
             is_clack_valve=updates.get("is_clack_valve"),
+            valve_type_full=valve_type,
         )
         serial_a, serial_b = packet.get("dlsa"), packet.get("dlsb")
         if all(type(value) is int and 0 <= value <= 0x7FFFFFFFFFFFFFFF
@@ -2827,7 +2890,9 @@ class ValveConnection:
                 ])
                 changed_fields = [
                     field.name for field in fields(dashboard)
-                    if getattr(previous, field.name) != getattr(dashboard, field.name)
+                    # Cycle status is a new interpretation of those wire fields.
+                    if field.name != "cycle"
+                    and getattr(previous, field.name) != getattr(dashboard, field.name)
                 ]
                 if changed_fields:
                     _LOGGER.debug(
@@ -3153,6 +3218,7 @@ class ValveConnection:
                 soak_timer=raw.soak_timer if has_soak else 0,
                 is_in_aeration=valve_type == "NitroProSidekick" and raw.is_in_aeration,
             )
+            dashboard.cycle = evb019_cycle(dashboard, self._entity_capabilities)
         except Exception:  # pragma: no cover - parsing errors should be rare
             _LOGGER.exception(
                 "Error while parsing Dashboard response from valve %s", self._address
@@ -3330,6 +3396,7 @@ class ValveConnection:
                 firmware_version=self._device_list_firmware_version,
                 is_twin_valve=self._device_list_is_twin_valve,
                 valve_type=self._device_list_valve_type,
+                valve_type_full=packet[3] if self._device_list_valve_type is not None else None,
             )
 
         serial_number = self._extract_serial_number(packet)

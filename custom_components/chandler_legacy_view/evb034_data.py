@@ -5,15 +5,18 @@ from dataclasses import fields
 import math
 import struct
 
-from .models import ValveDashboardData
+from .cycle import CYCLE_READING, cycle_status, evb034_moving, supports_aeration, supports_soak
+from .models import ValveCapabilities, ValveCycleStatus, ValveDashboardData
 
-READING_KEYS = {"dh", "dm", "da", "dbl", "gpf", "dtgr", "dwu", "dpfd", "dwh", "dcdo", "asdo"}
+CYCLE_FIELDS = {"gra": 1, "grs": 12, "drcp": 9, "drtr": 65535, "drtt": 2,
+                "dps": 1, "drst": 65535, "dria": 1}
+READING_KEYS = {"dh", "dm", "da", "dbl", "gpf", "dtgr", "dwu", "dpfd", "dwh", "dcdo", "asdo"} | CYCLE_FIELDS.keys()
 READING_FIELDS = {
     "present_flow": "present_flow", "water_usage_today": "water_usage",
     "peak_flow_today": "peak_flow", "soft_water_remaining": "water_remaining_until_regeneration",
     "days_until_regeneration": "air_recharge", "water_hardness": "water_hardness",
     "battery": "battery_capacity", "time_of_day": "time_hour",
-    "display_off": "display_off",
+    "display_off": "display_off", CYCLE_READING: "cycle",
 }
 
 
@@ -53,7 +56,18 @@ def valid_reading_keys(packet: Mapping, firmware: int, *, clack: bool) -> set[st
         keys.discard("da")  # The 24-hour clock does not consume this component.
     if type(packet.get("asdo")) is not int or packet["asdo"] not in (0, 1):
         keys.discard("asdo")
+    keys.difference_update(
+        key for key in CYCLE_FIELDS if cycle_value(packet, key) is None
+    )
     return keys
+
+
+def cycle_value(packet: Mapping, key: str) -> int | None:
+    """Return an explicit in-range cycle integer, or None for invalid/missing data."""
+    value = packet.get(key)
+    if type(value) is int and 0 <= value <= CYCLE_FIELDS[key]:
+        return value
+    return None
 
 
 def _battery_capacity(raw: float) -> int:
@@ -70,7 +84,10 @@ def _battery_capacity(raw: float) -> int:
     return 0
 
 
-def decode_dashboard(packet: Mapping, firmware: int, *, clack: bool = False) -> ValveDashboardData:
+def decode_dashboard(
+    packet: Mapping, firmware: int, *, clack: bool = False,
+    capabilities: ValveCapabilities | None = None,
+) -> ValveDashboardData:
     """Decode a packet snapshot, leaving absent or invalid readings as None.
 
     ``firmware`` uses major * 100 + minor. Clack or firmware >= 611 uses
@@ -78,6 +95,7 @@ def decode_dashboard(packet: Mapping, firmware: int, *, clack: bool = False) -> 
     a 24-hour clock. Remaining gallons follow the reference's JVM float/int
     conversion. This does not merge deltas, enforce support/freshness, or
     mutate packet; callers supply any retained session values explicitly.
+    Supply confirmed capabilities to interpret cycle position names.
     """
     values = {field.name: None for field in fields(ValveDashboardData)}
     if type(packet.get("asdo")) is int and packet["asdo"] in (0, 1):
@@ -115,4 +133,47 @@ def decode_dashboard(packet: Mapping, firmware: int, *, clack: bool = False) -> 
     raw_battery = number(packet, "dbl")
     if raw_battery is not None:
         values["battery_capacity"] = _battery_capacity(raw_battery)
+    if capabilities is not None:
+        values["cycle"] = _decode_cycle(packet, capabilities)
     return ValveDashboardData(**values)
+
+
+def _decode_cycle(
+    packet: Mapping, capabilities: ValveCapabilities,
+) -> ValveCycleStatus | None:
+    def flag(key):
+        value = cycle_value(packet, key)
+        return bool(value) if value is not None else None
+
+    active = flag("gra")
+    motion = cycle_value(packet, "grs")
+    moving = evb034_moving(motion)
+    position = cycle_value(packet, "drcp")
+    soaking = flag("dps") if supports_soak(capabilities) else None
+    aerating = flag("dria") if supports_aeration(capabilities, evb034=True) else None
+    if all(value is None for value in (active, moving, position, soaking, aerating)):
+        return None
+
+    remaining = None
+    if soaking:
+        estimate = cycle_value(packet, "drst")
+        if estimate:
+            remaining = estimate * 60
+    else:
+        estimate = cycle_value(packet, "drtr")
+        unit = cycle_value(packet, "drtt")
+        if unit is None and position is not None:
+            flags = packet.get("aspo")
+            if isinstance(flags, list) and position < len(flags) and type(flags[position]) is int:
+                # CsValveCyclePositionOptions uses the raw position as the
+                # array index. Salt-dose positions report seconds at runtime.
+                mask = 0x80 if capabilities.is_clack_valve else 0x100
+                unit = 0 if flags[position] & (0x08 | mask) else 1
+        if estimate is not None and unit is not None:
+            remaining = estimate * (60 if unit == 1 else 1)
+
+    destination = {6: "service", 9: "brine_soak"}.get(motion)
+    return cycle_status(
+        capabilities, active=active, position=position, moving=moving,
+        remaining=remaining, soaking=soaking, aerating=aerating, destination=destination,
+    )
