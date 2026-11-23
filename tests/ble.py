@@ -81,6 +81,7 @@ class Valve:
         self.firmware_version = None
         self.is_twin_valve = False
         self.is_clack_valve = False
+        self.valve_type = 1
         self.legacy_reserved_counter_byte = 42
         self.device_lists = deque()
         self.auth_replies = deque()
@@ -102,11 +103,13 @@ class Valve:
         self.display_setting_acceptance = deque()
         self.report_display_off = True
         self.display_writes = []
+        self.cycle_writes = []
+        self.cycle_replies = deque()
         self.status_bits = 0
         self.legacy_service_discovery = False
         self.operations = {name: Operation() for name in
                            ("connect", "identify", "device_list", "authenticate", "dashboard", "reset", "disconnect", "timeout",
-                            "start_notify", "stop_notify", "services", "display_setting")}
+                            "start_notify", "stop_notify", "services", "display_setting", "cycle_action")}
 
     def authenticated(self, counter=23):
         self.device_lists.append([device_list_frame(status=0, counter=counter)])
@@ -242,6 +245,12 @@ class Client:
               and payload[13] == 0x47 and payload[14] in (0, 1) and payload[15:] == b"v" * 5):
             await self.write_display_setting(payload[14])
             return
+        elif (len(payload) == 20 and payload[:13] == b"u" * 13
+              and payload[13:15] in (b"RN", b"RT") and payload[15:] == b"u" * 5):
+            reply = await self.write_cycle_action(payload[13:15])
+            if reply is not None:
+                self.valve.dashboards.appendleft(reply)
+            return
         elif payload == b"r" * 20:
             operation, replies = "reset", []
         else:
@@ -259,6 +268,14 @@ class Client:
                     if self.valve.display_setting_acceptance else self.valve.accept_display_settings)
         if self.dashboard_access and accepted:
             self.valve.display_off = bool(value)
+
+    async def write_cycle_action(self, command):
+        """Record a cycle write and deliver a scripted runtime response if available."""
+        assert self.dashboard_access, "Cycle commands require an authenticated peer"
+        self.valve.cycle_writes.append(command)
+        await self.valve.operations["cycle_action"].run()
+        self.require_connected()
+        return self.valve.cycle_replies.popleft() if self.valve.cycle_replies else None
 
     async def write_evb034(self, payload):
         """Reference peer: EA starts notifications; raw PIN precedes framed JSON."""
@@ -337,6 +354,11 @@ class Client:
                 await self.peer_outgoing.put((frames({"asdo": int(self.valve.display_off)}, min(512, self.mtu_size - 3)), False))
             else:
                 self.peer_latest_data.pop("asdo", None)
+        if request in (b'{"grn":0}', b'{"grl":0}'):
+            reply = await self.write_cycle_action(request)
+            if reply is not None:
+                self.peer_latest_data.update(self._peer_packet(reply))
+                await self.peer_outgoing.put((reply, True))
 
     @staticmethod
     def _peer_packet(reply):
@@ -384,7 +406,7 @@ class Client:
         await self.valve.operations["device_list"].run()
         default = {"dlf": self.valve.firmware_version, "dlc": self.connection_counter,
                    "as": 1 if self.valve.authentication_required else 2,
-                   "dlvt": 1, "dli": int(self.valve.is_twin_valve),
+                   "dlvt": self.valve.valve_type, "dli": int(self.valve.is_twin_valve),
                    "dlic": int(self.valve.is_clack_valve), "gbre": 1}
         scripted = bool(self.valve.identification_packets)
         reply = (self.valve.identification_packets.popleft() if scripted

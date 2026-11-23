@@ -13,6 +13,7 @@ multiple valves by Bluetooth address.
 | Discovery and presence | Recognizes Chandler Bluetooth names/manufacturer data, registers each valve separately, and tracks reachability through connectable scanners or an active session. |
 | Dashboard readings | Exposes flow, daily usage/peak flow, hardness, remaining water, days until regeneration/backwash, battery, and valve time where applicable. Model/type/Clack restrictions and missing-data/freshness rules govern availability. |
 | Regeneration and backwash status | Shows whether the cycle is active, the confirmed step, valve movement, and time left in the current step where reported. Applicable valves also show brine soak or aeration status. |
+| Regeneration and backwash actions | Start now, advance an eligible running cycle, or request a cycle at the next scheduled time where supported. See [cycle controls](docs/polling.md#manual-cycle-controls). |
 | Monitoring | Reads on demand every 15 minutes by default, supports manual refresh, and offers optional persistent monitoring with saved entry defaults and per-valve overrides. |
 | Configuration controls | Provides Persistent Connection, Persistent Poll Interval, Authentication Lockout where applicable, and a confirmed Display Off setting on supported valves. |
 | Device metadata | Reports model, firmware, and available type/variant diagnostics without requiring YAML configuration. |
@@ -139,8 +140,8 @@ proxy capacity, or live hardware recovery.
   discovery logic.
 * `custom_components/chandler_legacy_view/connection.py` owns reads, setting
   commands, session recovery, and their cleanup.
-* The `binary_sensor.py`, `sensor.py`, `number.py`, and `switch.py` platforms
-  expose presence, readings, and configuration controls.
+* The `binary_sensor.py`, `sensor.py`, `number.py`, `switch.py`, and
+  `button.py` platforms expose presence, readings, controls, and actions.
 * Configuration flow strings are located in
   `custom_components/chandler_legacy_view/translations/en.json`.
 

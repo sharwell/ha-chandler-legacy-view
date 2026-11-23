@@ -32,8 +32,11 @@ async def test_all_platforms_publish_loss_and_recovery(hass, runtime_factory, bl
     await hass.async_block_till_done()
     softener = enabled_records(hass, entry, "softener")
     water_filter = enabled_records(hass, entry, "filter")
-    assert {record.domain for record in softener} == {"binary_sensor", "sensor", "number", "switch"}
-    assert {record.domain for record in water_filter} == {"binary_sensor", "sensor", "number", "switch"}
+    expected_platforms = {"binary_sensor", "button", "sensor", "number", "switch"}
+    assert {record.domain for record in softener} == expected_platforms
+    assert {record.domain for record in water_filter} == expected_platforms
+    idle_advance = {entity_id(hass, "button", f"{address}_advance_cycle")
+                    for address in ("softener", "filter")}
     original_ids = {record.entity_id for record in softener + water_filter}
     presence = entity_id(hass, "binary_sensor", "softener")
     assert hass.states.get(presence).state == "on"
@@ -55,7 +58,10 @@ async def test_all_platforms_publish_loss_and_recovery(hass, runtime_factory, bl
         # The interval number saves local options and remains usable offline.
         assert all(hass.states.get(record.entity_id).state == "unavailable" for record in softener if record.domain != "number")
         assert all(hass.states.get(record.entity_id).state != "unavailable" for record in softener if record.domain == "number")
-        assert all(hass.states.get(record.entity_id).state != "unavailable" for record in water_filter)
+        assert all(
+            (hass.states.get(record.entity_id).state == "unavailable") == (record.entity_id in idle_advance)
+            for record in water_filter
+        )
         await clock.advance(901)
         await clock.until(lambda: len(transport.valve("filter").clients) == 2 and
                           not transport.valve("filter").clients[-1].is_connected)
@@ -64,7 +70,12 @@ async def test_all_platforms_publish_loss_and_recovery(hass, runtime_factory, bl
         bluetooth_io.advertise("softener", rssi=-45)
         await clock.until(lambda: len(transport.valve("softener").clients) == 2 and
                           not transport.valve("softener").clients[-1].is_connected)
-        assert all(hass.states.get(record.entity_id).state != "unavailable" for record in softener + water_filter)
+        # Connectivity restores idle actions on both valves. Advance still
+        # requires an active cycle and remains unavailable for an idle valve.
+        assert all(
+            (hass.states.get(record.entity_id).state == "unavailable") == (record.entity_id in idle_advance)
+            for record in softener + water_filter
+        )
         assert {record.entity_id for record in enabled_records(hass, entry, "softener") + enabled_records(hass, entry, "filter")} == original_ids
         assert published == ["unavailable", "on"]
     finally:

@@ -36,6 +36,7 @@ async def setup_cycle_valve(hass, runtime_factory, bluetooth_io, transport,
     valve.firmware_version = firmware
     valve.is_twin_valve = twin
     if firmware >= 600:
+        valve.valve_type = valve_type
         bluetooth_io.advertise(payload=EVB034_622)
         valve.identification_packets.append(frames({
             "dlf": firmware, "dlc": 23, "as": 1, "dlvt": valve_type,

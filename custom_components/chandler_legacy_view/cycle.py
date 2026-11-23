@@ -1,10 +1,21 @@
 """Interpret authenticated valve cycle readings from both BLE protocols."""
 
+from enum import StrEnum
+
 from .models import ValveCapabilities, ValveCycleStatus, ValveDashboardData
 
 CYCLE_READING = "cycle_status"
 EVB034_MOVING = frozenset({1, 2, 6, 7, 9, 11})
 _EVB034_STATIONARY = frozenset({0, 5, 8, 10})
+
+
+class CycleAction(StrEnum):
+    """Distinct button intents that must survive validation before sending."""
+
+    START = "regenerate_now"
+    ADVANCE = "advance_cycle"
+    SCHEDULE = "regenerate_at_next_scheduled_time"
+
 
 _SOFTENER = ("service", "backwash", "brine_draw", "rapid_rinse", "brine_fill")
 _SALT_DOSE = ("service", "backwash", "brine_draw", "second_backwash", "rapid_rinse", "brine_fill")

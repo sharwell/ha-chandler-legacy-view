@@ -18,14 +18,13 @@ from .models import ValveAdvertisement, ValveCycleStatus
 
 
 class ValveCycleEntity(ChandlerValveEntity):
-    """Subscribe an enabled entity to its valve's cycle and freshness updates."""
+    """Publish state from the cycle, capability, and availability listeners."""
 
     def __init__(self, advertisement: ValveAdvertisement, connection: ValveConnection,
-                 field: str, suffix: str, name: str) -> None:
-        """Bind a reading field and stable registry suffix to the valve's connection."""
+                 suffix: str, name: str) -> None:
+        """Bind the registry suffix and entity name to the valve's connection."""
         super().__init__(advertisement)
         self._connection = connection
-        self._field = field
         self._attr_unique_id = f"{advertisement.address}_{suffix}"
         self._attr_name = self._reading_name = name
 
@@ -42,10 +41,45 @@ class ValveCycleEntity(ChandlerValveEntity):
     def supported(self) -> bool:
         """Return whether current model and program evidence supports this entity."""
         capabilities = self._connection.entity_capabilities
-        if not cycle_program(capabilities) or (
-            self._evb034 and capabilities.is_clack_valve is None
-        ):
+        return bool(cycle_program(capabilities)) and (
+            not self._evb034 or capabilities.is_clack_valve is not None
+        )
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to cycle, capability, and availability notifications."""
+        await super().async_added_to_hass()
+        self.async_on_remove(self._connection.add_dashboard_listener(self._publish))
+        self.async_on_remove(self._connection.add_freshness_listener(self._publish))
+        self.async_on_remove(self._connection.add_capability_listener(self._publish))
+
+    @callback
+    def _publish(self, *_args) -> None:
+        if self.hass is not None and self.platform is not None:
+            self.async_write_ha_state()
+
+    @callback
+    def async_handle_discovery(self, advertisement: ValveAdvertisement) -> None:
+        """Update device metadata and publish connection availability."""
+        self.async_update_from_advertisement(advertisement)
+        self._attr_name = self._reading_name
+        self._publish()
+
+
+class ValveCycleReading(ValveCycleEntity):
+    """Expose one cycle reading while its value and capabilities are current."""
+
+    def __init__(self, advertisement: ValveAdvertisement, connection: ValveConnection,
+                 field: str, suffix: str, name: str) -> None:
+        """Bind the named ValveCycleStatus field to the entity."""
+        super().__init__(advertisement, connection, suffix, name)
+        self._field = field
+
+    @property
+    def supported(self) -> bool:
+        """Return whether the app shows this reading on the current program."""
+        if not super().supported:
             return False
+        capabilities = self._connection.entity_capabilities
         if self._field == "soaking":
             if self._evb034:
                 return supports_soak(capabilities) and self._value is not None
@@ -68,31 +102,12 @@ class ValveCycleEntity(ChandlerValveEntity):
             and self._value is not None
         )
 
-    async def async_added_to_hass(self) -> None:
-        """Subscribe to cycle, capability, and availability notifications."""
-        await super().async_added_to_hass()
-        self.async_on_remove(self._connection.add_dashboard_listener(self._publish))
-        self.async_on_remove(self._connection.add_freshness_listener(self._publish))
-        self.async_on_remove(self._connection.add_capability_listener(self._publish))
-
     async def async_update(self) -> None:
         """Request a fresh, shared Dashboard read through the valve connection."""
         await self._connection.async_refresh()
 
-    @callback
-    def _publish(self, *_args) -> None:
-        if self.hass is not None and self.platform is not None:
-            self.async_write_ha_state()
 
-    @callback
-    def async_handle_discovery(self, advertisement: ValveAdvertisement) -> None:
-        """Update device metadata and publish connection availability."""
-        self.async_update_from_advertisement(advertisement)
-        self._attr_name = self._reading_name
-        self._publish()
-
-
-class ValveCycleBinarySensor(ValveCycleEntity, BinarySensorEntity):
+class ValveCycleBinarySensor(ValveCycleReading, BinarySensorEntity):
     """Report a confirmed boolean phase or movement indication."""
 
     @property
@@ -108,7 +123,7 @@ class ValveCycleBinarySensor(ValveCycleEntity, BinarySensorEntity):
         return None
 
 
-class ValveCurrentCycleSensor(ValveCycleEntity, SensorEntity):
+class ValveCurrentCycleSensor(ValveCycleReading, SensorEntity):
     """Report the named stationary cycle position as a Home Assistant enum."""
 
     _attr_device_class = SensorDeviceClass.ENUM
@@ -136,7 +151,7 @@ class ValveCurrentCycleSensor(ValveCycleEntity, SensorEntity):
         return options
 
 
-class ValveCycleTimeSensor(ValveCycleEntity, SensorEntity):
+class ValveCycleTimeSensor(ValveCycleReading, SensorEntity):
     """Report the confirmed stationary step's remaining duration in seconds."""
 
     _attr_device_class = SensorDeviceClass.DURATION

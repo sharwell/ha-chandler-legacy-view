@@ -252,13 +252,16 @@ class Evb034Session:
                     if "as" in packet:
                         return packet
 
-    async def send_command(self, payload: bytes) -> None:
+    async def send_command(self, payload: bytes, *, retry: bool = True) -> None:
         """Send a nonempty JSON object with bounded ACK/NAK retries.
 
         Caller must establish authenticated access first. Return after frame
         ACKs, not confirmation that the valve applied the setting; a matching
-        reading must confirm that separately. Invalid JSON/framing or exhausted
-        retries raise Evb034ProtocolError; transport errors/timeouts propagate.
+        reading must confirm that separately. Set `retry=False` for commands
+        that can change the physical cycle on each press. For those commands,
+        a non-ACK response ends the exchange without resending any frame.
+        Invalid JSON/framing or exhausted retries raise Evb034ProtocolError.
+        Transport errors and timeouts propagate.
         Failure/cancellation can leave the physical command outcome uncertain.
         """
         try:
@@ -283,6 +286,8 @@ class Evb034Session:
                             serial, response = await self._wait_ready(self._acks, TIMEOUT)
                             if serial > after:
                                 break
+                    if response != ACK and not retry:
+                        raise Evb034ProtocolError("Valve did not acknowledge the command")
                     if response in (b"\xc2", b"\xc3"):
                         if self._timeout_retries > PACKET_ATTEMPTS:
                             raise Evb034ProtocolError("Timeout retries exceeded")

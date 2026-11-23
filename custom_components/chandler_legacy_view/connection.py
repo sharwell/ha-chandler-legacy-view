@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timedelta
 from enum import Enum, IntEnum
@@ -43,7 +43,7 @@ from .const import (
     PERSISTENT_EXCHANGE_TIMEOUT_SECONDS,
 )
 from .ble_operations import OwnedBluetoothOperations
-from .cycle import CYCLE_READING, EVB034_MOVING, evb019_cycle
+from .cycle import CYCLE_READING, EVB034_MOVING, CycleAction, cycle_program, evb019_cycle
 from .device_registry import async_update_device_serial_number
 from .discovery import ValveDiscoveryChange, ValveDiscoveryManager, _map_valve_type
 from .models import ValveAdvertisement, ValveCapabilities, ValveCycleStatus, ValveDashboardData
@@ -117,6 +117,7 @@ _DEVICE_LIST_RESPONSE_TIMEOUT_SECONDS = 5
 _DEVICE_LIST_MIN_RESPONSE_LENGTH = 18
 _DASHBOARD_RESPONSE_TIMEOUT_SECONDS = 5
 _DISPLAY_READBACK_TIMEOUT_SECONDS = 9
+_CYCLE_STATUS_TIMEOUT_SECONDS = 9
 _RESET_BUFFER_TIMEOUT_SECONDS = 5
 _DISCONNECT_TIMEOUT_SECONDS = 30
 _DASHBOARD_PACKET_COUNT = 6
@@ -532,6 +533,23 @@ class ValveConnection:
             self.schedule_poll()
 
     async def _async_set_display_off(self, batch: _DisplayBatch) -> None:
+        async with self._async_control_session():
+            if not self.display_off_supported:
+                raise HomeAssistantError("Display-off control is unavailable")
+            try:
+                if not await self._async_poll_locked(
+                    control=lambda client: self._async_write_display_batch(client, batch)
+                ):
+                    raise HomeAssistantError("Valve did not confirm the display-off setting")
+                self._raise_if_cleanup_pending()
+            except BaseException:
+                # The device may have adopted a command whose reply was
+                # lost. A pre-command value cannot resolve that outcome.
+                self._freshness.invalidate({"display_off"}, "display configuration was not confirmed")
+                raise
+
+    @contextlib.asynccontextmanager
+    async def _async_control_session(self):
         # A setting owns a finite session. Retire the polling session first so
         # its reader cannot consume a command's readback or race the write.
         async with self._setting_lock:
@@ -546,20 +564,13 @@ class ValveConnection:
             await self._async_stop_persistent_session()
             self._raise_if_cleanup_pending()
             async with self._lock:
-                if not self.available or not self.display_off_supported or self._authentication_failed:
-                    raise HomeAssistantError("Display-off control is unavailable or authentication is locked out")
+                if not self.available or self._authentication_failed:
+                    raise HomeAssistantError("Valve control is unavailable or authentication is locked out")
                 if not await self._async_prepare_connection():
                     raise HomeAssistantError("Another Bluetooth operation still owns this valve")
                 self._poll_task = asyncio.current_task()
                 try:
-                    if not await self._async_poll_locked(display_batch=batch):
-                        raise HomeAssistantError("Valve did not confirm the display-off setting")
-                    self._raise_if_cleanup_pending()
-                except BaseException:
-                    # The device may have adopted a command whose reply was
-                    # lost. A pre-command value cannot resolve that outcome.
-                    self._freshness.invalidate({"display_off"}, "display configuration was not confirmed")
-                    raise
+                    yield
                 finally:
                     self._poll_task = None
 
@@ -622,6 +633,148 @@ class ValveConnection:
         """Return confirmed support metadata without changing advertisement data."""
 
         return self._entity_capabilities
+
+    def cycle_action_supported(self, action: CycleAction) -> bool:
+        """Return whether the valve program supports the selected button.
+
+        The reference app's menu omits the one-time scheduled action on twins.
+        This checks capabilities only. Eligibility also requires current state.
+        """
+        capabilities = self.entity_capabilities
+        if not isinstance(action, CycleAction) or not cycle_program(capabilities):
+            return False
+        if action is CycleAction.SCHEDULE:
+            return capabilities.is_twin_valve is False
+        return True
+
+    def cycle_action_available(self, action: CycleAction) -> bool:
+        """Return UI eligibility based on the last confirmed cycle snapshot.
+
+        An on-demand session may have disconnected since this snapshot. The
+        command always checks fresh state on the authenticated write session.
+        """
+        return (
+            self.available and not self.authentication_lockout
+            and self.cycle_action_supported(action) and self._cycle_matches(action)
+        )
+
+    @property
+    def _cycle(self) -> ValveCycleStatus | None:
+        return self._dashboard_data.cycle if self._dashboard_data is not None else None
+
+    def _cycle_matches(self, action: CycleAction) -> bool:
+        cycle = self._cycle
+        if cycle is None or cycle.moving is not False or cycle.step is None:
+            return False
+        if action is CycleAction.ADVANCE:
+            return cycle.active is True or cycle.soaking is True
+        if (
+            action is CycleAction.START and self._evb034_client is None
+            and self._advertisement.model != "Evb034"
+            and (self._dashboard_data.bypass_setting_enabled
+                 or self._dashboard_data.shutoff_setting_enabled)
+        ):
+            return False
+        return cycle.active is False and cycle.soaking is not True and cycle.step in ("service", "standby")
+
+    async def async_cycle_action(self, action: CycleAction) -> None:
+        """Send one button intent on a fresh authenticated session.
+
+        Start and advance await a confirmed cycle change. Schedule sends
+        one request, as the app exposes no distinct confirmation of queueing.
+        State, access, and unconfirmed exchanges raise HomeAssistantError.
+        Cancellation ends the caller's operation and never replays a command
+        that may have reached the valve.
+        """
+        if not self.cycle_action_available(action):
+            raise HomeAssistantError("Cycle action is unavailable for the reported valve state")
+        expected_step = self._cycle.step
+        task = asyncio.create_task(self._async_cycle_action(action, expected_step))
+        self._setting_tasks.add(task)
+        try:
+            await task
+        finally:
+            self._setting_tasks.discard(task)
+            self._schedule_next_poll()
+            if self._persistent_connection_enabled and not self._setting_tasks:
+                self.schedule_poll()
+
+    async def _async_cycle_action(self, action: CycleAction, expected_step: str) -> None:
+        async with self._async_control_session():
+            if not await self._async_poll_locked(
+                control=lambda client: self._async_write_cycle_action(client, action, expected_step)
+            ):
+                raise HomeAssistantError("Valve did not return authenticated data for the cycle action")
+            self._raise_if_cleanup_pending()
+
+    async def _async_write_cycle_action(
+        self, client: BaseBleakClient, action: CycleAction, expected_step: str
+    ) -> None:
+        session = self._evb034_session if client is self._evb034_client else None
+        if session is not None:
+            async with asyncio.timeout(_CYCLE_STATUS_TIMEOUT_SECONDS):
+                while not self._cycle_state_received():
+                    self._handle_evb034_update(await session.next_packet())
+        if (
+            not self._has_dashboard_access() or not self.cycle_action_supported(action)
+            or not self._cycle_matches(action)
+            or not self.reading_is_current(CYCLE_READING)
+            or (action is CycleAction.ADVANCE and self._cycle.step != expected_step)
+        ):
+            raise HomeAssistantError("Fresh valve state does not permit the requested cycle action")
+
+        scheduled = action is CycleAction.SCHEDULE
+        try:
+            if session is not None:
+                cursor = session.notification_cursor
+                started = self._hass.loop.time()
+                await session.send_command(b'{"grl":0}' if scheduled else b'{"grn":0}', retry=False)
+                if scheduled:
+                    return
+                async with asyncio.timeout(_CYCLE_STATUS_TIMEOUT_SECONDS):
+                    while True:
+                        self._handle_evb034_update(await session.next_packet(after=cursor))
+                        keys = ("gra", "dps") if action is CycleAction.START else ("drcp", "dps")
+                        times = self._evb034_received_times
+                        phase_received = any(times.get(key, float("-inf")) >= started for key in keys)
+                        arrived = action is CycleAction.START or times.get("grs", float("-inf")) >= started
+                        if phase_received and arrived and self._cycle_confirmed(action, expected_step):
+                            return
+            else:
+                payload = bytearray(self._create_request_payload(ValveRequestCommand.DASHBOARD))
+                payload[13:15] = b"RT" if scheduled else b"RN"
+                if not await self._async_send_payload(client, bytes(payload), command_name="cycle action"):
+                    raise HomeAssistantError("The valve cycle request could not be confirmed")
+                if scheduled:
+                    return
+                async with asyncio.timeout(_CYCLE_STATUS_TIMEOUT_SECONDS):
+                    while True:
+                        sent, received = await self._async_request_dashboard(client)
+                        if not sent:
+                            raise HomeAssistantError("Unable to read back the cycle action")
+                        if received and self._cycle_confirmed(action, expected_step):
+                            return
+                        await asyncio.sleep(1)
+        except BaseException:
+            # The valve may have received a command whose response was lost.
+            self._freshness.invalidate({CYCLE_READING}, "cycle action outcome was not confirmed")
+            raise
+
+    def _cycle_state_received(self) -> bool:
+        cycle = self._cycle
+        return bool(
+            cycle is not None and self.reading_is_current(CYCLE_READING)
+            and (cycle.active is not None or cycle.soaking is True)
+            and (cycle.moving is True or (cycle.moving is False and cycle.step is not None))
+        )
+
+    def _cycle_confirmed(self, action: CycleAction, expected_step: str) -> bool:
+        cycle = self._cycle
+        if cycle is None:
+            return False
+        if action is CycleAction.START:
+            return cycle.active is True or cycle.soaking is True
+        return cycle.moving is False and cycle.step not in (None, expected_step)
 
     @property
     def authentication_lockout(self) -> bool:
@@ -1510,7 +1663,9 @@ class ValveConnection:
             return False
         return True
 
-    async def _async_poll_locked(self, *, display_batch: _DisplayBatch | None = None) -> bool:
+    async def _async_poll_locked(
+        self, *, control: Callable[[BaseBleakClient], Awaitable[None]] | None = None,
+    ) -> bool:
         """Perform a Bluetooth connection cycle for the valve."""
 
         now = dt_util.utcnow()
@@ -1518,7 +1673,7 @@ class ValveConnection:
         if self._authentication_failed:
             return False
         next_connection_time = self._next_connection_time
-        if display_batch is None and next_connection_time is not None and now < next_connection_time:
+        if control is None and next_connection_time is not None and now < next_connection_time:
             remaining = max((next_connection_time - now).total_seconds(), 0)
             _LOGGER.debug(
                 "Skipping poll for %s; retrying after %.1f seconds",
@@ -1596,17 +1751,17 @@ class ValveConnection:
                     self._connection_state_callback(self._address, True)
                 async with asyncio.timeout(POLL_EXCHANGE_TIMEOUT_SECONDS):
                     refreshed = await self._async_fetch_device_information(client)
-                    if display_batch is not None:
+                    if control is not None:
                         if not refreshed:
                             raise HomeAssistantError("Valve did not provide authenticated readings before configuration")
-                        await self._async_write_display_batch(client, display_batch)
+                        await control(client)
             except TimeoutError:
                 owner.invalidate()
-                if display_batch is not None:
-                    raise HomeAssistantError("Display-off configuration timed out; its outcome is unconfirmed") from None
+                if control is not None:
+                    raise HomeAssistantError("Valve control timed out; its outcome is unconfirmed") from None
                 _LOGGER.warning("Reading exchange timed out for valve %s", self._address)
             except Exception as exc:
-                if display_batch is not None:
+                if control is not None:
                     raise HomeAssistantError(str(exc)) from exc
                 _LOGGER.exception(
                     "Error while retrieving extended data from valve %s", self._address

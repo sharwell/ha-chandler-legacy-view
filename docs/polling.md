@@ -167,6 +167,32 @@ Use **Regeneration/backwash active** to tell when the valve has finished.
 Fresh Evb034 cycle notifications can publish cycle changes between regular
 Dashboard updates. Cycle readings require their own updates to stay fresh.
 
+### Manual cycle controls
+
+The valve device exposes **Regenerate now** or **Backwash now** when the
+reported cycle is idle. **Advance to next cycle step** becomes available
+once an eligible running step has been confirmed. Home Assistant reads
+the valve again on the authenticated connection before sending either
+command. If the requested action no longer matches the valve's state,
+the press fails. The integration sends the action once and checks the
+reported cycle for the resulting change.
+
+#### Commissioning a backwashing filter
+
+This sequence applies to a filter with Backwash, Rest, and Rapid Rinse.
+
+1. Press **Backwash now** and wait for **Current cycle** to show Backwash.
+2. Let the Backwash step finish and wait for **Current cycle** to show Rest.
+3. Press **Advance to next cycle step** and check for Rapid Rinse.
+4. Let the rinse finish. **Regeneration/backwash active** turns off when
+   the valve confirms completion.
+
+Use persistent monitoring or refresh the readings while watching for the
+step changes. **Regenerate at next scheduled time** or **Backwash at next
+scheduled time** sends a one-time request where the app offers it. Legacy
+View exposes no separate queue confirmation for that request. Use the
+normal cycle status to see when a cycle actually starts.
+
 ## Reading expiration
 
 Expired Dashboard readings become unavailable
@@ -204,9 +230,10 @@ availability together. Firmware/type/Clack applicability still takes precedence.
 
 ### Evb034 session-health policy
 
-Evb034 uses an integration policy assumption: a valid received field establishes
-eligibility, and later valid authenticated reading activity renews every
-eligible field in that session. **One field's producer can stop updating while
+For ordinary Dashboard readings, a valid Evb034 field establishes eligibility
+and later valid authenticated reading activity renews those eligible fields
+in the same session. Cycle status has its own confirmation timestamps.
+**An ordinary field's producer can stop updating while
 other reading traffic keeps its retained value marked fresh.** This detects
 loss of session reading activity, not every individual producer failure.
 
