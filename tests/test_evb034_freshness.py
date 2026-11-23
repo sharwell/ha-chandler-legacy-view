@@ -135,6 +135,32 @@ async def test_silence_expires_then_one_new_update_restores_snapshot_atomically(
         remove()
 
 
+async def test_unchanged_cycle_recovers_before_the_next_dashboard_update(
+    hass, entry_factory, runtime_factory, bluetooth_io, transport, clock,
+):
+    backwash = {"gra": 1, "grs": 5, "drcp": 1, "dps": 0}
+    _, connection, _, owner = await session(
+        hass, entry_factory, runtime_factory, bluetooth_io, transport, clock, interval=300,
+        initial={**backwash, "gpf": 100},
+    )
+    await hass.async_block_till_done()
+    step = sensor_id(hass, "current_cycle")
+    flow = sensor_id(hass, "present_flow")
+    original = connection.last_success
+    assert hass.states.get(step).state == "backwash"
+
+    # Other readings keep the session healthy while the cycle fields expire.
+    for age in (200, 400, 600, 800):
+        await age_from(clock, original, age)
+        await receive(owner, {"gpf": 100}, clock)
+    await age_from(clock, original, 901)
+    assert hass.states.get(step).state == "unavailable"
+    assert float(hass.states.get(flow).state) == 1.0
+
+    await receive(owner, backwash, clock)
+    assert hass.states.get(step).state == "backwash"
+
+
 async def test_new_connection_cannot_renew_a_field_from_the_previous_baseline(
     hass, entry_factory, runtime_factory, bluetooth_io, transport, clock,
 ):

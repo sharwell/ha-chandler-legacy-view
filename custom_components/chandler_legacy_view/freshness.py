@@ -9,6 +9,7 @@ from homeassistant.helpers.event import async_call_later
 from homeassistant.core import callback
 
 from .const import CONNECTION_ATTEMPT_BUDGET_SECONDS, CONNECTION_MIN_RETRY_INTERVAL
+from .cycle import CYCLE_READING
 
 _LOGGER = logging.getLogger(__name__)
 RECOVERY_ALLOWANCE = max(
@@ -18,6 +19,7 @@ RECOVERY_ALLOWANCE = max(
 READINGS = frozenset({
     "present_flow", "water_usage_today", "peak_flow_today", "soft_water_remaining",
     "days_until_regeneration", "water_hardness", "battery", "time_of_day", "display_off",
+    CYCLE_READING,
 })
 
 

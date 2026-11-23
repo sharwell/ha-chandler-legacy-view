@@ -148,6 +148,58 @@ disconnect to settle.
 Manual refresh reports unsuccessful reads to the calling action/automation;
 it does not treat a completed wait as a successful reading.
 
+## Regeneration and backwash status
+
+Use **Current cycle** to identify the confirmed stationary step. On valves
+that report movement, **Valve moving** shows when the valve is changing
+positions. Its `moving_to` attribute shows the destination when known.
+For example, a valve moving toward Backwash can report destination
+`backwash` before **Current cycle** reports Backwash.
+
+**Cycle time remaining** reports seconds for the current step, including
+brine soak where supported. It is unavailable while the valve moves or
+when no valid estimate is reported. A confirmed finished cycle can report
+zero. Cycle names depend on the valve program and follow the live
+Legacy View Dashboard. On Clack filters, the Dashboard calls position 2
+Air Draw, which can differ from the label in the cycle timing screen.
+
+Use **Regeneration/backwash active** to tell when the valve has finished.
+Fresh Evb034 cycle notifications can publish cycle changes between regular
+Dashboard updates. Cycle readings require their own updates to stay fresh.
+When an Evb034 reports a new position, the current step is unavailable until
+the valve confirms arrival. For brine-soak transitions, the soak flag and
+stationary movement state must agree. They can arrive in either order. A
+countdown for a new position uses that position's options or its reported
+time unit. If neither is available, the countdown is unavailable.
+
+### Manual cycle controls
+
+The valve device exposes **Regenerate now** or **Backwash now** when the
+reported cycle is idle. **Advance to next cycle step** becomes available
+once an eligible running step has been confirmed. Home Assistant reads
+the valve again on the authenticated connection before sending either
+command. If the requested action no longer matches the valve's state,
+the press fails. The integration sends the action once and checks the
+reported cycle for the resulting change.
+On Evb034 programs with brine soak, the fresh state check includes the soak
+flag. An idle action requires the flag to be off.
+
+#### Commissioning a backwashing filter
+
+This sequence applies to a filter with Backwash, Rest, and Rapid Rinse.
+
+1. Press **Backwash now** and wait for **Current cycle** to show Backwash.
+2. Let the Backwash step finish and wait for **Current cycle** to show Rest.
+3. Press **Advance to next cycle step** and check for Rapid Rinse.
+4. Let the rinse finish. **Regeneration/backwash active** turns off when
+   the valve confirms completion.
+
+Use persistent monitoring or refresh the readings while watching for the
+step changes. **Regenerate at next scheduled time** or **Backwash at next
+scheduled time** sends a one-time request where the app offers it. Legacy
+View exposes no separate queue confirmation for that request. Use the
+normal cycle status to see when a cycle actually starts.
+
 ## Reading expiration
 
 Expired Dashboard readings become unavailable
@@ -185,9 +237,10 @@ availability together. Firmware/type/Clack applicability still takes precedence.
 
 ### Evb034 session-health policy
 
-Evb034 uses an integration policy assumption: a valid received field establishes
-eligibility, and later valid authenticated reading activity renews every
-eligible field in that session. **One field's producer can stop updating while
+For ordinary Dashboard readings, a valid Evb034 field establishes eligibility
+and later valid authenticated reading activity renews those eligible fields
+in the same session. Cycle status has its own confirmation timestamps.
+**An ordinary field's producer can stop updating while
 other reading traffic keeps its retained value marked fresh.** This detects
 loss of session reading activity, not every individual producer failure.
 
@@ -201,7 +254,9 @@ loss of session reading activity, not every individual producer failure.
   buffering and coalescing.
 - A complete validated packet with a usable known reading component renews
   eligible baselines. Metadata, ACKs, keepalives, null-only packets, and invalid
-  data do not. A null or invalid field does not erase an existing valid baseline.
+  data do not. Ordinary readings keep their last valid baseline after a
+  null or invalid field. An invalid cycle field clears its value and needs
+  a subsequent valid report to recover.
 - Silence uses the maximum-age and due-failure rules above. Access loss,
   receiver failure, or a detected unexpected disconnect invalidates eligibility;
   a new authenticated connection starts with no eligible fields. Late old

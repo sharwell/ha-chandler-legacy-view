@@ -21,7 +21,7 @@ async def test_parent_exists_when_valve_entities_are_registered(hass, runtime_fa
     await hass.async_block_till_done()
     registered_parent = parent(hass, entry)
     records = er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id)
-    assert {record.domain for record in records} == {"binary_sensor", "sensor", "number", "switch"}
+    assert {record.domain for record in records} == {"binary_sensor", "button", "sensor", "number", "switch"}
     for record in records:
         device = dr.async_get(hass).async_get(record.device_id)
         assert device is not None

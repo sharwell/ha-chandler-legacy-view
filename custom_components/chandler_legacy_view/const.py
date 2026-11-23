@@ -19,6 +19,7 @@ DEFAULT_VALVE_PASSCODE: Final = "1234"
 DOMAIN: Final = "chandler_legacy_view"
 PLATFORMS: Final[list[Platform]] = [
     Platform.BINARY_SENSOR,
+    Platform.BUTTON,
     Platform.NUMBER,
     Platform.SENSOR,
     Platform.SWITCH,

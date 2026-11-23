@@ -43,8 +43,8 @@
   when a new change, failure, or unresolved concern warrants it.
 - Retain dependency pins and CI action commit pins. Avoid incidental upgrades,
   moving tags, unpinned downloads, and new tooling without a task-specific need.
-  Pin introduced tools and components at their first consumer; preserve the
-  existing dependency manager, any lockfiles, and integrity checks.
+  Pin introduced tools, SDKs, components, and build assets at first use.
+  Preserve the existing dependency manager, any lockfiles, and integrity checks.
 - Use changed-file commands or explicit paths when unrelated work is present.
   Formatting must preserve the Git index; keep repository-wide style passes
   separately scoped. Respect generated output, private data, caches, unsupported
@@ -162,10 +162,8 @@ paragraphs; the implementation-summary guideline does not require a bullet list.
   not become the only current definition of the work.
 - Put issue-specific technical requirements below the introduction and
   main outcomes in a closed `<details>` section with a descriptive
-  `<summary>`. Leave blank lines around Markdown inside the section.
-  Preserve necessary contracts, resource limits, failure cases, and
-  acceptance requirements; readability edits must not silently reduce
-  the scope.
+  `<summary>`. Preserve necessary contracts, resource limits, failure cases,
+  and acceptance requirements when editing for readability.
 - Keep repository-wide privacy, testing, authorization, and security rules
   in this guide or the relevant documentation instead of repeating them
   in each issue. Retain a rule in an issue when it defines that issue's
@@ -279,10 +277,12 @@ paragraphs; the implementation-summary guideline does not require a bullet list.
   Claims about physical disconnects or released proxy connection slots
   require evidence from the corresponding hardware or transport boundary;
   completion of a mocked call or task alone does not establish them.
+- Add meaningful regression coverage alongside the behavior it protects,
+  including relevant failure and boundary cases.
 - Derive expected values independently of the implementation under test.
-  Include relevant failure and boundary cases; do not weaken assertions or
-  security checks to obtain a pass. A focused mock may guard an operation that
-  must not occur, without replacing the production behavior under test.
+  Do not weaken assertions or security checks to obtain a pass. A focused mock
+  may guard an operation that must not occur, without replacing the production
+  behavior under test.
 - Prefer controlled clocks, events, and existing fixtures over sleeps. Bound
   waits and release test-owned resources; preserve genuine randomness when
   independent keys or tokens are part of the behavior being tested.
@@ -314,13 +314,14 @@ paragraphs; the implementation-summary guideline does not require a bullet list.
   readers entering or skipping sections,
   rather than recurring instructions about what to skip. Review both the whole
   piece and standalone statements for dependable conclusions when skimmed.
-- Code and public interfaces establish implemented behavior; `README.md` and
-  maintained guides such as `docs/polling.md` explain current use. GitHub Issues
-  owns planned scope; completed issues, PRs, commits, and older revisions retain
-  historical rationale and evidence. Scope claims to the relevant branch or
-  release. Identify what content means independently of its container: an open
-  issue may describe a current defect, and a closed PR a rejected proposal.
-  Closure alone does not prove implementation or readiness.
+- Give each item a primary home. Code and public interfaces establish
+  implemented behavior and contracts. `README.md` and maintained guides such
+  as `docs/polling.md` explain use for supported versions. GitHub Issues owns
+  planned scope and progress. Completed issues, PRs, commits, and older
+  revisions retain historical rationale and evidence. Use placement and links
+  to make the authoritative source and applicable branch or release clear.
+  An open issue may describe a current defect, and a closed PR a rejected
+  proposal. Establish implementation and readiness from evidence.
 - Permit summaries, links, and repeated contracts at points of use when they
   serve independent reader needs. Keep the primary source identifiable and
   weigh reader benefit against upkeep; avoid a second complete progress record.
@@ -328,23 +329,24 @@ paragraphs; the implementation-summary guideline does not require a bullet list.
   explain the useful outcome, identify major gaps, and link authoritative scope
   in Issues. Keep a concise vision in the overview when needed to understand
   the project today. After MVP, lead adoption with available capabilities and
-  use; put future ambitions where they do not dominate current users' path.
-  Establish readiness from evidence rather than inferring it from scaffolding
-  wording or successful local checks.
+  use. Make future plans easy to find for interested readers while keeping
+  current use prominent.
 - Distinguish required outcomes, preferred representations, tentative or chosen
   approaches, observed behavior, and accepted readiness. Label planned
-  capabilities and performance targets. Update current contracts and usage
-  guides with behavior changes; preserve useful explanations while updating
-  status, versions, and evidence. Keep hardware and firmware evidence gaps
-  explicit even after implementation.
+  capabilities and performance targets. Write durable explanations of purpose
+  and behavior with explicit status. Update current contracts and usage guides
+  when behavior changes. Preserve useful explanations as you update status,
+  versions, references, and acceptance evidence. Keep outstanding deployment,
+  hardware, and firmware checks explicit after implementation or local validation.
   A status edit cannot substitute for implementation or acceptance evidence.
   Let maintained contracts and usage guides become authoritative for current
   callers while completed planning records retain historical requirements and
   evidence without having to track later guide changes.
 - Remove superseded instructions from the affected version's active guides.
-  Retain migration advice, operative rationale, and evidence for current
-  limitations where useful. Do not create duplicate archives or rewrite
-  historical records solely to synchronize them with current guides.
+  Retain migration advice, breaking changes, operative rationale, and evidence
+  for current limitations where useful. Use existing history for earlier
+  accounts. During transitions, check the source for planned scope, current use,
+  and historical rationale, then decide what stays, changes, or leaves the guide.
 - For new or touched reusable Python APIs, shared types, meaningful shared
   members, and requested documentation work, document caller contracts so
   callers need not read the implementation. Use native docstrings at the
@@ -360,15 +362,16 @@ paragraphs; the implementation-summary guideline does not require a bullet list.
   output, exceptions, rejection, fallback, and best-effort behavior.
 - Document meaningful members of public options, results, shared records, and
   enums by how values affect behavior. Include side effects, environmental
-  dependence, ownership, lifetime, initialization order, event-loop context,
-  cancellation, and blocking where relevant to correct use; distinguish an
-  accepted request from confirmed valve output.
+  dependence, ownership, lifetime, initialization order, execution context
+  such as event-loop or worker-thread requirements, cancellation, and blocking
+  where relevant to correct use. Explain separately when a request is accepted
+  and when valve output is confirmed.
 - Favor predictable related APIs during authorized implementation work.
   Documentation-only work does not authorize redesign. State actual enforced
   behavior without inventing validation, recovery, error results, or concurrency
-  guarantees. Keep implementation rationale beside the implementation; explain evidenced
-  workarounds with affected HA/backend/firmware versions, the failure avoided,
-  and supporting evidence.
+  guarantees. Keep implementation rationale beside the implementation. For a
+  workaround, name the affected HA, backend, or firmware version and the
+  failure it avoids, and reference the supporting evidence.
 - Preserve accurate wording and make proportional repairs instead of stylistic
   rewrites; repeated review should produce little further change. Use a short
   example when it prevents likely misuse. For scripts, document paths,
@@ -376,6 +379,51 @@ paragraphs; the implementation-summary guideline does not require a bullet list.
   where needed. Comments do not enforce contracts or replace behavior tests.
   Do not introduce a documentation tool or another language's tags for these
   rules.
+
+## GitHub Markdown
+
+- Use CommonMark and GitHub Flavored Markdown (GFM) for repository files and
+  GitHub conversations. In issues, PRs, discussions, and comments, keep each
+  prose paragraph outside code blocks on one source line, with blank lines
+  between paragraphs and soft wrapping in the editor. Follow repository-file
+  wrapping conventions, currently hard wrapping. Use configured formatting,
+  linting, and link checks when available, with any single-line wrapping
+  enforcement scoped to conversation output. Wrap code at valid break points,
+  preserving syntax, literal values, and copyability. Keep indivisible content
+  intact.
+- In GitHub conversations, use bare commit hashes and issue or PR references
+  such as #123 for this repository. Qualify cross-repository references as
+  `owner/repo@hash` or `owner/repo#123`. Leave actual references outside inline
+  code. Use explicit Markdown links with the same visible labels in files and
+  wikis where shorthand does not autolink. Pin code-file citations to a full
+  commit hash. Verify the path and any line or range fragment at that revision,
+  and put `?plain=1` before line fragments for Markdown source.
+- Prefer relative links for maintained documentation and assets in this
+  repository. Use descriptive link labels and verify path spelling and case.
+  Check generated heading anchors after edits, including punctuation and
+  duplicate headings, and repair affected links.
+- Use a logical heading hierarchy, meaningful alt text for informative images,
+  and surrounding text for essential diagram information. Provide commands
+  and output as copyable text. Separate blocks with blank lines as needed
+  and indent nested lists and continuations relative to the containing item's
+  text. Use ordered lists for sequences and task lists for actual completion
+  tracking. Escape literal bracket syntax where it would create a checkbox.
+- Label code fences with the represented language. Use a longer outer fence
+  for examples containing fences and a long enough inline delimiter for code
+  containing backticks. Escape literal Markdown punctuation where needed. Use
+  tables for comparable data, with meaningful headers and a delimiter row.
+  Escape literal pipes even in inline code, place block content outside table
+  cells, and leave alignment to tooling where configured.
+- Prefer Markdown and verify that any needed HTML survives GitHub sanitization.
+  Give collapsed `<details>` a meaningful `<summary>`, with blank lines before
+  the Markdown body and before `</details>`. Reserve alerts for consequential
+  information and keep them outside nested containers. Check support for
+  optional footnotes and Mermaid in the destination, including Mermaid's
+  supported syntax version, and keep diagrams understandable in text.
+- Review source and rendered output in the intended GitHub context. Check
+  repository files and conversation output separately when both are affected,
+  including wrapping, references, anchors, tables, nested fences, and collapsed
+  content. A generic preview or linter can miss GitHub-specific behavior.
 
 ## Writing and review presentation
 
@@ -402,11 +450,11 @@ alongside the documentation practices above.
   variables are not private storage. Preserve useful
   requested measurements and configuration records without treating them as
   permission to expose identifying details.
-- Before writing sensitive evidence, verify that its repository-local private
-  storage is ignored. `local-artifacts/` currently has a local ignore rule;
-  verify it in the checkout instead of assuming the directory name is sufficient.
-  Preserve intentional evidence and deliverables rather than blanket-deleting
-  or ignoring every output directory. Redact identifying details before sharing.
+- Store sensitive evidence in verified, ignored repository-local private
+  storage. `local-artifacts/` currently has a local ignore rule. Verify its
+  coverage in the checkout before writing there. Base retention on purpose,
+  preserving intentional deliverables and earlier physical evidence. Redact
+  identifying details before sharing.
 - Keep unrelated private reference names, links, and machine paths out of
   ordinary deliverables. Record source identities only when attribution has
   been authorized in an appropriate maintenance record. Inspect the actual
@@ -415,9 +463,9 @@ alongside the documentation practices above.
   into a live Home Assistant instance, changing valve settings or firmware,
   provisioning, signing, deployment, uploads, publication, or account changes.
   Establish the authorized operation, target, and scope before an external
-  write; reuse authorization that still applies without a redundant approval
-  step.
-- Keep live investigations read-only unless the relevant change is authorized.
+  write. Reuse explicit authorization that still applies.
+- Keep live investigations read-only unless the relevant change is explicitly
+  authorized.
   Judge operations by their effects: Bluetooth discovery, authentication, or a
   nominal read can affect a real device. Do not probe mutation endpoints to
   learn their behavior. Use simulated peers for mutation and failure tests.

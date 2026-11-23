@@ -22,13 +22,16 @@ class ValveCapabilities:
 
     None means unresolved, including for the boolean flags; it does not mean
     False. ``firmware_version`` is the numeric major * 100 + minor value,
-    such as 618 for C6.18. Frozen instances can be shared by entities.
+    such as 618 for C6.18. ``valve_type_full`` is the raw type number used
+    to distinguish programs sharing a consolidated ``valve_type``. Frozen
+    instances can be shared by entities.
     """
 
     is_twin_valve: bool | None = None
     valve_type: str | None = None
     is_clack_valve: bool | None = None
     firmware_version: int | None = None
+    valve_type_full: int | None = None
 
     @property
     def is_metered_softener(self) -> bool | None:
@@ -113,7 +116,8 @@ class ValveDashboardData:
     Absent Evb034 values remain None, including unused legacy-only fields;
     zero is a real reading. This object carries values, not freshness or
     support guarantees: consumers must also check connection eligibility and
-    expiration before presenting them as available.
+    expiration before presenting them as available. ``cycle`` contains the
+    normalized runtime state when a status observation is available.
     """
 
     time_hour: int | None
@@ -143,4 +147,24 @@ class ValveDashboardData:
     is_in_aeration: bool
     tank_in_service: int
     graph_usage_ten_gallons: tuple[int, ...]
+    cycle: ValveCycleStatus | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ValveCycleStatus:
+    """Confirmed cycle readings from a Dashboard snapshot.
+
+    Names are stable HA enum values. During movement, `moving_to` holds
+    the destination and `step` is absent. `remaining` is the current
+    stationary step's duration in seconds. None means unknown, unavailable,
+    or inapplicable for each field. The owning connection tracks freshness.
+    """
+
+    active: bool | None
+    step: str | None
+    moving: bool | None
+    moving_to: str | None
+    remaining: int | None
+    soaking: bool | None
+    aerating: bool | None
 

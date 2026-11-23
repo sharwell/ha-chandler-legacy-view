@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timedelta
 from enum import Enum, IntEnum
@@ -43,11 +43,18 @@ from .const import (
     PERSISTENT_EXCHANGE_TIMEOUT_SECONDS,
 )
 from .ble_operations import OwnedBluetoothOperations
+from .cycle import (
+    CYCLE_READING, EVB034_MOVING, EVB034_WAITING_IN_BRINE_SOAK, CycleAction,
+    cycle_program, evb019_cycle, evb034_moving, supports_soak,
+)
 from .device_registry import async_update_device_serial_number
 from .discovery import ValveDiscoveryChange, ValveDiscoveryManager, _map_valve_type
-from .models import ValveAdvertisement, ValveCapabilities, ValveDashboardData
+from .models import ValveAdvertisement, ValveCapabilities, ValveCycleStatus, ValveDashboardData
 from .evb034 import Evb034ProtocolError, Evb034Session
-from .evb034_data import READING_KEYS, READING_FIELDS, decode_dashboard, integer, valid_reading_keys
+from .evb034_data import (
+    CYCLE_FIELDS, READING_FIELDS, READING_KEYS, cycle_value, decode_dashboard, integer,
+    valid_reading_keys,
+)
 from .freshness import FreshnessPolicy, ReadingFreshness, READINGS, RECOVERY_ALLOWANCE
 from .preferences import ValvePreferences, PERSISTENT_ENABLED, PERSISTENT_INTERVAL, persistent_interval
 from .protocol_compatibility import (
@@ -114,6 +121,7 @@ _DEVICE_LIST_RESPONSE_TIMEOUT_SECONDS = 5
 _DEVICE_LIST_MIN_RESPONSE_LENGTH = 18
 _DASHBOARD_RESPONSE_TIMEOUT_SECONDS = 5
 _DISPLAY_READBACK_TIMEOUT_SECONDS = 9
+_CYCLE_STATUS_TIMEOUT_SECONDS = 9
 _RESET_BUFFER_TIMEOUT_SECONDS = 5
 _DISCONNECT_TIMEOUT_SECONDS = 30
 _DASHBOARD_PACKET_COUNT = 6
@@ -340,6 +348,9 @@ class ValveConnection:
         self._evb034_eligible: set[str] = set()
         self._evb034_received_readings: dict = {}
         self._evb034_received_times: dict[str, float] = {}
+        self._evb034_position_changed_at = float("-inf")
+        self._evb034_soak_started_at = float("-inf")
+        self._evb034_soak_ended_at = float("-inf")
         self._evb034_last_update_time: float | None = None
         self._evb034_published_time: float | None = None
         self._evb034_reading_ready = False
@@ -529,6 +540,23 @@ class ValveConnection:
             self.schedule_poll()
 
     async def _async_set_display_off(self, batch: _DisplayBatch) -> None:
+        async with self._async_control_session():
+            if not self.display_off_supported:
+                raise HomeAssistantError("Display-off control is unavailable")
+            try:
+                if not await self._async_poll_locked(
+                    control=lambda client: self._async_write_display_batch(client, batch)
+                ):
+                    raise HomeAssistantError("Valve did not confirm the display-off setting")
+                self._raise_if_cleanup_pending()
+            except BaseException:
+                # The device may have adopted a command whose reply was
+                # lost. A pre-command value cannot resolve that outcome.
+                self._freshness.invalidate({"display_off"}, "display configuration was not confirmed")
+                raise
+
+    @contextlib.asynccontextmanager
+    async def _async_control_session(self):
         # A setting owns a finite session. Retire the polling session first so
         # its reader cannot consume a command's readback or race the write.
         async with self._setting_lock:
@@ -543,20 +571,13 @@ class ValveConnection:
             await self._async_stop_persistent_session()
             self._raise_if_cleanup_pending()
             async with self._lock:
-                if not self.available or not self.display_off_supported or self._authentication_failed:
-                    raise HomeAssistantError("Display-off control is unavailable or authentication is locked out")
+                if not self.available or self._authentication_failed:
+                    raise HomeAssistantError("Valve control is unavailable or authentication is locked out")
                 if not await self._async_prepare_connection():
                     raise HomeAssistantError("Another Bluetooth operation still owns this valve")
                 self._poll_task = asyncio.current_task()
                 try:
-                    if not await self._async_poll_locked(display_batch=batch):
-                        raise HomeAssistantError("Valve did not confirm the display-off setting")
-                    self._raise_if_cleanup_pending()
-                except BaseException:
-                    # The device may have adopted a command whose reply was
-                    # lost. A pre-command value cannot resolve that outcome.
-                    self._freshness.invalidate({"display_off"}, "display configuration was not confirmed")
-                    raise
+                    yield
                 finally:
                     self._poll_task = None
 
@@ -619,6 +640,159 @@ class ValveConnection:
         """Return confirmed support metadata without changing advertisement data."""
 
         return self._entity_capabilities
+
+    def cycle_action_supported(self, action: CycleAction) -> bool:
+        """Return whether the valve program supports the selected button.
+
+        The reference app's menu omits the one-time scheduled action on twins.
+        This checks capabilities only. Eligibility also requires current state.
+        """
+        capabilities = self.entity_capabilities
+        if not isinstance(action, CycleAction) or not cycle_program(capabilities):
+            return False
+        if action is CycleAction.SCHEDULE:
+            return capabilities.is_twin_valve is False
+        return True
+
+    def cycle_action_available(self, action: CycleAction) -> bool:
+        """Return UI eligibility based on the last confirmed cycle snapshot.
+
+        An on-demand session may have disconnected since this snapshot. The
+        command always checks fresh state on the authenticated write session.
+        """
+        return (
+            self.available and not self.authentication_lockout
+            and self.cycle_action_supported(action) and self._cycle_matches(action)
+        )
+
+    @property
+    def _cycle(self) -> ValveCycleStatus | None:
+        return self._dashboard_data.cycle if self._dashboard_data is not None else None
+
+    def _cycle_matches(self, action: CycleAction) -> bool:
+        cycle = self._cycle
+        if cycle is None or cycle.moving is not False or cycle.step is None:
+            return False
+        evb034 = self._evb034_client is not None or self._advertisement.model == "Evb034"
+        if evb034 and supports_soak(self.entity_capabilities) and cycle.soaking is None:
+            return False
+        if action is CycleAction.ADVANCE:
+            return cycle.active is True or cycle.soaking is True
+        if (
+            action is CycleAction.START and not evb034
+            and (self._dashboard_data.bypass_setting_enabled
+                 or self._dashboard_data.shutoff_setting_enabled)
+        ):
+            return False
+        return cycle.active is False and cycle.soaking is not True and cycle.step in ("service", "standby")
+
+    async def async_cycle_action(self, action: CycleAction) -> None:
+        """Send one button intent on a fresh authenticated session.
+
+        Start and advance await a confirmed cycle change. Schedule sends
+        one request, as the app exposes no distinct confirmation of queueing.
+        State, access, and unconfirmed exchanges raise HomeAssistantError.
+        Cancellation ends the caller's operation and never replays a command
+        that may have reached the valve.
+        """
+        if not self.cycle_action_available(action):
+            raise HomeAssistantError("Cycle action is unavailable for the reported valve state")
+        expected_step = self._cycle.step
+        task = asyncio.create_task(self._async_cycle_action(action, expected_step))
+        self._setting_tasks.add(task)
+        try:
+            await task
+        finally:
+            self._setting_tasks.discard(task)
+            self._schedule_next_poll()
+            if self._persistent_connection_enabled and not self._setting_tasks:
+                self.schedule_poll()
+
+    async def _async_cycle_action(self, action: CycleAction, expected_step: str) -> None:
+        async with self._async_control_session():
+            if not await self._async_poll_locked(
+                control=lambda client: self._async_write_cycle_action(client, action, expected_step)
+            ):
+                raise HomeAssistantError("Valve did not return authenticated data for the cycle action")
+            self._raise_if_cleanup_pending()
+
+    async def _async_write_cycle_action(
+        self, client: BaseBleakClient, action: CycleAction, expected_step: str
+    ) -> None:
+        session = self._evb034_session if client is self._evb034_client else None
+        if session is not None:
+            async with asyncio.timeout(_CYCLE_STATUS_TIMEOUT_SECONDS):
+                while not self._cycle_state_received(action):
+                    self._handle_evb034_update(await session.next_packet())
+        if (
+            not self._has_dashboard_access() or not self.cycle_action_supported(action)
+            or not self._cycle_matches(action)
+            or not self.reading_is_current(CYCLE_READING)
+            or (action is CycleAction.ADVANCE and self._cycle.step != expected_step)
+        ):
+            raise HomeAssistantError("Fresh valve state does not permit the requested cycle action")
+
+        scheduled = action is CycleAction.SCHEDULE
+        try:
+            if session is not None:
+                cursor = session.notification_cursor
+                started = self._hass.loop.time()
+                await session.send_command(b'{"grl":0}' if scheduled else b'{"grn":0}', retry=False)
+                if scheduled:
+                    return
+                async with asyncio.timeout(_CYCLE_STATUS_TIMEOUT_SECONDS):
+                    while True:
+                        self._handle_evb034_update(await session.next_packet(after=cursor))
+                        keys = ("gra", "dps") if action is CycleAction.START else ("drcp", "dps")
+                        times = self._evb034_received_times
+                        phase_received = any(
+                            self._evb034_received_readings.get(key) is not None
+                            and times.get(key, float("-inf")) >= started for key in keys
+                        )
+                        arrived = action is CycleAction.START or times.get("grs", float("-inf")) >= started
+                        if phase_received and arrived and self._cycle_confirmed(action, expected_step):
+                            return
+            else:
+                payload = bytearray(self._create_request_payload(ValveRequestCommand.DASHBOARD))
+                payload[13:15] = b"RT" if scheduled else b"RN"
+                if not await self._async_send_payload(client, bytes(payload), command_name="cycle action"):
+                    raise HomeAssistantError("The valve cycle request could not be confirmed")
+                if scheduled:
+                    return
+                async with asyncio.timeout(_CYCLE_STATUS_TIMEOUT_SECONDS):
+                    while True:
+                        sent, received = await self._async_request_dashboard(client)
+                        if not sent:
+                            raise HomeAssistantError("Unable to read back the cycle action")
+                        if received and self._cycle_confirmed(action, expected_step):
+                            return
+                        await asyncio.sleep(1)
+        except BaseException:
+            # The valve may have received a command whose response was lost.
+            self._freshness.invalidate({CYCLE_READING}, "cycle action outcome was not confirmed")
+            raise
+
+    def _cycle_state_received(self, action: CycleAction) -> bool:
+        cycle = self._cycle
+        if cycle is None or not self.reading_is_current(CYCLE_READING):
+            return False
+        if cycle.moving is True or (
+            action is not CycleAction.ADVANCE and (cycle.active is True or cycle.soaking is True)
+        ):
+            return True  # Sufficient evidence to reject the action.
+        if cycle.moving is None or cycle.step is None or (
+            supports_soak(self.entity_capabilities) and cycle.soaking is None
+        ):
+            return False
+        return cycle.active is not None or cycle.soaking is True
+
+    def _cycle_confirmed(self, action: CycleAction, expected_step: str) -> bool:
+        cycle = self._cycle
+        if cycle is None:
+            return False
+        if action is CycleAction.START:
+            return cycle.active is True or cycle.soaking is True
+        return cycle.moving is False and cycle.step not in (None, expected_step)
 
     @property
     def authentication_lockout(self) -> bool:
@@ -950,6 +1124,7 @@ class ValveConnection:
                 if complete or previous.valve_type is None
                 else None
             ),
+            valve_type_full=advertisement.valve_type_full if complete else None,
         )
 
     def add_capability_listener(self, listener: Callable[[], None]) -> CALLBACK_TYPE:
@@ -972,6 +1147,7 @@ class ValveConnection:
         *,
         is_twin_valve: bool | None = None,
         valve_type: str | None = None,
+        valve_type_full: int | None = None,
         is_clack_valve: bool | None = None,
         firmware_version: int | None = None,
     ) -> None:
@@ -993,6 +1169,9 @@ class ValveConnection:
                 is_twin_valve if is_twin_valve is not None else previous.is_twin_valve
             ),
             valve_type=valve_type if valve_type is not None else previous.valve_type,
+            valve_type_full=(
+                valve_type_full if valve_type_full is not None else previous.valve_type_full
+            ),
             is_clack_valve=(
                 is_clack_valve if is_clack_valve is not None else previous.is_clack_valve
             ),
@@ -1502,7 +1681,9 @@ class ValveConnection:
             return False
         return True
 
-    async def _async_poll_locked(self, *, display_batch: _DisplayBatch | None = None) -> bool:
+    async def _async_poll_locked(
+        self, *, control: Callable[[BaseBleakClient], Awaitable[None]] | None = None,
+    ) -> bool:
         """Perform a Bluetooth connection cycle for the valve."""
 
         now = dt_util.utcnow()
@@ -1510,7 +1691,7 @@ class ValveConnection:
         if self._authentication_failed:
             return False
         next_connection_time = self._next_connection_time
-        if display_batch is None and next_connection_time is not None and now < next_connection_time:
+        if control is None and next_connection_time is not None and now < next_connection_time:
             remaining = max((next_connection_time - now).total_seconds(), 0)
             _LOGGER.debug(
                 "Skipping poll for %s; retrying after %.1f seconds",
@@ -1588,17 +1769,17 @@ class ValveConnection:
                     self._connection_state_callback(self._address, True)
                 async with asyncio.timeout(POLL_EXCHANGE_TIMEOUT_SECONDS):
                     refreshed = await self._async_fetch_device_information(client)
-                    if display_batch is not None:
+                    if control is not None:
                         if not refreshed:
                             raise HomeAssistantError("Valve did not provide authenticated readings before configuration")
-                        await self._async_write_display_batch(client, display_batch)
+                        await control(client)
             except TimeoutError:
                 owner.invalidate()
-                if display_batch is not None:
-                    raise HomeAssistantError("Display-off configuration timed out; its outcome is unconfirmed") from None
+                if control is not None:
+                    raise HomeAssistantError("Valve control timed out; its outcome is unconfirmed") from None
                 _LOGGER.warning("Reading exchange timed out for valve %s", self._address)
             except Exception as exc:
-                if display_batch is not None:
+                if control is not None:
                     raise HomeAssistantError(str(exc)) from exc
                 _LOGGER.exception(
                     "Error while retrieving extended data from valve %s", self._address
@@ -1743,6 +1924,9 @@ class ValveConnection:
         self._evb034_eligible.clear()
         self._evb034_received_readings.clear()
         self._evb034_received_times.clear()
+        self._evb034_position_changed_at = float("-inf")
+        self._evb034_soak_started_at = float("-inf")
+        self._evb034_soak_ended_at = float("-inf")
         self._evb034_last_update_time = None
         self._evb034_published_time = None
         self._evb034_reading_ready = False
@@ -1885,7 +2069,7 @@ class ValveConnection:
         updated = {**self._evb034_packet, **{key: value for key, value in packet.items()
                                            if value is not None and key not in READING_KEYS}}
         # Only explicit valid values received in this session can establish a
-        # baseline. A later invalid/null delta cannot erase an earlier value.
+        # baseline. An invalid cycle field can clear the corresponding value.
         updated.update(self._evb034_received_readings)
         firmware = integer(updated, "dlf")
         if firmware is None or not 600 <= firmware <= 9999:
@@ -1900,21 +2084,22 @@ class ValveConnection:
         received_at = self._evb034_last_update_time
         if received_at is None or received_at == self._evb034_published_time:
             return False
-        data = decode_dashboard(updated, firmware, clack=is_clack)
-        if not any(getattr(data, field) is not None for field in (
-            "time_hour", "battery_capacity", "present_flow", "water_usage", "peak_flow",
-            "water_hardness", "water_remaining_until_regeneration", "air_recharge", "display_off",
-        )):
+        data = self._decode_evb034_dashboard(updated, firmware, clack=is_clack)
+        present = {key for key, field in READING_FIELDS.items() if getattr(data, field) is not None}
+        if not present and not self._evb034_eligible:
             return False
-        self._evb034_eligible.update(
-            key for key, field in READING_FIELDS.items() if getattr(data, field) is not None
-        )
+        self._evb034_eligible.update(present)
         self._dashboard_data = data
         self._evb034_published_time = received_at
-        self._record_confirmation(received_at)
-        self._freshness.confirm({key: received_at for key in self._evb034_eligible})
+        if present:
+            self._record_confirmation(received_at)
+        confirmations = {
+            key: received_at for key in self._evb034_eligible if key != CYCLE_READING
+        }
+        self._freshness.confirm(confirmations)
+        self._confirm_evb034_cycle(data.cycle)
         self._notify_dashboard_listeners(data)
-        return True
+        return bool(present)
 
     def _observe_evb034_readings(self, client, packet) -> None:
         """Keep the selected session-health policy independent of publication."""
@@ -1933,31 +2118,129 @@ class ValveConnection:
         is_clack = clack == 1 if clack in (0, 1) else self._entity_capabilities.is_clack_valve is True
         times = getattr(packet, "confirmed_at", {})
         advanced = []
-        for key in valid_reading_keys(packet, firmware, clack=is_clack):
+        cycle_received = False
+        changes: dict[str, float] = {}
+        valid = valid_reading_keys(packet, firmware, clack=is_clack)
+        previous_motion_at = self._evb034_received_times.get("grs", float("-inf"))
+        for key in valid | (CYCLE_FIELDS.keys() & packet.keys()):
             received = times.get(key)
             if received is None or received <= self._evb034_received_times.get(key, float("-inf")):
                 continue
-            self._evb034_received_readings[key] = packet[key]
+            value = packet[key] if key in valid else None
+            if key in CYCLE_FIELDS:
+                cycle_received = True
+                previous_value = self._evb034_received_readings.get(key)
+                if previous_value != value:
+                    # The first unit for a step can complete a countdown
+                    # whose value arrived separately.
+                    if key != "drtt" or previous_value is not None:
+                        changes[key] = received
+                    if key == "dps":
+                        if value == 1:
+                            self._evb034_soak_started_at = received
+                        elif previous_value == 1:
+                            self._evb034_soak_ended_at = received
+            self._evb034_received_readings[key] = value
             self._evb034_received_times[key] = received
-            advanced.append(received)
+            if value is not None:
+                advanced.append(received)
+        self._discard_previous_cycle_fields(changes, previous_motion_at)
         if advanced:
             received = max(advanced)
             self._evb034_last_update_time = max(received, self._evb034_last_update_time or received)
-            if not self._evb034_reading_ready:
-                return
-            # This intentionally confirms session liveness for every known
-            # field; it does not prove that each field's producer is healthy.
-            self._freshness.renew_session(self._evb034_eligible, received)
-            baseline = {**identity, **self._evb034_received_readings}
-            data = decode_dashboard(baseline, firmware, clack=is_clack)
-            eligible = {key for key, field in READING_FIELDS.items() if getattr(data, field) is not None}
-            if eligible - self._evb034_eligible or any(
-                not self._freshness.current(key) for key in self._evb034_eligible
+        if not self._evb034_reading_ready or not (advanced or cycle_received):
+            return
+        if advanced:
+            # Valid data establishes session liveness for ordinary readings.
+            self._freshness.renew_session(self._evb034_eligible - {CYCLE_READING}, received)
+        baseline = {**identity, **self._evb034_received_readings}
+        data = self._decode_evb034_dashboard(baseline, firmware, clack=is_clack)
+        eligible = {
+            key for key, field in READING_FIELDS.items()
+            if key != CYCLE_READING and getattr(data, field) is not None
+        }
+        if advanced and (
+            eligible - self._evb034_eligible
+            or any(not self._freshness.current(key)
+                   for key in self._evb034_eligible - {CYCLE_READING})
+            or (cycle_received and not self._evb034_eligible)
+        ):
+            # First availability and recovery publish the latest snapshot
+            # immediately. The recursive observer sees no new receipt.
+            self._handle_evb034_update(packet)
+        elif cycle_received and self._dashboard_data is not None:
+            # Publish cycle changes, including invalidations, independently of
+            # the configured publication cadence for the other readings.
+            was_current = self.reading_is_current(CYCLE_READING)
+            cycle_changed = data.cycle != self._dashboard_data.cycle
+            if cycle_changed:
+                self._dashboard_data = replace(self._dashboard_data, cycle=data.cycle)
+            self._confirm_evb034_cycle(data.cycle)
+            if cycle_changed or was_current != self.reading_is_current(CYCLE_READING):
+                self._notify_dashboard_listeners(self._dashboard_data)
+
+    def _decode_evb034_dashboard(
+        self, packet: dict, firmware: int, *, clack: bool
+    ) -> ValveDashboardData:
+        motion = cycle_value(packet, "grs")
+        if evb034_moving(motion) is False:
+            motion_at = self._evb034_received_times.get("grs", float("-inf"))
+            earliest_arrival = self._evb034_position_changed_at
+            soak_agrees = True
+            if supports_soak(self._entity_capabilities):
+                # Accept matching reports in either order. A stationary report
+                # from before the opposite phase began belongs to an older step.
+                in_soak_position = motion == EVB034_WAITING_IN_BRINE_SOAK
+                soak_agrees = in_soak_position == (cycle_value(packet, "dps") == 1)
+                opposite_phase_started_at = (
+                    self._evb034_soak_ended_at if in_soak_position else self._evb034_soak_started_at
+                )
+                earliest_arrival = max(earliest_arrival, opposite_phase_started_at)
+            if not soak_agrees or motion_at < earliest_arrival:
+                packet = {**packet, "grs": None}
+        return decode_dashboard(packet, firmware, clack=clack, capabilities=self._entity_capabilities)
+
+    def _confirm_evb034_cycle(self, cycle: ValveCycleStatus | None) -> None:
+        if cycle is None:
+            self._evb034_eligible.discard(CYCLE_READING)
+            return
+        self._evb034_eligible.add(CYCLE_READING)
+        received = max(
+            self._evb034_received_times[key] for key in CYCLE_FIELDS
+            if self._evb034_received_readings.get(key) is not None
+        )
+        self._freshness.confirm({CYCLE_READING: received})
+
+    def _discard_previous_cycle_fields(
+        self, changes: dict[str, float], previous_motion_at: float
+    ) -> None:
+        if "drcp" in changes and self._evb034_received_readings.get("drcp") is not None:
+            position_at = changes["drcp"]
+            self._evb034_position_changed_at = position_at
+            # Runtime units belong to the reported position. Fall back to
+            # the new position's options until its own unit arrives.
+            if self._evb034_received_times.get("drtt", position_at) < position_at:
+                self._evb034_received_readings["drtt"] = None
+        # A new phase without a position/time value cannot reuse a previous
+        # phase's position or countdown as the new destination or dwell time.
+        if "gra" in changes or (
+            "grs" in changes and self._evb034_received_readings.get("grs") in EVB034_MOVING
+        ):
+            cutoff = max(changes.get("gra", 0), changes.get("grs", 0))
+            # A position that changed after the prior movement report may
+            # already be the new destination, even when its report came first.
+            if (
+                self._evb034_received_times.get("drcp", cutoff) < cutoff
+                and self._evb034_position_changed_at <= previous_motion_at
             ):
-                # First availability and recovery publish the latest snapshot
-                # immediately, so an old value is never briefly resurrected.
-                # The recursive observer sees no new receipt and does nothing.
-                self._handle_evb034_update(packet)
+                self._evb034_received_readings["drcp"] = None
+        phase_cutoff = max(changes.get(key, 0) for key in ("gra", "grs", "drcp", "dps"))
+        for key, cutoff in (
+            ("drtr", max(phase_cutoff, changes.get("drtt", 0))),
+            ("drst", phase_cutoff),
+        ):
+            if self._evb034_received_times.get(key, cutoff) < cutoff:
+                self._evb034_received_readings[key] = None
 
     def _invalidate_evb034_session(self, client, reason: str) -> None:
         if client is not self._evb034_client:
@@ -2011,6 +2294,7 @@ class ValveConnection:
             firmware_version=firmware,
             valve_type=updates.get("valve_type"), is_twin_valve=updates.get("is_twin_valve"),
             is_clack_valve=updates.get("is_clack_valve"),
+            valve_type_full=valve_type,
         )
         serial_a, serial_b = packet.get("dlsa"), packet.get("dlsb")
         if all(type(value) is int and 0 <= value <= 0x7FFFFFFFFFFFFFFF
@@ -2827,7 +3111,9 @@ class ValveConnection:
                 ])
                 changed_fields = [
                     field.name for field in fields(dashboard)
-                    if getattr(previous, field.name) != getattr(dashboard, field.name)
+                    # Cycle status is a new interpretation of those wire fields.
+                    if field.name != "cycle"
+                    and getattr(previous, field.name) != getattr(dashboard, field.name)
                 ]
                 if changed_fields:
                     _LOGGER.debug(
@@ -3153,6 +3439,7 @@ class ValveConnection:
                 soak_timer=raw.soak_timer if has_soak else 0,
                 is_in_aeration=valve_type == "NitroProSidekick" and raw.is_in_aeration,
             )
+            dashboard.cycle = evb019_cycle(dashboard, self._entity_capabilities)
         except Exception:  # pragma: no cover - parsing errors should be rare
             _LOGGER.exception(
                 "Error while parsing Dashboard response from valve %s", self._address
@@ -3330,6 +3617,7 @@ class ValveConnection:
                 firmware_version=self._device_list_firmware_version,
                 is_twin_valve=self._device_list_is_twin_valve,
                 valve_type=self._device_list_valve_type,
+                valve_type_full=packet[3] if self._device_list_valve_type is not None else None,
             )
 
         serial_number = self._extract_serial_number(packet)
