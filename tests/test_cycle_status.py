@@ -4,6 +4,7 @@ import pytest
 
 from homeassistant.const import EVENT_STATE_CHANGED
 from homeassistant.core import callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 
 from custom_components.chandler_legacy_view.const import DATA_CONNECTION_MANAGER, DOMAIN
@@ -160,6 +161,60 @@ async def test_evb034_partial_cycle_updates_cannot_present_previous_step_as_arri
     valve.dashboards.append(frames({"gra": 1, "grs": 5, "drcp": 3, "drtr": 9, "drtt": 0}))
     await clock.until(lambda: step().state == "rapid_rinse")
     assert remaining().state == "9"
+
+
+@pytest.mark.parametrize("separate_movement", [True, False])
+async def test_evb034_new_position_waits_for_its_own_movement_evidence(
+    hass, runtime_factory, bluetooth_io, transport, clock, separate_movement,
+):
+    connection, valve = await setup_cycle_valve(
+        hass, runtime_factory, bluetooth_io, transport, firmware=622,
+    )
+    await connection.async_set_persistent_connection_enabled(True)
+    valve.dashboards.append(frames({"gra": 1, "grs": 5, "drcp": 2}))
+    await clock.run(connection.async_refresh())
+    await hass.async_block_till_done()
+    step = lambda: cycle_state(hass, "sensor", "current_cycle")
+    movement = lambda: cycle_state(hass, "binary_sensor", "valve_moving")
+    assert step().state == "rest"
+
+    # A destination received before the motion field must not inherit Rest's
+    # stationary state. Preserve the destination for the subsequent update.
+    valve.dashboards.append(frames({"drcp": 3}))
+    await clock.until(lambda: step().state == "unavailable")
+    assert movement().state == "unavailable"
+    if separate_movement:
+        valve.dashboards.append(frames({"grs": 1}))
+        await clock.until(lambda: movement().state == "on")
+        assert movement().attributes.get("moving_to") == "rapid_rinse"
+        assert step().state == "unavailable"
+
+    # A fresh stationary report can have the same wire value as the retained
+    # report for Rest. Its receipt confirms arrival even without a new position.
+    valve.dashboards.append(frames({"grs": 5}))
+    await clock.until(lambda: step().state == "rapid_rinse")
+    assert movement().state == "off"
+
+
+async def test_evb034_invalid_cycle_packets_do_not_confirm_a_manual_refresh(
+    hass, runtime_factory, bluetooth_io, transport, clock,
+):
+    connection, valve = await setup_cycle_valve(
+        hass, runtime_factory, bluetooth_io, transport, firmware=622,
+    )
+    await connection.async_set_persistent_connection_enabled(True)
+    await connection.async_set_persistent_poll_interval(300)
+    valve.dashboards.append(frames({"gpf": 100}))
+    await clock.run(connection.async_refresh())
+    before = connection.last_success
+    assert before is not None
+
+    # Keep a retained flow reading in the session while only invalid cycle
+    # fields arrive. Those packets must not make the old flow look freshly read.
+    valve.dashboards.extend([frames({"gra": 3, "grs": 91})] * 20)
+    with pytest.raises(HomeAssistantError, match="timed out|did not return fresh readings"):
+        await clock.run(connection.async_refresh())
+    assert connection.last_success == before
 
 
 async def test_clack_filter_uses_live_dashboard_step_names(

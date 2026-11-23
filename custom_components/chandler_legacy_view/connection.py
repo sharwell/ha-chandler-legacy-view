@@ -43,13 +43,17 @@ from .const import (
     PERSISTENT_EXCHANGE_TIMEOUT_SECONDS,
 )
 from .ble_operations import OwnedBluetoothOperations
-from .cycle import CYCLE_READING, EVB034_MOVING, CycleAction, cycle_program, evb019_cycle
+from .cycle import (
+    CYCLE_READING, EVB034_MOVING, CycleAction, cycle_program, evb019_cycle,
+    evb034_moving, supports_soak,
+)
 from .device_registry import async_update_device_serial_number
 from .discovery import ValveDiscoveryChange, ValveDiscoveryManager, _map_valve_type
 from .models import ValveAdvertisement, ValveCapabilities, ValveCycleStatus, ValveDashboardData
 from .evb034 import Evb034ProtocolError, Evb034Session
 from .evb034_data import (
-    CYCLE_FIELDS, READING_FIELDS, READING_KEYS, decode_dashboard, integer, valid_reading_keys,
+    CYCLE_FIELDS, READING_FIELDS, READING_KEYS, cycle_value, decode_dashboard, integer,
+    valid_reading_keys,
 )
 from .freshness import FreshnessPolicy, ReadingFreshness, READINGS, RECOVERY_ALLOWANCE
 from .preferences import ValvePreferences, PERSISTENT_ENABLED, PERSISTENT_INTERVAL, persistent_interval
@@ -344,6 +348,7 @@ class ValveConnection:
         self._evb034_eligible: set[str] = set()
         self._evb034_received_readings: dict = {}
         self._evb034_received_times: dict[str, float] = {}
+        self._evb034_position_changed_at = float("-inf")
         self._evb034_last_update_time: float | None = None
         self._evb034_published_time: float | None = None
         self._evb034_reading_ready = False
@@ -668,9 +673,11 @@ class ValveConnection:
             return False
         if action is CycleAction.ADVANCE:
             return cycle.active is True or cycle.soaking is True
+        evb034 = self._evb034_client is not None or self._advertisement.model == "Evb034"
+        if evb034 and supports_soak(self.entity_capabilities) and cycle.soaking is None:
+            return False
         if (
-            action is CycleAction.START and self._evb034_client is None
-            and self._advertisement.model != "Evb034"
+            action is CycleAction.START and not evb034
             and (self._dashboard_data.bypass_setting_enabled
                  or self._dashboard_data.shutoff_setting_enabled)
         ):
@@ -713,7 +720,7 @@ class ValveConnection:
         session = self._evb034_session if client is self._evb034_client else None
         if session is not None:
             async with asyncio.timeout(_CYCLE_STATUS_TIMEOUT_SECONDS):
-                while not self._cycle_state_received():
+                while not self._cycle_state_received(action):
                     self._handle_evb034_update(await session.next_packet())
         if (
             not self._has_dashboard_access() or not self.cycle_action_supported(action)
@@ -736,7 +743,10 @@ class ValveConnection:
                         self._handle_evb034_update(await session.next_packet(after=cursor))
                         keys = ("gra", "dps") if action is CycleAction.START else ("drcp", "dps")
                         times = self._evb034_received_times
-                        phase_received = any(times.get(key, float("-inf")) >= started for key in keys)
+                        phase_received = any(
+                            self._evb034_received_readings.get(key) is not None
+                            and times.get(key, float("-inf")) >= started for key in keys
+                        )
                         arrived = action is CycleAction.START or times.get("grs", float("-inf")) >= started
                         if phase_received and arrived and self._cycle_confirmed(action, expected_step):
                             return
@@ -760,12 +770,20 @@ class ValveConnection:
             self._freshness.invalidate({CYCLE_READING}, "cycle action outcome was not confirmed")
             raise
 
-    def _cycle_state_received(self) -> bool:
+    def _cycle_state_received(self, action: CycleAction) -> bool:
         cycle = self._cycle
-        return bool(
-            cycle is not None and self.reading_is_current(CYCLE_READING)
-            and (cycle.active is not None or cycle.soaking is True)
-            and (cycle.moving is True or (cycle.moving is False and cycle.step is not None))
+        if cycle is None or not self.reading_is_current(CYCLE_READING):
+            return False
+        if cycle.moving is True:
+            return True  # Sufficient evidence to reject the action.
+        if cycle.moving is None or cycle.step is None:
+            return False
+        if cycle.active is True or cycle.soaking is True:
+            return True
+        return cycle.active is False and (
+            action is CycleAction.ADVANCE
+            or cycle.soaking is False
+            or not supports_soak(self.entity_capabilities)
         )
 
     def _cycle_confirmed(self, action: CycleAction, expected_step: str) -> bool:
@@ -1906,6 +1924,7 @@ class ValveConnection:
         self._evb034_eligible.clear()
         self._evb034_received_readings.clear()
         self._evb034_received_times.clear()
+        self._evb034_position_changed_at = float("-inf")
         self._evb034_last_update_time = None
         self._evb034_published_time = None
         self._evb034_reading_ready = False
@@ -2048,7 +2067,7 @@ class ValveConnection:
         updated = {**self._evb034_packet, **{key: value for key, value in packet.items()
                                            if value is not None and key not in READING_KEYS}}
         # Only explicit valid values received in this session can establish a
-        # baseline. A later invalid/null delta cannot erase an earlier value.
+        # baseline. An invalid cycle field can clear the corresponding value.
         updated.update(self._evb034_received_readings)
         firmware = integer(updated, "dlf")
         if firmware is None or not 600 <= firmware <= 9999:
@@ -2063,9 +2082,7 @@ class ValveConnection:
         received_at = self._evb034_last_update_time
         if received_at is None or received_at == self._evb034_published_time:
             return False
-        data = decode_dashboard(
-            updated, firmware, clack=is_clack, capabilities=self._entity_capabilities,
-        )
+        data = self._decode_evb034_dashboard(updated, firmware, clack=is_clack)
         present = {key for key, field in READING_FIELDS.items() if getattr(data, field) is not None}
         if not present and not self._evb034_eligible:
             return False
@@ -2102,6 +2119,7 @@ class ValveConnection:
         cycle_received = False
         changes: dict[str, float] = {}
         valid = valid_reading_keys(packet, firmware, clack=is_clack)
+        previous_motion_at = self._evb034_received_times.get("grs", float("-inf"))
         for key in valid | (CYCLE_FIELDS.keys() & packet.keys()):
             received = times.get(key)
             if received is None or received <= self._evb034_received_times.get(key, float("-inf")):
@@ -2113,43 +2131,54 @@ class ValveConnection:
                     changes[key] = received
             self._evb034_received_readings[key] = value
             self._evb034_received_times[key] = received
-            advanced.append(received)
-        self._discard_previous_cycle_fields(changes)
+            if value is not None:
+                advanced.append(received)
+        self._discard_previous_cycle_fields(changes, previous_motion_at)
         if advanced:
             received = max(advanced)
             self._evb034_last_update_time = max(received, self._evb034_last_update_time or received)
-            if not self._evb034_reading_ready:
-                return
-            # This intentionally confirms session liveness for every known
-            # field; it does not prove that each field's producer is healthy.
+        if not self._evb034_reading_ready or not (advanced or cycle_received):
+            return
+        if advanced:
+            # Valid data establishes session liveness for ordinary readings.
             self._freshness.renew_session(self._evb034_eligible - {CYCLE_READING}, received)
-            baseline = {**identity, **self._evb034_received_readings}
-            data = decode_dashboard(
-                baseline, firmware, clack=is_clack, capabilities=self._entity_capabilities,
-            )
-            eligible = {
-                key for key, field in READING_FIELDS.items()
-                if key != CYCLE_READING and getattr(data, field) is not None
-            }
-            if (
-                eligible - self._evb034_eligible
-                or any(not self._freshness.current(key)
-                       for key in self._evb034_eligible - {CYCLE_READING})
-                or (cycle_received and not self._evb034_eligible)
-            ):
-                # First availability and recovery publish the latest snapshot
-                # immediately, so an old value is never briefly resurrected.
-                # The recursive observer sees no new receipt and does nothing.
-                self._handle_evb034_update(packet)
-            elif cycle_received:
-                # Publish changes to the live cycle without changing the
-                # configured publication cadence for the other readings.
-                previous = self._dashboard_data.cycle
-                if data.cycle != previous:
-                    self._dashboard_data = replace(self._dashboard_data, cycle=data.cycle)
-                self._confirm_evb034_cycle(data.cycle)
-                if data.cycle != previous:
-                    self._notify_dashboard_listeners(self._dashboard_data)
+        baseline = {**identity, **self._evb034_received_readings}
+        data = self._decode_evb034_dashboard(baseline, firmware, clack=is_clack)
+        eligible = {
+            key for key, field in READING_FIELDS.items()
+            if key != CYCLE_READING and getattr(data, field) is not None
+        }
+        if advanced and (
+            eligible - self._evb034_eligible
+            or any(not self._freshness.current(key)
+                   for key in self._evb034_eligible - {CYCLE_READING})
+            or (cycle_received and not self._evb034_eligible)
+        ):
+            # First availability and recovery publish the latest snapshot
+            # immediately. The recursive observer sees no new receipt.
+            self._handle_evb034_update(packet)
+        elif cycle_received and self._dashboard_data is not None:
+            # Publish cycle changes, including invalidations, independently of
+            # the configured publication cadence for the other readings.
+            previous = self._dashboard_data.cycle
+            if data.cycle != previous:
+                self._dashboard_data = replace(self._dashboard_data, cycle=data.cycle)
+            self._confirm_evb034_cycle(data.cycle)
+            if data.cycle != previous:
+                self._notify_dashboard_listeners(self._dashboard_data)
+
+    def _decode_evb034_dashboard(
+        self, packet: dict, firmware: int, *, clack: bool
+    ) -> ValveDashboardData:
+        # A new position can arrive before its movement update. Earlier
+        # stationary evidence cannot establish arrival at the new position.
+        motion_at = self._evb034_received_times.get("grs", float("-inf"))
+        if (
+            evb034_moving(cycle_value(packet, "grs")) is False
+            and motion_at < self._evb034_position_changed_at
+        ):
+            packet = {**packet, "grs": None}
+        return decode_dashboard(packet, firmware, clack=clack, capabilities=self._entity_capabilities)
 
     def _confirm_evb034_cycle(self, cycle: ValveCycleStatus | None) -> None:
         if cycle is None:
@@ -2162,14 +2191,23 @@ class ValveConnection:
         )
         self._freshness.confirm({CYCLE_READING: received})
 
-    def _discard_previous_cycle_fields(self, changes: dict[str, float]) -> None:
+    def _discard_previous_cycle_fields(
+        self, changes: dict[str, float], previous_motion_at: float
+    ) -> None:
+        if "drcp" in changes and self._evb034_received_readings.get("drcp") is not None:
+            self._evb034_position_changed_at = changes["drcp"]
         # A new phase without a position/time value cannot reuse a previous
         # phase's position or countdown as the new destination or dwell time.
         if "gra" in changes or (
             "grs" in changes and self._evb034_received_readings.get("grs") in EVB034_MOVING
         ):
             cutoff = max(changes.get("gra", 0), changes.get("grs", 0))
-            if self._evb034_received_times.get("drcp", cutoff) < cutoff:
+            # A position that changed after the prior movement report may
+            # already be the new destination, even when its report came first.
+            if (
+                self._evb034_received_times.get("drcp", cutoff) < cutoff
+                and self._evb034_position_changed_at <= previous_motion_at
+            ):
                 self._evb034_received_readings["drcp"] = None
         cutoff = max(changes.get(key, 0) for key in ("gra", "grs", "drcp", "dps"))
         for key in ("drtr", "drst"):

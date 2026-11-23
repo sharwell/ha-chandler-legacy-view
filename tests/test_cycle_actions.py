@@ -190,6 +190,47 @@ async def test_evb034_transport_ack_and_unrelated_readings_do_not_confirm_start(
     assert cycle_state(hass, "binary_sensor", "regeneration_active").state == "unavailable"
 
 
+@pytest.mark.parametrize("button", ["regenerate_now", "regenerate_at_next_scheduled_time"])
+async def test_evb034_idle_action_waits_for_fresh_soak_status(
+    hass, runtime_factory, bluetooth_io, transport, clock, button,
+):
+    connection, valve = await setup_cycle_valve(
+        hass, runtime_factory, bluetooth_io, transport, firmware=622, valve_type=1,
+    )
+    await connection.async_set_persistent_connection_enabled(True)
+    idle_fields = {"gra": 0, "grs": 0, "drcp": 0}
+    valve.dashboards.append(frames({**idle_fields, "dps": 0}))
+    await clock.run(connection.async_refresh())
+    await hass.async_block_till_done()
+    assert hass.states.get(button_id(hass, button)).state != "unavailable"
+
+    # The new write session receives the soak flag after the other fields.
+    # The Now command would advance this soak instead of starting a cycle.
+    valve.dashboards.extend([frames(idle_fields), frames({"dps": 1, "drst": 5})])
+    with pytest.raises(HomeAssistantError, match="Fresh valve state"):
+        await clock.run(press(hass, button))
+    assert valve.cycle_writes == []
+
+
+async def test_evb034_start_proceeds_after_split_update_confirms_soak_is_inactive(
+    hass, runtime_factory, bluetooth_io, transport, clock,
+):
+    connection, valve = await setup_cycle_valve(
+        hass, runtime_factory, bluetooth_io, transport, firmware=622, valve_type=1,
+    )
+    await connection.async_set_persistent_connection_enabled(True)
+    idle_fields = {"gra": 0, "grs": 0, "drcp": 0}
+    valve.dashboards.append(frames({**idle_fields, "dps": 0}))
+    await clock.run(connection.async_refresh())
+    await hass.async_block_till_done()
+
+    valve.dashboards.extend([frames(idle_fields), frames({"dps": 0})])
+    valve.cycle_replies.append(cycle_reply(622, 1))
+    await clock.run(press(hass, "regenerate_now"))
+    assert valve.cycle_writes == [b'{"grn":0}']
+    assert cycle_state(hass, "sensor", "current_cycle").state == "backwash"
+
+
 async def test_cancelling_a_sent_action_and_refreshing_does_not_repeat_it(
     hass, runtime_factory, bluetooth_io, transport, clock,
 ):

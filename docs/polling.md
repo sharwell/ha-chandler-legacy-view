@@ -166,6 +166,8 @@ Air Draw, which can differ from the label in the cycle timing screen.
 Use **Regeneration/backwash active** to tell when the valve has finished.
 Fresh Evb034 cycle notifications can publish cycle changes between regular
 Dashboard updates. Cycle readings require their own updates to stay fresh.
+When an Evb034 reports a new position before its movement state, the current
+step is unavailable until the valve confirms arrival.
 
 ### Manual cycle controls
 
@@ -176,6 +178,8 @@ the valve again on the authenticated connection before sending either
 command. If the requested action no longer matches the valve's state,
 the press fails. The integration sends the action once and checks the
 reported cycle for the resulting change.
+On Evb034 programs with brine soak, an idle action also requires a fresh
+report that soak is inactive.
 
 #### Commissioning a backwashing filter
 
@@ -247,7 +251,9 @@ loss of session reading activity, not every individual producer failure.
   buffering and coalescing.
 - A complete validated packet with a usable known reading component renews
   eligible baselines. Metadata, ACKs, keepalives, null-only packets, and invalid
-  data do not. A null or invalid field does not erase an existing valid baseline.
+  data do not. Ordinary readings keep their last valid baseline after a
+  null or invalid field. An invalid cycle field clears its value and needs
+  a subsequent valid report to recover.
 - Silence uses the maximum-age and due-failure rules above. Access loss,
   receiver failure, or a detected unexpected disconnect invalidates eligibility;
   a new authenticated connection starts with no eligible fields. Late old
