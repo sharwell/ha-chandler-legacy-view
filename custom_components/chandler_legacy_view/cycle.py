@@ -6,7 +6,8 @@ from .models import ValveCapabilities, ValveCycleStatus, ValveDashboardData
 
 CYCLE_READING = "cycle_status"
 EVB034_MOVING = frozenset({1, 2, 6, 7, 9, 11})
-_EVB034_STATIONARY = frozenset({0, 5, 8, 10})
+EVB034_WAITING_IN_BRINE_SOAK = 10
+_EVB034_STATIONARY = frozenset({0, 5, 8, EVB034_WAITING_IN_BRINE_SOAK})
 
 
 class CycleAction(StrEnum):

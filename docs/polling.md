@@ -166,8 +166,10 @@ Air Draw, which can differ from the label in the cycle timing screen.
 Use **Regeneration/backwash active** to tell when the valve has finished.
 Fresh Evb034 cycle notifications can publish cycle changes between regular
 Dashboard updates. Cycle readings require their own updates to stay fresh.
-When an Evb034 reports a new position before its movement state, the current
-step is unavailable until the valve confirms arrival.
+When an Evb034 reports a new position or a change in brine-soak state before
+its movement state, the current step is unavailable until the valve confirms
+arrival. A countdown for a new position uses that position's options or its
+reported time unit. If neither is available, the countdown is unavailable.
 
 ### Manual cycle controls
 

@@ -44,8 +44,8 @@ from .const import (
 )
 from .ble_operations import OwnedBluetoothOperations
 from .cycle import (
-    CYCLE_READING, EVB034_MOVING, CycleAction, cycle_program, evb019_cycle,
-    evb034_moving, supports_soak,
+    CYCLE_READING, EVB034_MOVING, EVB034_WAITING_IN_BRINE_SOAK, CycleAction,
+    cycle_program, evb019_cycle, evb034_moving, supports_soak,
 )
 from .device_registry import async_update_device_serial_number
 from .discovery import ValveDiscoveryChange, ValveDiscoveryManager, _map_valve_type
@@ -349,6 +349,7 @@ class ValveConnection:
         self._evb034_received_readings: dict = {}
         self._evb034_received_times: dict[str, float] = {}
         self._evb034_position_changed_at = float("-inf")
+        self._evb034_soak_changed_at = float("-inf")
         self._evb034_last_update_time: float | None = None
         self._evb034_published_time: float | None = None
         self._evb034_reading_ready = False
@@ -1925,6 +1926,7 @@ class ValveConnection:
         self._evb034_received_readings.clear()
         self._evb034_received_times.clear()
         self._evb034_position_changed_at = float("-inf")
+        self._evb034_soak_changed_at = float("-inf")
         self._evb034_last_update_time = None
         self._evb034_published_time = None
         self._evb034_reading_ready = False
@@ -2127,8 +2129,14 @@ class ValveConnection:
             value = packet[key] if key in valid else None
             if key in CYCLE_FIELDS:
                 cycle_received = True
-                if self._evb034_received_readings.get(key) != value:
-                    changes[key] = received
+                previous_value = self._evb034_received_readings.get(key)
+                if previous_value != value:
+                    # The first unit for a step can complete a countdown
+                    # whose value arrived separately.
+                    if key != "drtt" or previous_value is not None:
+                        changes[key] = received
+                    if key == "dps" and 1 in (previous_value, value):
+                        self._evb034_soak_changed_at = received
             self._evb034_received_readings[key] = value
             self._evb034_received_times[key] = received
             if value is not None:
@@ -2170,13 +2178,19 @@ class ValveConnection:
     def _decode_evb034_dashboard(
         self, packet: dict, firmware: int, *, clack: bool
     ) -> ValveDashboardData:
-        # A new position can arrive before its movement update. Earlier
-        # stationary evidence cannot establish arrival at the new position.
+        # Position and soak updates can precede motion. Require stationary
+        # evidence for the resulting step, and never treat a soak dwell
+        # indication as stationary in the previous step.
+        motion = cycle_value(packet, "grs")
         motion_at = self._evb034_received_times.get("grs", float("-inf"))
-        if (
-            evb034_moving(cycle_value(packet, "grs")) is False
-            and motion_at < self._evb034_position_changed_at
-        ):
+        step_changed_at = self._evb034_position_changed_at
+        soak_state_conflicts = False
+        if supports_soak(self._entity_capabilities):
+            step_changed_at = max(step_changed_at, self._evb034_soak_changed_at)
+            soak_state_conflicts = (
+                motion == EVB034_WAITING_IN_BRINE_SOAK and cycle_value(packet, "dps") != 1
+            )
+        if soak_state_conflicts or (evb034_moving(motion) is False and motion_at < step_changed_at):
             packet = {**packet, "grs": None}
         return decode_dashboard(packet, firmware, clack=clack, capabilities=self._entity_capabilities)
 
@@ -2195,7 +2209,12 @@ class ValveConnection:
         self, changes: dict[str, float], previous_motion_at: float
     ) -> None:
         if "drcp" in changes and self._evb034_received_readings.get("drcp") is not None:
-            self._evb034_position_changed_at = changes["drcp"]
+            position_at = changes["drcp"]
+            self._evb034_position_changed_at = position_at
+            # Runtime units belong to the reported position. Fall back to
+            # the new position's options until its own unit arrives.
+            if self._evb034_received_times.get("drtt", position_at) < position_at:
+                self._evb034_received_readings["drtt"] = None
         # A new phase without a position/time value cannot reuse a previous
         # phase's position or countdown as the new destination or dwell time.
         if "gra" in changes or (
@@ -2209,8 +2228,11 @@ class ValveConnection:
                 and self._evb034_position_changed_at <= previous_motion_at
             ):
                 self._evb034_received_readings["drcp"] = None
-        cutoff = max(changes.get(key, 0) for key in ("gra", "grs", "drcp", "dps"))
-        for key in ("drtr", "drst"):
+        phase_cutoff = max(changes.get(key, 0) for key in ("gra", "grs", "drcp", "dps"))
+        for key, cutoff in (
+            ("drtr", max(phase_cutoff, changes.get("drtt", 0))),
+            ("drst", phase_cutoff),
+        ):
             if self._evb034_received_times.get(key, cutoff) < cutoff:
                 self._evb034_received_readings[key] = None
 

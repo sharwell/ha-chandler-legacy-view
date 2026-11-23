@@ -196,6 +196,112 @@ async def test_evb034_new_position_waits_for_its_own_movement_evidence(
     assert movement().state == "off"
 
 
+async def test_evb034_brine_soak_entry_and_exit_wait_for_fresh_movement_evidence(
+    hass, runtime_factory, bluetooth_io, transport, clock,
+):
+    connection, valve = await setup_cycle_valve(
+        hass, runtime_factory, bluetooth_io, transport, firmware=622, valve_type=1,
+    )
+    await connection.async_set_persistent_connection_enabled(True)
+    valve.dashboards.append(frames({"gra": 0, "grs": 0, "drcp": 0, "dps": 0}))
+    await clock.run(connection.async_refresh())
+    await hass.async_block_till_done()
+    step = lambda: cycle_state(hass, "sensor", "current_cycle")
+    movement = lambda: cycle_state(hass, "binary_sensor", "valve_moving")
+    start = lambda: cycle_state(hass, "button", "regenerate_now")
+    advance = lambda: cycle_state(hass, "button", "advance_cycle")
+    assert step().state == "service"
+
+    # The soak flag can arrive while the motion report still describes Service.
+    valve.dashboards.append(frames({"dps": 1, "drst": 5}))
+    await clock.until(lambda: step().state == "unavailable")
+    assert movement().state == advance().state == "unavailable"
+    valve.dashboards.append(frames({"grs": 9}))
+    await clock.until(lambda: movement().state == "on")
+    assert movement().attributes["moving_to"] == "brine_soak"
+    assert step().state == "unavailable"
+    valve.dashboards.append(frames({"grs": 10, "drst": 5}))
+    await clock.until(lambda: step().state == "brine_soak")
+    assert advance().state != "unavailable"
+
+    # When soak ends before the movement notification, the old dwell report
+    # cannot show the valve back in Service or make Start available.
+    valve.dashboards.append(frames({"dps": 0}))
+    await clock.until(lambda: step().state == "unavailable")
+    assert movement().state == start().state == "unavailable"
+    valve.dashboards.append(frames({"grs": 0, "drcp": 0}))
+    await clock.until(lambda: step().state == "service")
+    assert start().state != "unavailable"
+
+
+async def test_evb034_soak_dwell_with_delayed_soak_flag_cannot_report_service(
+    hass, runtime_factory, bluetooth_io, transport, clock,
+):
+    connection, valve = await setup_cycle_valve(
+        hass, runtime_factory, bluetooth_io, transport, firmware=622, valve_type=1,
+    )
+    await connection.async_set_persistent_connection_enabled(True)
+    valve.dashboards.append(frames({"gra": 0, "grs": 0, "drcp": 0, "dps": 0}))
+    await clock.run(connection.async_refresh())
+    await hass.async_block_till_done()
+    assert cycle_state(hass, "sensor", "current_cycle").state == "service"
+
+    # WaitingInBrineSoak is stationary in soak even if the separate flag
+    # still says inactive. It cannot confirm the previous Service position.
+    valve.dashboards.append(frames({"grs": 10}))
+    await clock.until(lambda: cycle_state(hass, "sensor", "current_cycle").state == "unavailable")
+    assert cycle_state(hass, "button", "regenerate_now").state == "unavailable"
+    valve.dashboards.append(frames({"dps": 1, "grs": 10}))
+    await clock.until(lambda: cycle_state(hass, "sensor", "current_cycle").state == "brine_soak")
+
+
+@pytest.mark.parametrize("position_options", [True, False])
+async def test_evb034_new_position_uses_its_own_timer_unit(
+    hass, runtime_factory, bluetooth_io, transport, clock, position_options,
+):
+    connection, valve = await setup_cycle_valve(
+        hass, runtime_factory, bluetooth_io, transport, firmware=622, valve_type=10,
+    )
+    await connection.async_set_persistent_connection_enabled(True)
+    decompress = {"gra": 1, "grs": 5, "drcp": 1, "drtr": 44, "drtt": 0}
+    if position_options:
+        # Position 1 uses seconds. Position 3 (Backwash) uses minutes.
+        decompress["aspo"] = [0, 8, 8, 0, 0, 0, 0]
+    valve.dashboards.append(frames(decompress))
+    await clock.run(connection.async_refresh())
+    await hass.async_block_till_done()
+    step = lambda: cycle_state(hass, "sensor", "current_cycle")
+    remaining = lambda: cycle_state(hass, "sensor", "cycle_time_remaining")
+    assert (step().state, remaining().state) == ("decompress", "44")
+
+    valve.dashboards.append(frames({"drcp": 3, "grs": 5, "drtr": 4}))
+    await clock.until(lambda: step().state == "backwash")
+    assert remaining().state == ("240" if position_options else "unavailable")
+    valve.dashboards.append(frames({"drtt": 1}))
+    await clock.until(lambda: remaining().state == "240")
+
+
+async def test_evb034_early_timer_unit_change_does_not_rescale_previous_value(
+    hass, runtime_factory, bluetooth_io, transport, clock,
+):
+    connection, valve = await setup_cycle_valve(
+        hass, runtime_factory, bluetooth_io, transport, firmware=622, valve_type=10,
+    )
+    await connection.async_set_persistent_connection_enabled(True)
+    valve.dashboards.append(frames({"gra": 1, "grs": 5, "drcp": 1, "drtr": 44, "drtt": 0}))
+    await clock.run(connection.async_refresh())
+    await hass.async_block_till_done()
+    remaining = lambda: cycle_state(hass, "sensor", "cycle_time_remaining")
+    assert remaining().state == "44"
+
+    # Receiving minutes before the next countdown does not turn the old
+    # 44-second estimate into 44 minutes.
+    valve.dashboards.append(frames({"drtt": 1}))
+    await clock.until(lambda: remaining().state == "unavailable")
+    valve.dashboards.append(frames({"drcp": 3, "grs": 5, "drtr": 4, "drtt": 1}))
+    await clock.until(lambda: remaining().state == "240")
+
+
 async def test_evb034_invalid_cycle_packets_do_not_confirm_a_manual_refresh(
     hass, runtime_factory, bluetooth_io, transport, clock,
 ):
