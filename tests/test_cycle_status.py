@@ -251,8 +251,39 @@ async def test_evb034_soak_dwell_with_delayed_soak_flag_cannot_report_service(
     valve.dashboards.append(frames({"grs": 10}))
     await clock.until(lambda: cycle_state(hass, "sensor", "current_cycle").state == "unavailable")
     assert cycle_state(hass, "button", "regenerate_now").state == "unavailable"
-    valve.dashboards.append(frames({"dps": 1, "grs": 10}))
-    await clock.until(lambda: cycle_state(hass, "sensor", "current_cycle").state == "brine_soak")
+    valve.dashboards.append(frames({"dps": 1, "drst": 5}))
+    await clock.until(lambda: cycle_state(hass, "binary_sensor", "brine_soak_active").state == "on")
+    assert cycle_state(hass, "sensor", "current_cycle").state == "brine_soak"
+    assert cycle_state(hass, "sensor", "cycle_time_remaining").state == "300"
+    assert cycle_state(hass, "button", "advance_cycle").state != "unavailable"
+
+
+async def test_evb034_arrival_outside_soak_waits_for_the_delayed_soak_flag(
+    hass, runtime_factory, bluetooth_io, transport, clock,
+):
+    connection, valve = await setup_cycle_valve(
+        hass, runtime_factory, bluetooth_io, transport, firmware=622, valve_type=1,
+    )
+    await connection.async_set_persistent_connection_enabled(True)
+    valve.dashboards.append(frames({"gra": 1, "grs": 10, "drcp": 0, "dps": 1}))
+    await clock.run(connection.async_refresh())
+    await hass.async_block_till_done()
+    step = lambda: cycle_state(hass, "sensor", "current_cycle").state
+    movement = lambda: cycle_state(hass, "binary_sensor", "valve_moving").state
+    soaking = lambda: cycle_state(hass, "binary_sensor", "brine_soak_active").state
+    advance = lambda: cycle_state(hass, "button", "advance_cycle").state
+    assert step() == "brine_soak"
+
+    valve.dashboards.append(frames({"grs": 1}))
+    await clock.until(lambda: movement() == "on")
+    # The old soak flag cannot restore Advance after movement to Backwash.
+    valve.dashboards.append(frames({"grs": 5, "drcp": 1}))
+    await clock.until(lambda: movement() != "on")
+    assert step() == advance() == "unavailable"
+    valve.dashboards.append(frames({"dps": 0}))
+    await clock.until(lambda: soaking() == "off")
+    assert step() == "backwash"
+    assert advance() != "unavailable"
 
 
 @pytest.mark.parametrize("position_options", [True, False])

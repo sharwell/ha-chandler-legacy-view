@@ -166,10 +166,11 @@ Air Draw, which can differ from the label in the cycle timing screen.
 Use **Regeneration/backwash active** to tell when the valve has finished.
 Fresh Evb034 cycle notifications can publish cycle changes between regular
 Dashboard updates. Cycle readings require their own updates to stay fresh.
-When an Evb034 reports a new position or a change in brine-soak state before
-its movement state, the current step is unavailable until the valve confirms
-arrival. A countdown for a new position uses that position's options or its
-reported time unit. If neither is available, the countdown is unavailable.
+When an Evb034 reports a new position, the current step is unavailable until
+the valve confirms arrival. For brine-soak transitions, the soak flag and
+stationary movement state must agree. They can arrive in either order. A
+countdown for a new position uses that position's options or its reported
+time unit. If neither is available, the countdown is unavailable.
 
 ### Manual cycle controls
 
@@ -180,8 +181,8 @@ the valve again on the authenticated connection before sending either
 command. If the requested action no longer matches the valve's state,
 the press fails. The integration sends the action once and checks the
 reported cycle for the resulting change.
-On Evb034 programs with brine soak, an idle action also requires a fresh
-report that soak is inactive.
+On Evb034 programs with brine soak, the fresh state check includes the soak
+flag. An idle action requires the flag to be off.
 
 #### Commissioning a backwashing filter
 

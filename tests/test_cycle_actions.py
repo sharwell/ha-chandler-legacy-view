@@ -231,6 +231,34 @@ async def test_evb034_start_proceeds_after_split_update_confirms_soak_is_inactiv
     assert cycle_state(hass, "sensor", "current_cycle").state == "backwash"
 
 
+@pytest.mark.parametrize("soaking", [False, True])
+async def test_evb034_advance_checks_split_soak_status_before_sending(
+    hass, runtime_factory, bluetooth_io, transport, clock, soaking,
+):
+    connection, valve = await setup_cycle_valve(
+        hass, runtime_factory, bluetooth_io, transport, firmware=622, valve_type=1,
+    )
+    await connection.async_set_persistent_connection_enabled(True)
+    backwash = {"gra": 1, "grs": 5, "drcp": 1}
+    valve.dashboards.append(frames({**backwash, "dps": 0}))
+    await clock.run(connection.async_refresh())
+    await hass.async_block_till_done()
+    assert cycle_state(hass, "sensor", "current_cycle").state == "backwash"
+
+    # The new session reports the old step before the separate soak flag.
+    soak_report = {"dps": 1, "grs": 10} if soaking else {"dps": 0}
+    valve.dashboards.extend([frames(backwash), frames(soak_report)])
+    if soaking:
+        with pytest.raises(HomeAssistantError, match="Fresh valve state"):
+            await clock.run(press(hass, "advance_cycle"))
+        assert valve.cycle_writes == []
+    else:
+        valve.cycle_replies.append(frames({"drcp": 2, "grs": 5, "dps": 0}))
+        await clock.run(press(hass, "advance_cycle"))
+        assert valve.cycle_writes == [b'{"grn":0}']
+        assert cycle_state(hass, "sensor", "current_cycle").state == "brine_draw"
+
+
 async def test_cancelling_a_sent_action_and_refreshing_does_not_repeat_it(
     hass, runtime_factory, bluetooth_io, transport, clock,
 ):

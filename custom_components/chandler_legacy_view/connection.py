@@ -349,7 +349,8 @@ class ValveConnection:
         self._evb034_received_readings: dict = {}
         self._evb034_received_times: dict[str, float] = {}
         self._evb034_position_changed_at = float("-inf")
-        self._evb034_soak_changed_at = float("-inf")
+        self._evb034_soak_started_at = float("-inf")
+        self._evb034_soak_ended_at = float("-inf")
         self._evb034_last_update_time: float | None = None
         self._evb034_published_time: float | None = None
         self._evb034_reading_ready = False
@@ -672,11 +673,11 @@ class ValveConnection:
         cycle = self._cycle
         if cycle is None or cycle.moving is not False or cycle.step is None:
             return False
-        if action is CycleAction.ADVANCE:
-            return cycle.active is True or cycle.soaking is True
         evb034 = self._evb034_client is not None or self._advertisement.model == "Evb034"
         if evb034 and supports_soak(self.entity_capabilities) and cycle.soaking is None:
             return False
+        if action is CycleAction.ADVANCE:
+            return cycle.active is True or cycle.soaking is True
         if (
             action is CycleAction.START and not evb034
             and (self._dashboard_data.bypass_setting_enabled
@@ -775,17 +776,15 @@ class ValveConnection:
         cycle = self._cycle
         if cycle is None or not self.reading_is_current(CYCLE_READING):
             return False
-        if cycle.moving is True:
+        if cycle.moving is True or (
+            action is not CycleAction.ADVANCE and (cycle.active is True or cycle.soaking is True)
+        ):
             return True  # Sufficient evidence to reject the action.
-        if cycle.moving is None or cycle.step is None:
+        if cycle.moving is None or cycle.step is None or (
+            supports_soak(self.entity_capabilities) and cycle.soaking is None
+        ):
             return False
-        if cycle.active is True or cycle.soaking is True:
-            return True
-        return cycle.active is False and (
-            action is CycleAction.ADVANCE
-            or cycle.soaking is False
-            or not supports_soak(self.entity_capabilities)
-        )
+        return cycle.active is not None or cycle.soaking is True
 
     def _cycle_confirmed(self, action: CycleAction, expected_step: str) -> bool:
         cycle = self._cycle
@@ -1926,7 +1925,8 @@ class ValveConnection:
         self._evb034_received_readings.clear()
         self._evb034_received_times.clear()
         self._evb034_position_changed_at = float("-inf")
-        self._evb034_soak_changed_at = float("-inf")
+        self._evb034_soak_started_at = float("-inf")
+        self._evb034_soak_ended_at = float("-inf")
         self._evb034_last_update_time = None
         self._evb034_published_time = None
         self._evb034_reading_ready = False
@@ -2135,8 +2135,11 @@ class ValveConnection:
                     # whose value arrived separately.
                     if key != "drtt" or previous_value is not None:
                         changes[key] = received
-                    if key == "dps" and 1 in (previous_value, value):
-                        self._evb034_soak_changed_at = received
+                    if key == "dps":
+                        if value == 1:
+                            self._evb034_soak_started_at = received
+                        elif previous_value == 1:
+                            self._evb034_soak_ended_at = received
             self._evb034_received_readings[key] = value
             self._evb034_received_times[key] = received
             if value is not None:
@@ -2168,30 +2171,33 @@ class ValveConnection:
         elif cycle_received and self._dashboard_data is not None:
             # Publish cycle changes, including invalidations, independently of
             # the configured publication cadence for the other readings.
-            previous = self._dashboard_data.cycle
-            if data.cycle != previous:
+            was_current = self.reading_is_current(CYCLE_READING)
+            cycle_changed = data.cycle != self._dashboard_data.cycle
+            if cycle_changed:
                 self._dashboard_data = replace(self._dashboard_data, cycle=data.cycle)
             self._confirm_evb034_cycle(data.cycle)
-            if data.cycle != previous:
+            if cycle_changed or was_current != self.reading_is_current(CYCLE_READING):
                 self._notify_dashboard_listeners(self._dashboard_data)
 
     def _decode_evb034_dashboard(
         self, packet: dict, firmware: int, *, clack: bool
     ) -> ValveDashboardData:
-        # Position and soak updates can precede motion. Require stationary
-        # evidence for the resulting step, and never treat a soak dwell
-        # indication as stationary in the previous step.
         motion = cycle_value(packet, "grs")
-        motion_at = self._evb034_received_times.get("grs", float("-inf"))
-        step_changed_at = self._evb034_position_changed_at
-        soak_state_conflicts = False
-        if supports_soak(self._entity_capabilities):
-            step_changed_at = max(step_changed_at, self._evb034_soak_changed_at)
-            soak_state_conflicts = (
-                motion == EVB034_WAITING_IN_BRINE_SOAK and cycle_value(packet, "dps") != 1
-            )
-        if soak_state_conflicts or (evb034_moving(motion) is False and motion_at < step_changed_at):
-            packet = {**packet, "grs": None}
+        if evb034_moving(motion) is False:
+            motion_at = self._evb034_received_times.get("grs", float("-inf"))
+            earliest_arrival = self._evb034_position_changed_at
+            soak_agrees = True
+            if supports_soak(self._entity_capabilities):
+                # Accept matching reports in either order. A stationary report
+                # from before the opposite phase began belongs to an older step.
+                in_soak_position = motion == EVB034_WAITING_IN_BRINE_SOAK
+                soak_agrees = in_soak_position == (cycle_value(packet, "dps") == 1)
+                opposite_phase_started_at = (
+                    self._evb034_soak_ended_at if in_soak_position else self._evb034_soak_started_at
+                )
+                earliest_arrival = max(earliest_arrival, opposite_phase_started_at)
+            if not soak_agrees or motion_at < earliest_arrival:
+                packet = {**packet, "grs": None}
         return decode_dashboard(packet, firmware, clack=clack, capabilities=self._entity_capabilities)
 
     def _confirm_evb034_cycle(self, cycle: ValveCycleStatus | None) -> None:
